@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-VibeVoice"
 description = "VibeVoice TTS"
-version = "0.1.0"
+version = "0.0.1"
 license = {file = "LICENSE"}
 dependencies = ["torch", "torchaudio", "librosa", "numpy", "huggingface_hub", "einops", "scipy", "tokenizers", "soundfile", "s3tokenizer", "tqdm", "conformer", "safetensors", "transformers", "diffusers"]
 
@@ -13,3 +13,4 @@ Repository = "https://github.com/wildminder/ComfyUI-VibeVoice"
 PublisherId = "wildai"
 DisplayName = "ComfyUI-VibeVoice"
 Icon = ""
+
