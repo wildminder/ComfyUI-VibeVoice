@@ -1,0 +1,244 @@
+{
+  "id": "b91265e5-1b03-4b63-8dc3-4abd9a030e08",
+  "revision": 0,
+  "last_node_id": 5,
+  "last_link_id": 16,
+  "nodes": [
+    {
+      "id": 2,
+      "type": "LoadAudio",
+      "pos": [
+        -1900,
+        -1130
+      ],
+      "size": [
+        274.080078125,
+        136
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.52",
+        "Node name for S&R": "LoadAudio",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "audio": true,
+            "audioUI": true,
+            "upload": true
+          },
+          "version": "7.0.1"
+        }
+      },
+      "widgets_values": [
+        "male_petergriffin.wav",
+        null,
+        null
+      ]
+    },
+    {
+      "id": 4,
+      "type": "LoadAudio",
+      "pos": [
+        -1900,
+        -940
+      ],
+      "size": [
+        274.080078125,
+        136
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            16
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.52",
+        "Node name for S&R": "LoadAudio",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "audio": true,
+            "audioUI": true,
+            "upload": true
+          },
+          "version": "7.0.1"
+        }
+      },
+      "widgets_values": [
+        "male_rickmorty.mp3",
+        null,
+        null
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SaveAudio",
+      "pos": [
+        -1040,
+        -1130
+      ],
+      "size": [
+        270,
+        112
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 13
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.52",
+        "Node name for S&R": "SaveAudio",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "filename_prefix": true,
+            "audioUI": true
+          },
+          "version": "7.0.1"
+        }
+      },
+      "widgets_values": [
+        "audio/VibeVoice"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "VibeVoiceTTS",
+      "pos": [
+        -1570,
+        -1130
+      ],
+      "size": [
+        460,
+        460
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "speaker_1_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 15
+        },
+        {
+          "name": "speaker_2_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 16
+        },
+        {
+          "name": "speaker_3_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "speaker_4_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            13
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VibeVoiceTTS"
+      },
+      "widgets_values": [
+        "VibeVoice-1.5B",
+        "Speaker 1: Hey, remember \"See You Again\"?\nSpeaker 2: Yeah… from Furious 7, right? That song always hits deep.\nSpeaker 1: Let me try to sing a part of it for you. \"It's been a long day… without you, my friend. And I'll tell you all about it when I see you again…\"\nSpeaker 2: Wow… that line. Every time.\nSpeaker 1: Yeah, and then this part always makes me think of the people I've lost. \"We've come a long way… from where we began. Oh, I'll tell you all about it when I see you again…\"\nSpeaker 2: It's beautiful, really. It's not just sad—it's like… hopeful.\nSpeaker 1: Right? Like no matter how far apart we are, there's still that promise.",
+        1.3,
+        50,
+        42,
+        "fixed",
+        true,
+        0.95,
+        0.95,
+        0
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    }
+  ],
+  "links": [
+    [
+      13,
+      5,
+      0,
+      3,
+      0,
+      "AUDIO"
+    ],
+    [
+      15,
+      2,
+      0,
+      5,
+      0,
+      "AUDIO"
+    ],
+    [
+      16,
+      4,
+      0,
+      5,
+      1,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ue_links": [],
+    "links_added_by_ue": [],
+    "ds": {
+      "scale": 1.310999419150025,
+      "offset": [
+        2000,
+        1230
+      ]
+    },
+    "frontendVersion": "1.25.10",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true
+  },
+  "version": 0.4
+}
