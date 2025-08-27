@@ -23,36 +23,12 @@
 </div>
 
 
-<!-- TABLE OF CONTENTS -->
-<details>
-  <summary>Table of Contents</summary>
-  <ol>
-    <li><a href="#about-the-project">About The Project</a></li>
-    <li><a href="#getting-started">Getting Started</a>
-        <ul>
-            <li><a href="#prerequisites">Prerequisites</a></li>
-            <li><a href="#installation">Installation</a></li>
-        </ul>
-    </li>
-    <li><a href="#usage">Usage</a>
-        <ul>
-            <li><a href="#node-inputs">Node Inputs</a></li>
-            <li><a href="#tips-from-the-original-authors">Tips from the Original Authors</a></li>
-        </ul>
-    </li>
-    <li><a href="#roadmap">Roadmap</a></li>
-    <li><a href="#license">License</a></li>
-    <li><a href="#contact">Contact</a></li>
-    <li><a href="#acknowledgments">Acknowledgments</a></li>
-  </ol>
-</details>
-
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
 This project brings the power of **VibeVoice** into the modular workflow of ComfyUI. VibeVoice is a novel framework by Microsoft for generating expressive, long-form, multi-speaker conversational audio. It excels at creating natural-sounding dialogue, podcasts, and more, with consistent voices for up to 4 speakers.
 
-This custom node handles everything from model downloading and memory management to audio processing, allowing you to generate high-quality speech directly from a text script and reference audio files.
+The custom node handles everything from model downloading and memory management to audio processing, allowing you to generate high-quality speech directly from a text script and reference audio files.
 
 **Key Features:**
 *   **Multi-Speaker TTS:** Generate conversations with up to 4 distinct voices in a single audio output.
