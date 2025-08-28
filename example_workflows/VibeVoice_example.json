@@ -1,11 +1,11 @@
 {
   "id": "b91265e5-1b03-4b63-8dc3-4abd9a030e08",
   "revision": 0,
-  "last_node_id": 5,
-  "last_link_id": 16,
+  "last_node_id": 10,
+  "last_link_id": 24,
   "nodes": [
     {
-      "id": 2,
+      "id": 4,
       "type": "LoadAudio",
       "pos": [
         -1900,
@@ -24,14 +24,14 @@
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
-            15
+            21
           ]
         }
       ],
       "properties": {
+        "Node name for S&R": "LoadAudio",
         "cnr_id": "comfy-core",
         "ver": "0.3.52",
-        "Node name for S&R": "LoadAudio",
         "ue_properties": {
           "widget_ue_connectable": {
             "audio": true,
@@ -42,13 +42,13 @@
         }
       },
       "widgets_values": [
-        "male_petergriffin.wav",
+        "male_rickmorty.mp3",
         null,
         null
       ]
     },
     {
-      "id": 4,
+      "id": 8,
       "type": "LoadAudio",
       "pos": [
         -1900,
@@ -67,14 +67,14 @@
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
-            16
+            24
           ]
         }
       ],
       "properties": {
+        "Node name for S&R": "LoadAudio",
         "cnr_id": "comfy-core",
         "ver": "0.3.52",
-        "Node name for S&R": "LoadAudio",
         "ue_properties": {
           "widget_ue_connectable": {
             "audio": true,
@@ -85,7 +85,7 @@
         }
       },
       "widgets_values": [
-        "male_rickmorty.mp3",
+        "male_stewie.mp3",
         null,
         null
       ]
@@ -102,20 +102,20 @@
         112
       ],
       "flags": {},
-      "order": 3,
+      "order": 4,
       "mode": 0,
       "inputs": [
         {
           "name": "audio",
           "type": "AUDIO",
-          "link": 13
+          "link": 23
         }
       ],
       "outputs": [],
       "properties": {
+        "Node name for S&R": "SaveAudio",
         "cnr_id": "comfy-core",
         "ver": "0.3.52",
-        "Node name for S&R": "SaveAudio",
         "ue_properties": {
           "widget_ue_connectable": {
             "filename_prefix": true,
@@ -129,31 +129,55 @@
       ]
     },
     {
-      "id": 5,
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        -1030,
+        -960
+      ],
+      "size": [
+        420,
+        210
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Notes",
+      "properties": {},
+      "widgets_values": [
+        "## Models\n\nWill be downloaded on the first run, or download them manually and place them into the directory: /models/tts/VibeVoice\n\n| Model | Context Length | Generation Length |  Weight |\n|-------|----------------|----------|----------|\n| VibeVoice-0.5B-Streaming | - | - | On the way |\n| VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/microsoft/VibeVoice-1.5B) |\n| VibeVoice-7B-Preview| 32K | ~45 min | [HF link](https://huggingface.co/WestZhang/VibeVoice-Large-pt) |"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 9,
       "type": "VibeVoiceTTS",
       "pos": [
         -1570,
         -1130
       ],
       "size": [
-        460,
-        460
+        480,
+        490
       ],
       "flags": {},
-      "order": 2,
+      "order": 3,
       "mode": 0,
       "inputs": [
         {
           "name": "speaker_1_voice",
           "shape": 7,
           "type": "AUDIO",
-          "link": 15
+          "link": 24
         },
         {
           "name": "speaker_2_voice",
           "shape": 7,
           "type": "AUDIO",
-          "link": 16
+          "link": 21
         },
         {
           "name": "speaker_3_voice",
@@ -173,7 +197,7 @@
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
-            13
+            23
           ]
         }
       ],
@@ -182,11 +206,12 @@
       },
       "widgets_values": [
         "VibeVoice-1.5B",
-        "Speaker 1: Hey, remember \"See You Again\"?\nSpeaker 2: Yeah… from Furious 7, right? That song always hits deep.\nSpeaker 1: Let me try to sing a part of it for you. \"It's been a long day… without you, my friend. And I'll tell you all about it when I see you again…\"\nSpeaker 2: Wow… that line. Every time.\nSpeaker 1: Yeah, and then this part always makes me think of the people I've lost. \"We've come a long way… from where we began. Oh, I'll tell you all about it when I see you again…\"\nSpeaker 2: It's beautiful, really. It's not just sad—it's like… hopeful.\nSpeaker 1: Right? Like no matter how far apart we are, there's still that promise.",
+        "Speaker 1: I can't believe you did it again. I waited for two hours. Two hours! Not a single call, not a text. Do you have any idea how embarrassing that was, just sitting there alone?\nSpeaker 2: Look, I know, I'm sorry, alright? Work was a complete nightmare. My boss dropped a critical deadline on me at the last minute. I didn't even have a second to breathe, let alone check my phone.\nSpeaker 1: A nightmare? That's the same excuse you used last time. I'm starting to think you just don't care. It's easier to say 'work was crazy' than to just admit that I'm not a priority for you anymore.",
+        "flash_attention_2",
         1.3,
-        50,
-        42,
-        "fixed",
+        30,
+        309317081412002,
+        "randomize",
         true,
         0.95,
         0.95,
@@ -198,27 +223,27 @@
   ],
   "links": [
     [
-      13,
-      5,
+      21,
+      4,
+      0,
+      9,
+      1,
+      "AUDIO"
+    ],
+    [
+      23,
+      9,
       0,
       3,
       0,
       "AUDIO"
     ],
     [
-      15,
-      2,
+      24,
+      8,
       0,
-      5,
+      9,
       0,
-      "AUDIO"
-    ],
-    [
-      16,
-      4,
-      0,
-      5,
-      1,
       "AUDIO"
     ]
   ],
@@ -228,10 +253,10 @@
     "ue_links": [],
     "links_added_by_ue": [],
     "ds": {
-      "scale": 1.310999419150025,
+      "scale": 1.0834705943388634,
       "offset": [
-        2000,
-        1230
+        2057.223518869778,
+        1246.6132796718712
       ]
     },
     "frontendVersion": "1.25.10",

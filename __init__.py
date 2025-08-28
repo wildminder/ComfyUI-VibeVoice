@@ -11,14 +11,15 @@ import folder_paths
 
 from .vibevoice_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-# logger
+# Configure a logger for the entire custom node package
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
 if not logger.hasHandlers():
     handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter(f"[ComfyUI-VibeVoice] %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
 
 
 VIBEVOICE_MODEL_SUBDIR = os.path.join("tts", "VibeVoice")
