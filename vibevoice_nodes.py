@@ -6,6 +6,7 @@ import random
 from huggingface_hub import snapshot_download
 import logging
 import librosa
+import gc
 
 import folder_paths
 import comfy.model_management as model_management
@@ -35,11 +36,45 @@ MODEL_CONFIGS = {
 
 ATTENTION_MODES = ["eager", "sdpa", "flash_attention_2"]
 
+def cleanup_old_models(keep_cache_key=None):
+    """Clean up old models, optionally keeping one specific model loaded"""
+    global LOADED_MODELS, VIBEVOICE_PATCHER_CACHE
+    
+    keys_to_remove = []
+    
+    # Clear LOADED_MODELS
+    for key in list(LOADED_MODELS.keys()):
+        if key != keep_cache_key:
+            keys_to_remove.append(key)
+            del LOADED_MODELS[key]
+    
+    # Clear VIBEVOICE_PATCHER_CACHE - but more carefully
+    for key in list(VIBEVOICE_PATCHER_CACHE.keys()):
+        if key != keep_cache_key:
+            # Set the model/processor to None but don't delete the patcher itself
+            # This lets ComfyUI's model management handle the patcher cleanup
+            try:
+                patcher = VIBEVOICE_PATCHER_CACHE[key]
+                if hasattr(patcher, 'model') and patcher.model:
+                    patcher.model.model = None
+                    patcher.model.processor = None
+                # Remove from our cache but let ComfyUI handle the rest
+                del VIBEVOICE_PATCHER_CACHE[key]
+            except Exception as e:
+                logger.warning(f"Error cleaning up patcher {key}: {e}")
+    
+    if keys_to_remove:
+        logger.info(f"Cleaned up cached models: {keys_to_remove}")
+        gc.collect()
+        model_management.soft_empty_cache()
+
 class VibeVoiceModelHandler(torch.nn.Module):
     """A torch.nn.Module wrapper to hold the VibeVoice model and processor."""
-    def __init__(self, model_pack_name):
+    def __init__(self, model_pack_name, attention_mode="eager"):
         super().__init__()
         self.model_pack_name = model_pack_name
+        self.attention_mode = attention_mode
+        self.cache_key = f"{model_pack_name}_attn_{attention_mode}"
         self.model = None
         self.processor = None
         self.size = int(MODEL_CONFIGS[model_pack_name].get("size_gb", 4.0) * (1024**3))
@@ -53,6 +88,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
     def __init__(self, model, attention_mode="eager", *args, **kwargs):
         super().__init__(model, *args, **kwargs)
         self.attention_mode = attention_mode
+        self.cache_key = model.cache_key
 
     def patch_model(self, device_to=None, *args, **kwargs):
         target_device = self.load_device
@@ -70,12 +106,22 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
 
     def unpatch_model(self, device_to=None, unpatch_weights=True, *args, **kwargs):
         if unpatch_weights:
-            logger.info(f"Offloading VibeVoice models for '{self.model.model_pack_name}' to {device_to}...")
+            logger.info(f"Offloading VibeVoice models for '{self.model.model_pack_name}' ({self.attention_mode}) to {device_to}...")
             self.model.model = None
             self.model.processor = None
-            if self.model.model_pack_name in LOADED_MODELS:
-                del LOADED_MODELS[self.model.model_pack_name]
+            
+            # Clear using the correct cache key
+            if self.cache_key in LOADED_MODELS:
+                del LOADED_MODELS[self.cache_key]
+                logger.info(f"Cleared LOADED_MODELS cache for: {self.cache_key}")
+            
+            # DON'T delete from VIBEVOICE_PATCHER_CACHE here - let ComfyUI handle it
+            # This prevents the IndexError in ComfyUI's model management
+            
+            # Force garbage collection
+            gc.collect()
             model_management.soft_empty_cache()
+            
         return super().unpatch_model(device_to, unpatch_weights, *args, **kwargs)
 
 class VibeVoiceLoader:
@@ -360,8 +406,12 @@ class VibeVoiceTTSNode:
         # Create cache key that includes attention mode
         cache_key = f"{model_name}_attn_{attention_mode}"
         
+        # Clean up old models when switching to a different model
         if cache_key not in VIBEVOICE_PATCHER_CACHE:
-            model_handler = VibeVoiceModelHandler(model_name)
+            # Only keep models that are currently being requested
+            cleanup_old_models(keep_cache_key=cache_key)
+            
+            model_handler = VibeVoiceModelHandler(model_name, attention_mode)
             patcher = VibeVoicePatcher(
                 model_handler,
                 attention_mode=attention_mode,
