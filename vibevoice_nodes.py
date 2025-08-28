@@ -3,22 +3,30 @@ import re
 import torch
 import numpy as np
 import random
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 import logging
-import librosa
+
 import gc
 
 import folder_paths
 import comfy.model_management as model_management
 import comfy.model_patcher
 from comfy.utils import ProgressBar
+from comfy.model_management import throw_exception_if_processing_interrupted
 
-
-from transformers import set_seed
+from transformers import set_seed, AutoTokenizer
 from .vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from .vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
+from .vibevoice.processor.vibevoice_tokenizer_processor import VibeVoiceTokenizerProcessor
+from .vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceTextTokenizerFast
 
-logger = logging.getLogger("comfyui_vibevoice")
+try:
+    import librosa
+except ImportError:
+    print("VibeVoice Node: `librosa` is not installed. Resampling of reference audio will not be available.")
+    librosa = None
+
+logger = logging.getLogger(__name__)
 
 LOADED_MODELS = {}
 VIBEVOICE_PATCHER_CACHE = {}
@@ -27,10 +35,12 @@ MODEL_CONFIGS = {
     "VibeVoice-1.5B": {
         "repo_id": "microsoft/VibeVoice-1.5B",
         "size_gb": 3.0,
+        "tokenizer_repo": "Qwen/Qwen2.5-1.5B"
     },
     "VibeVoice-Large-pt": {
         "repo_id": "WestZhang/VibeVoice-Large-pt",
         "size_gb": 14.0,
+        "tokenizer_repo": "Qwen/Qwen2.5-7B" 
     }
 }
 
@@ -80,7 +90,7 @@ class VibeVoiceModelHandler(torch.nn.Module):
         self.size = int(MODEL_CONFIGS[model_pack_name].get("size_gb", 4.0) * (1024**3))
 
     def load_model(self, device, attention_mode="eager"):
-        self.model, self.processor = VibeVoiceLoader.load_model(self.model_pack_name, attention_mode)
+        self.model, self.processor = VibeVoiceLoader.load_model(self.model_pack_name, device , attention_mode)
         self.model.to(device)
 
 class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
@@ -170,7 +180,7 @@ class VibeVoiceLoader:
         return attention_mode
 
     @staticmethod
-    def load_model(model_name: str, attention_mode: str = "eager"):
+    def load_model(model_name: str, device, attention_mode: str = "eager"):
         # Validate attention mode
         if attention_mode not in ATTENTION_MODES:
             logger.warning(f"Unknown attention mode '{attention_mode}', falling back to eager")
@@ -185,10 +195,19 @@ class VibeVoiceLoader:
 
         model_path = VibeVoiceLoader.get_model_path(model_name)
         
-        print(f"Loading VibeVoice model components from: {model_path}")
-        processor = VibeVoiceProcessor.from_pretrained(model_path)
+        logger.info(f"Loading VibeVoice model components from: {model_path}")
+
         
-        torch_dtype = model_management.text_encoder_dtype(model_management.get_torch_device())
+        tokenizer_repo = MODEL_CONFIGS[model_name].get("tokenizer_repo")
+        try:
+            tokenizer_file_path = hf_hub_download(repo_id=tokenizer_repo, filename="tokenizer.json")
+        except Exception as e:
+            raise RuntimeError(f"Could not download tokenizer.json for {tokenizer_repo}. Error: {e}")
+
+        vibevoice_tokenizer = VibeVoiceTextTokenizerFast(tokenizer_file=tokenizer_file_path)
+        audio_processor = VibeVoiceTokenizerProcessor()
+        processor = VibeVoiceProcessor(tokenizer=vibevoice_tokenizer, audio_processor=audio_processor)
+        torch_dtype = model_management.text_encoder_dtype(device)
         device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else ""
         
         # Check compatibility and potentially fall back to safer mode
@@ -196,15 +215,15 @@ class VibeVoiceLoader:
             attention_mode, torch_dtype, device_name
         )
         
-        print(f"Requested attention mode: {attention_mode}")
+        logger.info(f"Requested attention mode: {attention_mode}")
         if final_attention_mode != attention_mode:
-            print(f"Using attention mode: {final_attention_mode} (automatic fallback)")
+            logger.info(f"Using attention mode: {final_attention_mode} (automatic fallback)")
             # Update cache key to reflect actual mode used
             cache_key = f"{model_name}_attn_{final_attention_mode}"
             if cache_key in LOADED_MODELS:
                 return LOADED_MODELS[cache_key]
         else:
-            print(f"Using attention mode: {final_attention_mode}")
+            logger.info(f"Using attention mode: {final_attention_mode}")
         
         logger.info(f"Final attention implementation: {final_attention_mode}")
 
@@ -236,6 +255,7 @@ class VibeVoiceLoader:
                 model_path,
                 torch_dtype=torch_dtype,
                 attn_implementation=final_attention_mode,
+                device_map=device
             )
             model.eval()
             
@@ -329,6 +349,8 @@ def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> np.ndarr
         waveform = waveform / max_val
 
     if original_sr != target_sr:
+        if librosa is None:
+            raise ImportError("`librosa` package is required for audio resampling. Please install it with `pip install librosa`.")
         logger.warning(f"Resampling reference audio from {original_sr}Hz to {target_sr}Hz.")
         waveform = librosa.resample(y=waveform, orig_sr=original_sr, target_sr=target_sr)
     
@@ -339,6 +361,12 @@ def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> np.ndarr
         
     return waveform.astype(np.float32)
 
+def check_for_interrupt():
+    try:
+        throw_exception_if_processing_interrupted()
+        return False
+    except:
+        return True
 
 class VibeVoiceTTSNode:
     @classmethod
@@ -508,7 +536,7 @@ class VibeVoiceTTSNode:
                     outputs = model.generate(
                         **inputs, max_new_tokens=None, cfg_scale=cfg_scale,
                         tokenizer=processor.tokenizer, generation_config=generation_config,
-                        verbose=False
+                        verbose=False, stop_check_fn=check_for_interrupt
                     )
                     # Note: The model.generate method doesn't support progress callbacks in the current VibeVoice implementation
                     # But we check for interruption at the start and end of generation
