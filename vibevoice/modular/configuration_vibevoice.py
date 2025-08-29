@@ -240,6 +240,11 @@ class VibeVoiceConfig(PretrainedConfig):
 
         super().__init__(**kwargs)
 
+    @property
+    def num_hidden_layers(self):
+        """Forward num_hidden_layers from decoder_config for compatibility with transformers."""
+        return self.decoder_config.num_hidden_layers
+
 __all__ = [
     "VibeVoiceAcousticTokenizerConfig", 
     "VibeVoiceSemanticTokenizerConfig", 
