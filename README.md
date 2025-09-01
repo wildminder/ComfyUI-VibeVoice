@@ -66,7 +66,7 @@ The node can be installed via **Use ComfyUI Manager:** Find the ComfyUI-VibeVoic
 | Model | Context Length | Generation Length |  Weight |
 |-------|----------------|----------|----------|
 | VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/microsoft/VibeVoice-1.5B) |
-| VibeVoice-7B-Preview| 32K | ~45 min | [HF link](https://huggingface.co/WestZhang/VibeVoice-Large-pt) |
+| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/microsoft/VibeVoice-Large) |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
