@@ -36,6 +36,8 @@ The custom node handles everything from model downloading and memory management 
 *   **Automatic Model Management:** Models are downloaded automatically from Hugging Face and managed efficiently by ComfyUI to save VRAM.
 *   **Fine-Grained Control:** Adjust parameters like CFG scale, temperature, and sampling methods to tune the performance and style of the generated speech.
 *   **4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage and improve speed on memory-constrained GPUs, especially for the 7B model.
+*   **Transformers 4.56+ Compatibility:** Fully backwards compatible with both older and newer versions of the Transformers library.
+*   **Force Offload Option:** Toggle to force model offloading from VRAM after generation to save memory between runs - now with improved ComfyUI compatibility.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -92,6 +94,7 @@ _For a complete workflow, you can drag the example image from the `example_workf
 *   **`inference_steps`**: Number of diffusion steps for the audio decoder.
 *   **`seed`**: A seed for reproducibility.
 *   **`do_sample`, `temperature`, `top_p`, `top_k`**: Standard sampling parameters for controlling the creativity and determinism of the speech generation.
+*   **`force_offload`**: (New!) Forces the model to be completely offloaded from VRAM after generation. Useful for memory management but may slow down subsequent runs.
 *   **`speaker_*_voice` (Optional)**: Connect an `AUDIO` output from a `Load Audio` node to provide a voice reference.
 
 ### Performance & Quantization
@@ -107,12 +110,37 @@ A key feature of this node is the optional **4-bit quantization** for the langua
 
 As shown, quantization provides a massive speedup and VRAM reduction for the 7B model, making it accessible on a wider range of hardware. While it slightly slows down the 1.5B model, the significant VRAM savings may still be beneficial for complex workflows.
 
+### Transformers Library Compatibility
+
+This version includes automatic detection and compatibility for both older and newer versions of the Transformers library:
+
+*   **Transformers 4.56+**: Automatically uses the new method signature for `_prepare_cache_for_generation`
+*   **Older Versions**: Maintains compatibility with pre-4.56 versions using the legacy method signature
+*   **Fallback Mechanism**: If detection fails, the node will automatically try both versions to ensure maximum compatibility
+
+This ensures the node works seamlessly regardless of your Transformers version without requiring manual updates.
+
 ### Tips from the Original Authors
 
 *   **Punctuation:** For Chinese text, using English punctuation (commas and periods) can improve stability.
 *   **Model Choice:** The 7B model variant (`VibeVoice-Large`) is generally more stable.
 *   **Spontaneous Sounds/Music:** The model may spontaneously generate background music, especially if the reference audio contains it or if the text includes introductory phrases like "Welcome to...". This is an emergent capability and cannot be directly controlled.
 *   **Singing:** The model was not trained on singing data, but it may attempt to sing as an emergent behavior. Results may vary.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+<!-- BUG FIXES -->
+## Recent Bug Fixes
+
+### Force Offload Compatibility Fix
+*   **Fixed:** Resolved `AttributeError: module 'comfy.model_management' has no attribute 'unload_model_clones'` error when using the force offload option
+*   **Details:** Updated the force offload implementation to use ComfyUI's standard `unload_all_models()` API instead of the deprecated `unload_model_clones()` function
+*   **Impact:** Force offload functionality now works correctly with all versions of ComfyUI
+
+### Multi-Speaker DynamicCache Fix
+*   **Fixed:** Resolved `'DynamicCache' object has no attribute 'key_cache'` error when using multiple speakers
+*   **Details:** Updated cache access in `modeling_vibevoice_inference.py` to use proper DynamicCache API - accessing layers via indexing instead of deprecated `.key_cache` and `.value_cache` attributes
+*   **Impact:** Multi-speaker functionality now works correctly with newer versions of Transformers library
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
