@@ -100,6 +100,11 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         super().__init__(model, *args, **kwargs)
         self.attention_mode = attention_mode
         self.cache_key = model.cache_key
+    
+    @property
+    def is_loaded(self):
+        """Check if the model is currently loaded in memory."""
+        return hasattr(self, 'model') and self.model is not None and hasattr(self.model, 'model') and self.model.model is not None
 
     def patch_model(self, device_to=None, *args, **kwargs):
         target_device = self.load_device
@@ -432,6 +437,10 @@ class VibeVoiceTTSNode:
                     "default": 0, "min": 0, "max": 500, "step": 1, 
                     "tooltip": "Top-K sampling. Restricts sampling to the K most likely next tokens. Set to 0 to disable. Active only if 'do_sample' is enabled."
                 }),
+                "force_offload": ("BOOLEAN", {
+                    "default": False, "label_on": "Force Offload", "label_off": "Keep in VRAM",
+                    "tooltip": "Force model to be offloaded from VRAM after generation. Useful to free up memory between generations but may slow down subsequent runs."
+                }),
             },
             "optional": {
                 "speaker_1_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 1' in the script."}),
@@ -445,7 +454,7 @@ class VibeVoiceTTSNode:
     FUNCTION = "generate_audio"
     CATEGORY = "audio/tts"
 
-    def generate_audio(self, model_name, text, attention_mode, cfg_scale, inference_steps, seed, do_sample, temperature, top_p, top_k, quantize_llm_4bit, **kwargs):
+    def generate_audio(self, model_name, text, attention_mode, cfg_scale, inference_steps, seed, do_sample, temperature, top_p, top_k, quantize_llm_4bit, force_offload, **kwargs):
         if not text.strip():
             logger.warning("VibeVoiceTTS: Empty text provided, returning silent audio.")
             return ({"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},)
@@ -589,6 +598,18 @@ class VibeVoiceTTSNode:
         output_waveform = outputs.speech_outputs[0]
         if output_waveform.ndim == 1: output_waveform = output_waveform.unsqueeze(0)
         if output_waveform.ndim == 2: output_waveform = output_waveform.unsqueeze(0)
+        
+        # Force offload model if requested
+        if force_offload:
+            logger.info(f"Force offloading VibeVoice model '{model_name}' from VRAM...")
+            # Force offload by unpatching the model and freeing memory
+            if patcher.is_loaded:
+                patcher.unpatch_model(unpatch_weights=True)
+            # Force unload all models to free memory
+            model_management.unload_all_models()
+            gc.collect()
+            model_management.soft_empty_cache()
+            logger.info("Model force offload completed")
             
         return ({"waveform": output_waveform.detach().cpu(), "sample_rate": 24000},)
 
