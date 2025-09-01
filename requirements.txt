@@ -14,3 +14,4 @@ safetensors
 transformers
 diffusers
 tqdm
+bitsandbytes
