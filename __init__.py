@@ -14,9 +14,10 @@ from .vibevoice_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 # Configure a logger for the entire custom node package
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
+logger.propagate = False
 
 if not logger.hasHandlers():
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler()
     formatter = logging.Formatter(f"[ComfyUI-VibeVoice] %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
