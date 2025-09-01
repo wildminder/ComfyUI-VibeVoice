@@ -37,9 +37,9 @@ MODEL_CONFIGS = {
         "size_gb": 3.0,
         "tokenizer_repo": "Qwen/Qwen2.5-1.5B"
     },
-    "VibeVoice-Large-pt": {
-        "repo_id": "WestZhang/VibeVoice-Large-pt",
-        "size_gb": 14.0,
+    "VibeVoice-Large": {
+        "repo_id": "microsoft/VibeVoice-Large",
+        "size_gb": 17.4,
         "tokenizer_repo": "Qwen/Qwen2.5-7B" 
     }
 }
@@ -281,14 +281,14 @@ class VibeVoiceLoader:
             
         except Exception as e:
             logger.error(f"Failed to load model with {final_attention_mode} attention: {e}")
-            
+
             # Progressive fallback: flash -> sdpa -> eager
             if final_attention_mode == "flash_attention_2":
                 logger.info("Attempting fallback to SDPA...")
-                return VibeVoiceLoader.load_model(model_name, "sdpa")
+                return VibeVoiceLoader.load_model(model_name, device, "sdpa")
             elif final_attention_mode == "sdpa":
                 logger.info("Attempting fallback to eager...")
-                return VibeVoiceLoader.load_model(model_name, "eager")
+                return VibeVoiceLoader.load_model(model_name, device, "eager")
             else:
                 # If eager fails, something is seriously wrong
                 raise RuntimeError(f"Failed to load model even with eager attention: {e}")

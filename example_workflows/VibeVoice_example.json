@@ -1,8 +1,8 @@
 {
   "id": "b91265e5-1b03-4b63-8dc3-4abd9a030e08",
   "revision": 0,
-  "last_node_id": 10,
-  "last_link_id": 24,
+  "last_node_id": 11,
+  "last_link_id": 29,
   "nodes": [
     {
       "id": 4,
@@ -24,14 +24,14 @@
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
-            21
+            28
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "LoadAudio",
         "cnr_id": "comfy-core",
         "ver": "0.3.52",
+        "Node name for S&R": "LoadAudio",
         "ue_properties": {
           "widget_ue_connectable": {
             "audio": true,
@@ -46,6 +46,77 @@
         null,
         null
       ]
+    },
+    {
+      "id": 11,
+      "type": "VibeVoiceTTS",
+      "pos": [
+        -1570,
+        -1130
+      ],
+      "size": [
+        460,
+        510
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "speaker_1_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 28
+        },
+        {
+          "name": "speaker_2_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 29
+        },
+        {
+          "name": "speaker_3_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "speaker_4_voice",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-VibeVoice",
+        "ver": "37803a884fb8f9b43c38286f6d654c7f97181a73",
+        "Node name for S&R": "VibeVoiceTTS"
+      },
+      "widgets_values": [
+        "VibeVoice-1.5B",
+        "Speaker 1: I can't believe you did it again. I waited for two hours. Two hours! Not a single call, not a text. Do you have any idea how embarrassing that was, just sitting there alone?\nSpeaker 2: Look, I know, I'm sorry, alright? Work was a complete nightmare. My boss dropped a critical deadline on me at the last minute. I didn't even have a second to breathe, let alone check my phone.\nSpeaker 1: A nightmare? That's the same excuse you used last time. I'm starting to think you just don't care. It's easier to say 'work was crazy' than to just admit that I'm not a priority for you anymore.",
+        false,
+        "sdpa",
+        1.3,
+        10,
+        56109085141530,
+        "randomize",
+        true,
+        0.95,
+        0.95,
+        0
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
     },
     {
       "id": 8,
@@ -67,14 +138,14 @@
           "name": "AUDIO",
           "type": "AUDIO",
           "links": [
-            24
+            29
           ]
         }
       ],
       "properties": {
-        "Node name for S&R": "LoadAudio",
         "cnr_id": "comfy-core",
         "ver": "0.3.52",
+        "Node name for S&R": "LoadAudio",
         "ue_properties": {
           "widget_ue_connectable": {
             "audio": true,
@@ -88,44 +159,6 @@
         "male_stewie.mp3",
         null,
         null
-      ]
-    },
-    {
-      "id": 3,
-      "type": "SaveAudio",
-      "pos": [
-        -1040,
-        -1130
-      ],
-      "size": [
-        270,
-        112
-      ],
-      "flags": {},
-      "order": 4,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "link": 23
-        }
-      ],
-      "outputs": [],
-      "properties": {
-        "Node name for S&R": "SaveAudio",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.52",
-        "ue_properties": {
-          "widget_ue_connectable": {
-            "filename_prefix": true,
-            "audioUI": true
-          },
-          "version": "7.0.1"
-        }
-      },
-      "widgets_values": [
-        "audio/VibeVoice"
       ]
     },
     {
@@ -145,105 +178,80 @@
       "inputs": [],
       "outputs": [],
       "title": "Notes",
-      "properties": {},
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.0.1"
+        }
+      },
       "widgets_values": [
-        "## Models\n\nWill be downloaded on the first run, or download them manually and place them into the directory: /models/tts/VibeVoice\n\n| Model | Context Length | Generation Length |  Weight |\n|-------|----------------|----------|----------|\n| VibeVoice-0.5B-Streaming | - | - | On the way |\n| VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/microsoft/VibeVoice-1.5B) |\n| VibeVoice-7B-Preview| 32K | ~45 min | [HF link](https://huggingface.co/WestZhang/VibeVoice-Large-pt) |"
+        "## Models\n\nWill be downloaded on the first run, or download them manually and place them into the directory: /models/tts/VibeVoice\n\n| Model | Context Length | Generation Length |  Weight |\n|-------|----------------|----------|----------|\n| VibeVoice-0.5B-Streaming | - | - | On the way |\n| VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/microsoft/VibeVoice-1.5B) |\n| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/microsoft/VibeVoice-Large) |"
       ],
       "color": "#432",
       "bgcolor": "#653"
     },
     {
-      "id": 9,
-      "type": "VibeVoiceTTS",
+      "id": 3,
+      "type": "SaveAudio",
       "pos": [
-        -1570,
+        -1040,
         -1130
       ],
       "size": [
-        480,
-        490
+        270,
+        112
       ],
       "flags": {},
-      "order": 3,
+      "order": 4,
       "mode": 0,
       "inputs": [
         {
-          "name": "speaker_1_voice",
-          "shape": 7,
+          "name": "audio",
           "type": "AUDIO",
-          "link": 24
-        },
-        {
-          "name": "speaker_2_voice",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": 21
-        },
-        {
-          "name": "speaker_3_voice",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": null
-        },
-        {
-          "name": "speaker_4_voice",
-          "shape": 7,
-          "type": "AUDIO",
-          "link": null
+          "link": 27
         }
       ],
-      "outputs": [
-        {
-          "name": "AUDIO",
-          "type": "AUDIO",
-          "links": [
-            23
-          ]
-        }
-      ],
+      "outputs": [],
       "properties": {
-        "Node name for S&R": "VibeVoiceTTS"
+        "cnr_id": "comfy-core",
+        "ver": "0.3.52",
+        "Node name for S&R": "SaveAudio",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "filename_prefix": true,
+            "audioUI": true
+          },
+          "version": "7.0.1"
+        }
       },
       "widgets_values": [
-        "VibeVoice-1.5B",
-        "Speaker 1: I can't believe you did it again. I waited for two hours. Two hours! Not a single call, not a text. Do you have any idea how embarrassing that was, just sitting there alone?\nSpeaker 2: Look, I know, I'm sorry, alright? Work was a complete nightmare. My boss dropped a critical deadline on me at the last minute. I didn't even have a second to breathe, let alone check my phone.\nSpeaker 1: A nightmare? That's the same excuse you used last time. I'm starting to think you just don't care. It's easier to say 'work was crazy' than to just admit that I'm not a priority for you anymore.",
-        "flash_attention_2",
-        1.3,
-        30,
-        309317081412002,
-        "randomize",
-        true,
-        0.95,
-        0.95,
-        0
-      ],
-      "color": "#232",
-      "bgcolor": "#353"
+        "audio/VibeVoice"
+      ]
     }
   ],
   "links": [
     [
-      21,
-      4,
-      0,
-      9,
-      1,
-      "AUDIO"
-    ],
-    [
-      23,
-      9,
+      27,
+      11,
       0,
       3,
       0,
       "AUDIO"
     ],
     [
-      24,
+      28,
+      4,
+      0,
+      11,
+      0,
+      "AUDIO"
+    ],
+    [
+      29,
       8,
       0,
-      9,
-      0,
+      11,
+      1,
       "AUDIO"
     ]
   ],
@@ -253,13 +261,13 @@
     "ue_links": [],
     "links_added_by_ue": [],
     "ds": {
-      "scale": 1.0834705943388634,
+      "scale": 1.2100000000000004,
       "offset": [
-        2057.223518869778,
-        1246.6132796718712
+        2024.7933884297524,
+        1252.3140495867776
       ]
     },
-    "frontendVersion": "1.25.10",
+    "frontendVersion": "1.25.11",
     "VHS_latentpreview": false,
     "VHS_latentpreviewrate": 0,
     "VHS_MetadataImage": true,
