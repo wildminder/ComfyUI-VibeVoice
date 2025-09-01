@@ -35,6 +35,7 @@ The custom node handles everything from model downloading and memory management 
 *   **Zero-Shot Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.
 *   **Automatic Model Management:** Models are downloaded automatically from Hugging Face and managed efficiently by ComfyUI to save VRAM.
 *   **Fine-Grained Control:** Adjust parameters like CFG scale, temperature, and sampling methods to tune the performance and style of the generated speech.
+*   **4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage and improve speed on memory-constrained GPUs, especially for the 7B model.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -44,16 +45,16 @@ The custom node handles everything from model downloading and memory management 
 Follow these steps to get the ComfyUI-VibeVoice node running in your environment.
 
 ### Installation
-The node can be installed via **Use ComfyUI Manager:** Find the ComfyUI-VibeVoice and install it. Or install it manually
+The node can be installed via **ComfyUI Manager:** Find `ComfyUI-VibeVoice` and click "Install". Or, install it manually:
     
 1.  **Clone the Repository:**
     Navigate to your `ComfyUI/custom_nodes/` directory and clone this repository:
     ```sh
-    git clone https://github.com/your-username/ComfyUI-VibeVoice.git
+    git clone https://github.com/wildminder/ComfyUI-VibeVoice.git
     ```
 
 2.  **Install Dependencies:**
-    Open a terminal or command prompt, navigate into the cloned directory, and install the required Python packages:
+    Open a terminal or command prompt, navigate into the cloned directory, and install the required Python packages. **For quantization support, ensure you install `bitsandbytes`**.
     ```sh
     cd ComfyUI-VibeVoice
     pip install -r requirements.txt
@@ -80,24 +81,36 @@ The node is designed to be intuitive within the ComfyUI workflow.
 3.  **Write Script:** In the `text` input, write your dialogue. Assign lines to speakers using the format `Speaker 1: ...`, `Speaker 2: ...`, etc., on separate lines.
 4.  **Generate:** Queue the prompt. The node will process the script and generate a single audio file containing the full conversation.
 
-_For a complete workflow, you can drag the example image `images/vibevoice_workflow_example.png` onto your ComfyUI canvas._
+_For a complete workflow, you can drag the example image from the `example_workflows` folder onto your ComfyUI canvas._
 
 ### Node Inputs
 
-*   **`model_name`**: Select the VibeVoice model to use (e.g., `VibeVoice-1.5B`). It will be downloaded automatically if not found.
-*   **`text`**: The conversational script. Lines must be prefixed with `Speaker <number>:` (e.g., `Speaker 1:`). The numbers correspond to the speaker voice inputs.
-*   **`cfg_scale`**: Controls how strongly the model adheres to the reference voice's timbre. Higher values improve voice similarity but may reduce naturalness.
-*   **`inference_steps`**: Number of diffusion steps. More steps can improve quality but increase generation time.
-*   **`seed`**: A seed for reproducibility. Set to 0 for a random seed on each run.
-*   **`do_sample`**: Toggles between deterministic (greedy) and stochastic (sampling) generation. Enable for more varied and potentially more natural-sounding speech.
-*   **`temperature`**: Controls randomness when sampling. Higher values lead to more diverse outputs. (Only active if `do_sample` is enabled).
-*   **`top_p` / `top_k`**: Nucleus and Top-K sampling parameters to further control the randomness of the generation. (Only active if `do_sample` is enabled).
-*   **`speaker_*_voice` (Optional)**: Connect an `AUDIO` output from a `Load Audio` node to provide a voice reference for the corresponding speaker number in the script.
+*   **`model_name`**: Select the VibeVoice model to use.
+*   **`quantize_llm`**: (New!) Enable to run the LLM component in 4-bit (NF4) mode. This dramatically reduces VRAM and can significantly speed up inference on the 7B model.
+*   **`text`**: The conversational script. Lines must be prefixed with `Speaker <number>:` (e.g., `Speaker 1:`).
+*   **`cfg_scale`**: Controls how strongly the model adheres to the reference voice's timbre.
+*   **`inference_steps`**: Number of diffusion steps for the audio decoder.
+*   **`seed`**: A seed for reproducibility.
+*   **`do_sample`, `temperature`, `top_p`, `top_k`**: Standard sampling parameters for controlling the creativity and determinism of the speech generation.
+*   **`speaker_*_voice` (Optional)**: Connect an `AUDIO` output from a `Load Audio` node to provide a voice reference.
+
+### Performance & Quantization
+
+A key feature of this node is the optional **4-bit quantization** for the language model component. This is highly recommended for users with memory-constrained GPUs (e.g., <= 16GB VRAM) who wish to run the larger `VibeVoice-Large-pt` model.
+
+**Benefits of `quantize_llm = Enabled`:**
+
+| Model | Performance Impact | VRAM Savings |
+|---|---|---|
+| **VibeVoice-Large (7B)** | **~8.5x faster** inference | Saves **>4.4 GB** (over 36%) |
+| **VibeVoice-1.5B** | ~1.5x slower inference | Saves **~5.5 GB** (over 63%) |
+
+As shown, quantization provides a massive speedup and VRAM reduction for the 7B model, making it accessible on a wider range of hardware. While it slightly slows down the 1.5B model, the significant VRAM savings may still be beneficial for complex workflows.
 
 ### Tips from the Original Authors
 
 *   **Punctuation:** For Chinese text, using English punctuation (commas and periods) can improve stability.
-*   **Model Choice:** The 7B model variant (`VibeVoice-Large-pt`) is generally more stable.
+*   **Model Choice:** The 7B model variant (`VibeVoice-Large`) is generally more stable.
 *   **Spontaneous Sounds/Music:** The model may spontaneously generate background music, especially if the reference audio contains it or if the text includes introductory phrases like "Welcome to...". This is an emergent capability and cannot be directly controlled.
 *   **Singing:** The model was not trained on singing data, but it may attempt to sing as an emergent behavior. Results may vary.
 

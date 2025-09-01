@@ -1,9 +1,9 @@
 [project]
 name = "ComfyUI-VibeVoice"
 description = "VibeVoice TTS. Expressive, long-form, multi-speaker conversational audio"
-version = "0.2.1"
+version = "0.2.2"
 license = {file = "LICENSE"}
-dependencies = ["torch", "torchaudio", "librosa", "numpy", "huggingface_hub", "einops", "scipy", "tokenizers", "soundfile", "s3tokenizer", "tqdm", "conformer", "safetensors", "transformers", "diffusers"]
+dependencies = ["torch", "torchaudio", "librosa", "numpy", "huggingface_hub", "einops", "scipy", "tokenizers", "soundfile", "s3tokenizer", "tqdm", "conformer", "safetensors", "transformers", "diffusers", "bitsandbytes"]
 
 [project.urls]
 Repository = "https://github.com/wildminder/ComfyUI-VibeVoice"
@@ -13,6 +13,7 @@ Repository = "https://github.com/wildminder/ComfyUI-VibeVoice"
 PublisherId = "wildai"
 DisplayName = "ComfyUI-VibeVoice"
 Icon = ""
+
 
 
 
