@@ -188,6 +188,10 @@ This project is distributed under the MIT License. See `LICENSE.txt` for more in
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=wildminder/ComfyUI-VibeVoice&type=Timeline)](https://www.star-history.com/#wildminder/ComfyUI-VibeVoice&Timeline)
+
 
 <!-- MARKDOWN LINKS & IMAGES -->
 [contributors-shield]: https://img.shields.io/github/contributors/wildminder/ComfyUI-VibeVoice.svg?style=for-the-badge
