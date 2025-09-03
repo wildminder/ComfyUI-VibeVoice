@@ -2,7 +2,12 @@ import os
 import sys
 import logging
 
-# allowing absolute imports like 'from vibevoice.modular...' to work.
+try:
+    import sageattention
+    SAGE_ATTENTION_AVAILABLE = True
+except ImportError:
+    SAGE_ATTENTION_AVAILABLE = False
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
@@ -13,7 +18,7 @@ from .vibevoice_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 # Configure a logger for the entire custom node package
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 logger.propagate = False
 
 if not logger.hasHandlers():
