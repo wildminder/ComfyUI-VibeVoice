@@ -197,7 +197,20 @@ class VibeVoiceLoader:
         logger.info(f"Loading VibeVoice model components from: {model_path}")
 
         tokenizer_repo = MODEL_CONFIGS[model_name].get("tokenizer_repo")
-        tokenizer_file_path = hf_hub_download(repo_id=tokenizer_repo, filename="tokenizer.json")
+        tokenizer_file_path = os.path.join(model_path, "tokenizer.json")
+        # Check if tokenizer.json exists locally. If not, download it directly to the model folder.
+        if not os.path.exists(tokenizer_file_path):
+            logger.info(f"tokenizer.json not found in {model_path}. Downloading from '{tokenizer_repo}'...")
+            try:
+                hf_hub_download(
+                    repo_id=tokenizer_repo,
+                    filename="tokenizer.json",
+                    local_dir=model_path,
+                )
+            except Exception as e:
+                logger.error(f"Failed to download tokenizer.json: {e}")
+                raise
+
         
         vibevoice_tokenizer = VibeVoiceTextTokenizerFast(tokenizer_file=tokenizer_file_path)
         audio_processor = VibeVoiceTokenizerProcessor()
