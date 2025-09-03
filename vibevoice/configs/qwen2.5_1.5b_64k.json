@@ -55,7 +55,7 @@
     "rms_norm_eps": 1e-06,
     "rope_scaling": null,
     "rope_theta": 1000000.0,
-    "sliding_window": null,
+    "sliding_window": 4096,
     "tie_word_embeddings": true,
     "torch_dtype": "bfloat16",
     "use_cache": true,
