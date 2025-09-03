@@ -30,25 +30,23 @@ This project brings the power of **VibeVoice** into the modular workflow of Comf
 
 The custom node handles everything from model downloading and memory management to audio processing, allowing you to generate high-quality speech directly from a text script and reference audio files.
 
-**Key Features:**
+**✨ Key Features:**
 *   **Multi-Speaker TTS:** Generate conversations with up to 4 distinct voices in a single audio output.
 *   **Zero-Shot Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.
-*   **Automatic Model Management:** Models are downloaded automatically from Hugging Face and managed efficiently by ComfyUI to save VRAM.
+*   **Advanced Attention Mechanisms:** Choose between `eager`, `sdpa`, `flash_attention_2`, and the new high-performance `sage` attention for fine-tuned control over speed, memory, and compatibility.
+*   **Robust 4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage, with smart, stable configurations for all attention modes.
+*   **Automatic Model Management:** Models are downloaded automatically and managed efficiently by ComfyUI to save VRAM.
 *   **Fine-Grained Control:** Adjust parameters like CFG scale, temperature, and sampling methods to tune the performance and style of the generated speech.
-*   **4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage and improve speed on memory-constrained GPUs, especially for the 7B model.
-*   **Transformers 4.56+ Compatibility:** Fully backwards compatible with both older and newer versions of the Transformers library.
-*   **Force Offload Option:** Toggle to force model offloading from VRAM after generation to save memory between runs - now with improved ComfyUI compatibility.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 <!-- GETTING STARTED -->
-## Getting Started
+## 🚀 Getting Started
 
-Follow these steps to get the ComfyUI-VibeVoice node running in your environment.
+The node can be installed via **ComfyUI Manager:** Find `ComfyUI-VibeVoice` and click "Install".
 
-### Installation
-The node can be installed via **ComfyUI Manager:** Find `ComfyUI-VibeVoice` and click "Install". Or, install it manually:
-    
+Alternatively, install it manually:
+
 1.  **Clone the Repository:**
     Navigate to your `ComfyUI/custom_nodes/` directory and clone this repository:
     ```sh
@@ -62,6 +60,11 @@ The node can be installed via **ComfyUI Manager:** Find `ComfyUI-VibeVoice` and 
     pip install -r requirements.txt
     ```
 
+3.  **Optional: Install SageAttention**
+    To enable the new `sage` attention mode, you must install the `sageattention` library in your ComfyUI Python environment. For Windows users, please refer to this [AI-windows-whl](https://github.com/wildminder/AI-windows-whl) for the required package.
+
+    > **Note:** This is only required if you intend to use the `sage` attention mode.
+  
 3.  **Start/Restart ComfyUI:**
     Launch ComfyUI. The "VibeVoice TTS" node will appear under the `audio/tts` category. The first time you use the node, it will automatically download the selected model to your `ComfyUI/models/tts/VibeVoice/` folder.
 
@@ -74,7 +77,7 @@ The node can be installed via **ComfyUI Manager:** Find `ComfyUI-VibeVoice` and 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 <!-- USAGE EXAMPLES -->
-## Usage
+## 🛠️ Usage
 
 The node is designed to be intuitive within the ComfyUI workflow.
 
@@ -83,21 +86,38 @@ The node is designed to be intuitive within the ComfyUI workflow.
 3.  **Write Script:** In the `text` input, write your dialogue. Assign lines to speakers using the format `Speaker 1: ...`, `Speaker 2: ...`, etc., on separate lines.
 4.  **Generate:** Queue the prompt. The node will process the script and generate a single audio file containing the full conversation.
 
-_For a complete workflow, you can drag the example image from the `example_workflows` folder onto your ComfyUI canvas._
+> **Tip:** For a complete workflow, you can drag the example image from the `example_workflows` folder onto your ComfyUI canvas.
 
 ### Node Inputs
 
-*   **`model_name`**: Select the VibeVoice model to use.
-*   **`quantize_llm`**: (New!) Enable to run the LLM component in 4-bit (NF4) mode. This dramatically reduces VRAM and can significantly speed up inference on the 7B model.
+*   **`model_name`**: Select the VibeVoice model to use (`1.5B` or `Large`).
+*   **`quantize_llm_4bit`**: **(Overhauled!)** Enable to run the LLM component in 4-bit (NF4) mode. This dramatically reduces VRAM usage.
+*   **`attention_mode`**: **(New!)** Select the attention implementation: `eager` (safest), `sdpa` (balanced), `flash_attention_2` (fastest), or `sage` (quantized high-performance).
 *   **`text`**: The conversational script. Lines must be prefixed with `Speaker <number>:` (e.g., `Speaker 1:`).
 *   **`cfg_scale`**: Controls how strongly the model adheres to the reference voice's timbre.
 *   **`inference_steps`**: Number of diffusion steps for the audio decoder.
 *   **`seed`**: A seed for reproducibility.
 *   **`do_sample`, `temperature`, `top_p`, `top_k`**: Standard sampling parameters for controlling the creativity and determinism of the speech generation.
-*   **`force_offload`**: (New!) Forces the model to be completely offloaded from VRAM after generation. Useful for memory management but may slow down subsequent runs.
-*   **`speaker_*_voice` (Optional)**: Connect an `AUDIO` output from a `Load Audio` node to provide a voice reference.
+*   **`force_offload`**: Forces the model to be completely offloaded from VRAM after generation.
 
-### Performance & Quantization
+<!-- PERFORMANCE SECTION -->
+## ⚙️ Performance & Advanced Features
+
+This update introduces a sophisticated system for managing performance, memory, and stability. The node will automatically select the best configuration based on your choices.
+
+### Feature Compatibility & VRAM Matrix
+
+| Quantize LLM | Attention Mode      | Behavior / Notes                                                                                                                                | Relative VRAM |
+| :----------- | :------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------- | :------------ |
+| **OFF**      | `eager`             | Full Precision. Most compatible baseline.                                                                                                       | High          |
+| **OFF**      | `sdpa`              | Full Precision. Recommended for balanced performance.                                                                                           | High          |
+| **OFF**      | `flash_attention_2` | Full Precision. High performance on compatible GPUs.                                                                                            | High          |
+| **OFF**      | `sage`              | Full Precision. Uses high-performance mixed-precision kernels.                                                                                  | High          |
+| **ON**       | `eager`             | **Falls back to `sdpa`** with `bfloat16` compute. Warns user.                                                                                   | **Low**       |
+| **ON**       | `sdpa`              | **Recommended for memory savings.** Uses `bfloat16` compute.                                                                                    | **Low**       |
+| **ON**       | `flash_attention_2` | **Falls back to `sdpa`** with `bfloat16` compute. Warns user.                                                                                   | **Low**       |
+| **ON**       | `sage`              | **Recommended for stability.** Uses `fp32` compute to ensure numerical stability with quantization, resulting in slightly higher VRAM usage.     | **Medium**    |
+
 
 A key feature of this node is the optional **4-bit quantization** for the language model component. This is highly recommended for users with memory-constrained GPUs (e.g., <= 16GB VRAM) who wish to run the larger `VibeVoice-Large-pt` model.
 
@@ -110,15 +130,39 @@ A key feature of this node is the optional **4-bit quantization** for the langua
 
 As shown, quantization provides a massive speedup and VRAM reduction for the 7B model, making it accessible on a wider range of hardware. While it slightly slows down the 1.5B model, the significant VRAM savings may still be beneficial for complex workflows.
 
-### Transformers Library Compatibility
+*\*Note: `flash_attention_2` with Q4 automatically falls back to `sdpa`.*
 
-This version includes automatic detection and compatibility for both older and newer versions of the Transformers library:
+<!-- CHANGELOG -->
+## Changelog
 
-*   **Transformers 4.56+**: Automatically uses the new method signature for `_prepare_cache_for_generation`
-*   **Older Versions**: Maintains compatibility with pre-4.56 versions using the legacy method signature
-*   **Fallback Mechanism**: If detection fails, the node will automatically try both versions to ensure maximum compatibility
+<details>
+<summary><strong>v1.3.0 - SageAttention & Quantization Overhaul</strong></summary>
 
-This ensures the node works seamlessly regardless of your Transformers version without requiring manual updates.
+### ✨ New Features
+*   **SageAttention Support:** Full integration with the `sageattention` library for a high-performance, mixed-precision attention option.
+*   **Robust 4-Bit LLM Quantization:** The "Quantize LLM (4-bit)" option is now highly stable and delivers significant VRAM savings.
+*   **Smart Configuration & Fallbacks:** The node now automatically handles incompatible settings (e.g., 4-bit with `flash_attention_2`) by gracefully falling back to a stable alternative (`sdpa`) and notifying the user.
+
+### 🐛 Bug Fixes & Stability Improvements
+*   **Fixed SageAttention Crashes** 
+*   **Fixed Numerical Instability (`NaN`/`Inf` Errors)**
+*   **Resolved All `dtype` Mismatches**
+*   **Corrected SageAttention Kernel Assertions**
+*   **Addressed Deprecation Warning**
+</details>
+
+<details>
+<summary><strong>v1.2.0 - Compatibility Update</strong></summary>
+
+### ✅ Compatibility
+*   **Transformers Library:** Includes automatic detection and compatibility for both older and newer versions of the Transformers library (pre- and post-4.56).
+
+### 🐛 Bug Fixes
+*   **Force Offload:** Resolved an `AttributeError` to ensure the force offload option works correctly with all versions of ComfyUI.
+*   **Multi-Speaker DynamicCache:** Fixed a `'DynamicCache' object has no attribute 'key_cache'` error when using multiple speakers with newer versions of the Transformers library.
+</details>
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ### Tips from the Original Authors
 
@@ -126,21 +170,6 @@ This ensures the node works seamlessly regardless of your Transformers version w
 *   **Model Choice:** The 7B model variant (`VibeVoice-Large`) is generally more stable.
 *   **Spontaneous Sounds/Music:** The model may spontaneously generate background music, especially if the reference audio contains it or if the text includes introductory phrases like "Welcome to...". This is an emergent capability and cannot be directly controlled.
 *   **Singing:** The model was not trained on singing data, but it may attempt to sing as an emergent behavior. Results may vary.
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-<!-- BUG FIXES -->
-## Recent Bug Fixes
-
-### Force Offload Compatibility Fix
-*   **Fixed:** Resolved `AttributeError: module 'comfy.model_management' has no attribute 'unload_model_clones'` error when using the force offload option
-*   **Details:** Updated the force offload implementation to use ComfyUI's standard `unload_all_models()` API instead of the deprecated `unload_model_clones()` function
-*   **Impact:** Force offload functionality now works correctly with all versions of ComfyUI
-
-### Multi-Speaker DynamicCache Fix
-*   **Fixed:** Resolved `'DynamicCache' object has no attribute 'key_cache'` error when using multiple speakers
-*   **Details:** Updated cache access in `modeling_vibevoice_inference.py` to use proper DynamicCache API - accessing layers via indexing instead of deprecated `.key_cache` and `.value_cache` attributes
-*   **Impact:** Multi-speaker functionality now works correctly with newer versions of Transformers library
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -156,7 +185,6 @@ This project is distributed under the MIT License. See `LICENSE.txt` for more in
 
 *   **Microsoft** for creating and open-sourcing the [VibeVoice](https://github.com/microsoft/VibeVoice) project.
 *   **The ComfyUI team** for their incredible and extensible platform.
-*   **othneildrew** for the [Best-README-Template](https://github.com/othneildrew/Best-README-Template).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
