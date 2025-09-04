@@ -49,7 +49,7 @@ MODEL_CONFIGS = {
         "tokenizer_repo": "Qwen/Qwen2.5-1.5B"
     },
     "VibeVoice-Large": {
-        "repo_id": "microsoft/VibeVoice-Large",
+        "repo_id": "aoi-ot/VibeVoice-Large",
         "size_gb": 17.4,
         "tokenizer_repo": "Qwen/Qwen2.5-7B"
     }
