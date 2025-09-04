@@ -72,7 +72,7 @@ Alternatively, install it manually:
 | Model | Context Length | Generation Length |  Weight |
 |-------|----------------|----------|----------|
 | VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/microsoft/VibeVoice-1.5B) |
-| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/microsoft/VibeVoice-Large) |
+| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/aoi-ot/VibeVoice-Large) |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
