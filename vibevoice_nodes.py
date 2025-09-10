@@ -1,6 +1,7 @@
 import torch
 import gc
 import logging
+import re
 
 import comfy.model_management as model_management
 from comfy.utils import ProgressBar
@@ -27,8 +28,8 @@ class VibeVoiceTTSNode:
                 }),
                 "text": ("STRING", {
                     "multiline": True, 
-                    "default": "Speaker 1: Hello from ComfyUI!\nSpeaker 2: VibeVoice sounds amazing.",
-                    "tooltip": "The script for the conversation. Use 'Speaker 1:', 'Speaker 2:', etc. to assign lines to different voices. Each speaker line should be on a new line."
+                    "default": "Hello from ComfyUI!\nThis is a second line without speaker tags.",
+                    "tooltip": "The script for the conversation. Use 'Speaker 1:', 'Speaker 2:', etc. to assign lines to different voices. Lines without speaker tags will automatically use Speaker 1."
                 }),
                 "quantize_llm_4bit": ("BOOLEAN", {
                     "default": False, "label_on": "Q4 (LLM only)", "label_off": "Full precision",
@@ -84,6 +85,21 @@ class VibeVoiceTTSNode:
     CATEGORY = "audio/tts"
 
     def generate_audio(self, model_name, text, attention_mode, cfg_scale, inference_steps, seed, do_sample, temperature, top_p, top_k, quantize_llm_4bit, force_offload, **kwargs):
+        # Preprocess text to add Speaker 1: prefix to lines without speaker tags
+        processed_lines = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            # Check if line starts with a speaker tag pattern
+            if re.match(r'^Speaker\s*\d+\s*:', line, re.IGNORECASE):
+                processed_lines.append(line)
+            else:
+                # Add Speaker 1: prefix to lines without tags
+                processed_lines.append(f"Speaker 1: {line}")
+        
+        processed_text = '\n'.join(processed_lines)
+        
         actual_attention_mode = attention_mode
         if quantize_llm_4bit and attention_mode in ["eager", "flash_attention_2"]:
             actual_attention_mode = "sdpa"
@@ -111,9 +127,9 @@ class VibeVoiceTTSNode:
         if model is None or processor is None:
             raise RuntimeError("VibeVoice model and processor could not be loaded. Check logs for errors.")
         
-        parsed_lines_0_based, speaker_ids_1_based = parse_script_1_based(text)
+        parsed_lines_0_based, speaker_ids_1_based = parse_script_1_based(processed_text)
         if not parsed_lines_0_based:
-            raise ValueError("Script is empty or invalid. Use 'Speaker 1:', 'Speaker 2:', etc. format.")
+            raise ValueError("Script is empty or invalid.")
             
         full_script = "\n".join([f"Speaker {spk+1}: {txt}" for spk, txt in parsed_lines_0_based])
         
