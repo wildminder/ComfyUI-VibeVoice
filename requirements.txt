@@ -11,7 +11,7 @@ soundfile
 s3tokenizer
 conformer
 safetensors
-transformers
+transformers>=4.51.3
 diffusers
 tqdm
 bitsandbytes
