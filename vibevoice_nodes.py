@@ -39,11 +39,11 @@ class VibeVoiceTTSNode:
                     "tooltip": "Attention implementation: Eager (safest), SDPA (balanced), Flash Attention 2 (fastest), Sage (quantized)"
                 }),
                 "cfg_scale": ("FLOAT", {
-                    "default": 1.3, "min": 1.0, "max": 10.0, "step": 0.05,
+                    "default": 1.3, "min": 0.1, "max": 50.0, "step": 0.05,
                     "tooltip": "Classifier-Free Guidance scale. Higher values increase adherence to the voice prompt but may reduce naturalness. Recommended: 1.3"
                 }),
                 "inference_steps": ("INT", {
-                    "default": 10, "min": 1, "max": 50,
+                    "default": 10, "min": 1, "max": 500,
                     "tooltip": "Number of diffusion steps for audio generation. More steps can improve quality but take longer. Recommended: 10"
                 }),
                 "seed": ("INT", {
