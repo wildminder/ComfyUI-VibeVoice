@@ -5,7 +5,7 @@ MODEL_CONFIGS = {
         "size_gb": 3.0,
     },
     "VibeVoice-Large": {
-        "repo_id": "microsoft/VibeVoice-Large",
+        "repo_id": "aoi-ot/VibeVoice-Large",
         "size_gb": 17.4,
     }
 }
