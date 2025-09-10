@@ -1,5 +1,6 @@
 # Author: Wildminder
 # Desc: SageAttention and patcher
+# License: Apache 2.0
 
 import torch
 from typing import Optional, Tuple
