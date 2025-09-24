@@ -34,26 +34,51 @@ def parse_script_1_based(script: str) -> tuple[list[tuple[int, str]], list[int]]
     Parses a 1-based speaker script into a list of (speaker_id, text) tuples
     and a list of unique speaker IDs in the order of their first appearance.
     Internally, it converts speaker IDs to 0-based for the model.
+
+    Supports two formats:
+    1. Speaker 1: Some text...
+    2. [1] Some text...
+
+    If no speaker markers are found, the entire script is assigned to Speaker 1.
     """
     parsed_lines = []
     speaker_ids_in_script = [] # This will store the 1-based IDs from the script
+    
+    line_format_regex = re.compile(r'^(?:Speaker\s+(\d+)\s*:|\[(\d+)\])\s*(.*)$', re.IGNORECASE)
+
     for line in script.strip().split("\n"):
         if not (line := line.strip()): continue
-        match = re.match(r'^Speaker\s+(\d+)\s*:\s*(.*)$', line, re.IGNORECASE)
+        
+        match = line_format_regex.match(line)
         if match:
-            speaker_id = int(match.group(1))
+            speaker_id_str = match.group(1) or match.group(2)
+            speaker_id = int(speaker_id_str)
+            text_content = match.group(3)
+
+            if match.group(1) is None and text_content.lstrip().startswith(':'):
+                colon_index = text_content.find(':')
+                text_content = text_content[colon_index + 1:]
+
             if speaker_id < 1:
                 logger.warning(f"Speaker ID must be 1 or greater. Skipping line: '{line}'")
                 continue
-            text = ' ' + match.group(2).strip()
-            # Internally, the model expects 0-based indexing for speakers
+
+            text = text_content.strip() # REMOVED the prepended space ' ' +
             internal_speaker_id = speaker_id - 1
             parsed_lines.append((internal_speaker_id, text))
+            
             if speaker_id not in speaker_ids_in_script:
                 speaker_ids_in_script.append(speaker_id)
         else:
-            logger.warning(f"Could not parse line, skipping: '{line}'")
+            logger.warning(f"Could not parse speaker marker, treating as part of previous line if any, or ignoring: '{line}'")
+
+    if not parsed_lines and script.strip():
+        logger.info("No speaker markers found. Treating entire text as a single utterance for Speaker 1.")
+        parsed_lines.append((0, ' ' + script.strip()))
+        speaker_ids_in_script.append(1)
+
     return parsed_lines, sorted(list(set(speaker_ids_in_script)))
+
 
 def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> np.ndarray:
     """

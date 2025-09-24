@@ -27,8 +27,8 @@ class VibeVoiceTTSNode:
                 }),
                 "text": ("STRING", {
                     "multiline": True, 
-                    "default": "Speaker 1: Hello from ComfyUI!\nSpeaker 2: VibeVoice sounds amazing.",
-                    "tooltip": "The script for the conversation. Use 'Speaker 1:', 'Speaker 2:', etc. to assign lines to different voices. Each speaker line should be on a new line."
+                    "default": "[1] Hello, this is a cloned voice.\n[2] And this is a generated voice, how cool is that?",
+                    "tooltip": "The script for generation. Use '[1]' or 'Speaker 1:' for speakers. If a speaker in the script lacks a reference voice, it will be generated via zero-shot TTS."
                 }),
                 "quantize_llm_4bit": ("BOOLEAN", {
                     "default": False, "label_on": "Q4 (LLM only)", "label_off": "Full precision",
@@ -72,10 +72,10 @@ class VibeVoiceTTSNode:
                 }),
             },
             "optional": {
-                "speaker_1_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 1' in the script."}),
-                "speaker_2_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 2' in the script."}),
-                "speaker_3_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 3' in the script."}),
-                "speaker_4_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 4' in the script."}),
+                "speaker_1_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 1' or '[1]' in the script."}),
+                "speaker_2_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 2' or '[2]' in the script."}),
+                "speaker_3_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 3' or '[3]' in the script."}),
+                "speaker_4_voice": ("AUDIO", {"tooltip": "Reference audio for 'Speaker 4' or '[4]' in the script."}),
             }
         }
     
@@ -113,23 +113,23 @@ class VibeVoiceTTSNode:
         
         parsed_lines_0_based, speaker_ids_1_based = parse_script_1_based(text)
         if not parsed_lines_0_based:
-            raise ValueError("Script is empty or invalid. Use 'Speaker 1:', 'Speaker 2:', etc. format.")
+            raise ValueError("Script is empty or invalid. Please provide text to generate.")
             
-        full_script = "\n".join([f"Speaker {spk+1}: {txt}" for spk, txt in parsed_lines_0_based])
+        # full_script = "\n".join([f"Speaker {spk+1}: {txt}" for spk, txt in parsed_lines_0_based]) # <-- REMOVED: This was the cause of the bug.
         
         speaker_inputs = {i: kwargs.get(f"speaker_{i}_voice") for i in range(1, 5)}
-        voice_samples_np = [preprocess_comfy_audio(speaker_inputs[sid]) for sid in speaker_ids_1_based]
-        
-        if any(v is None for v in voice_samples_np):
-            missing_ids = [sid for sid, v in zip(speaker_ids_1_based, voice_samples_np) if v is None]
-            raise ValueError(f"Script requires voices for Speakers {missing_ids}, but they were not provided.")
-        
+        voice_samples_np = [preprocess_comfy_audio(speaker_inputs.get(sid)) for sid in speaker_ids_1_based]
+
         set_vibevoice_seed(seed)
         
         try:
             inputs = processor(
-                text=[full_script], voice_samples=[voice_samples_np], padding=True,
-                return_tensors="pt", return_attention_mask=True
+                parsed_scripts=[parsed_lines_0_based],
+                voice_samples=[voice_samples_np], 
+                speaker_ids_for_prompt=[speaker_ids_1_based],
+                padding=True,
+                return_tensors="pt", 
+                return_attention_mask=True
             )
             
             for key, value in inputs.items():
@@ -155,7 +155,7 @@ class VibeVoiceTTSNode:
                 def progress_callback(step, total_steps):
                     pbar.update(1)
                     if model_management.interrupt_current_processing:
-                        raise comfy.model_management.InterruptProcessingException()
+                        raise model_management.InterruptProcessingException()
 
                 try:
                     outputs = model.generate(
@@ -172,13 +172,13 @@ class VibeVoiceTTSNode:
                         logger.error("This might be due to invalid input data, GPU memory issues, or incompatible attention mode.")
                         logger.error("Try restarting ComfyUI, using different audio files, or switching to 'eager' attention mode.")
                     raise e
-                except comfy.model_management.InterruptProcessingException:
+                except model_management.InterruptProcessingException:
                     logger.info("VibeVoice generation interrupted by user")
                     raise
                 finally:
                     pbar.update_absolute(inference_steps)
 
-        except comfy.model_management.InterruptProcessingException:
+        except model_management.InterruptProcessingException:
             logger.info("VibeVoice TTS generation was cancelled")
             return ({"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},)
         
