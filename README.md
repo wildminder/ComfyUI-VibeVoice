@@ -4,7 +4,7 @@
 <div align="center">
   <h1 align="center">ComfyUI-VibeVoice</h1>
 
-<img src="./example_workflows/VibeVoice_example.png" alt="ComfyUI-VibeVoice Nodes" alt="Logo" width="600" height="388">
+<img src="https://github.com/user-attachments/assets/ef2af626-efd6-4ce9-a3bf-87e4d51ca82d" alt="ComfyUI-VibeVoice Nodes" width="70%">
 
   <p align="center">
     A custom node for ComfyUI that integrates Microsoft's VibeVoice, a frontier model for generating expressive, long-form, multi-speaker conversational audio.
@@ -27,6 +27,10 @@
 ## About The Project
 
 VibeVoice is a novel framework by Microsoft for generating expressive, long-form, multi-speaker conversational audio. It excels at creating natural-sounding dialogue, podcasts, and more, with consistent voices for up to 4 speakers.
+
+<div align="center">
+      <img src="./example_workflows/VibeVoice_example.png" alt="ComfyUI-VibeVoice example workflow" width="70%">
+  </div>
 
 The custom node handles everything from model downloading and memory management to audio processing, allowing you to generate high-quality speech directly from a text script and reference audio files.
 
