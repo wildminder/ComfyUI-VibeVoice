@@ -26,26 +26,30 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-This project brings the power of **VibeVoice** into the modular workflow of ComfyUI. VibeVoice is a novel framework by Microsoft for generating expressive, long-form, multi-speaker conversational audio. It excels at creating natural-sounding dialogue, podcasts, and more, with consistent voices for up to 4 speakers.
+VibeVoice is a novel framework by Microsoft for generating expressive, long-form, multi-speaker conversational audio. It excels at creating natural-sounding dialogue, podcasts, and more, with consistent voices for up to 4 speakers.
 
 The custom node handles everything from model downloading and memory management to audio processing, allowing you to generate high-quality speech directly from a text script and reference audio files.
 
 **✨ Key Features:**
 *   **Multi-Speaker TTS:** Generate conversations with up to 4 distinct voices in a single audio output.
-*   **Zero-Shot Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.
-*   **Advanced Attention Mechanisms:** Choose between `eager`, `sdpa`, `flash_attention_2`, and the new high-performance `sage` attention for fine-tuned control over speed, memory, and compatibility.
-*   **Robust 4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage, with smart, stable configurations for all attention modes.
+*   **High-Fidelity Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.
+*   **Hybrid Generation Mode:** Mix and match cloned voices with high-quality, zero-shot generated voices in the same script.
+*   **Flexible Scripting:** Use simple `[1]` tags or the classic `Speaker 1:` format to write your dialogue.
+*   **Advanced Attention Mechanisms:** Choose between `eager`, `sdpa`, `flash_attention_2`, and the high-performance `sage` attention for fine-tuned control over speed and compatibility.
+*   **Robust 4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage.
 *   **Automatic Model Management:** Models are downloaded automatically and managed efficiently by ComfyUI to save VRAM.
-*   **Fine-Grained Control:** Adjust parameters like CFG scale, temperature, and sampling methods to tune the performance and style of the generated speech.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 <!-- GETTING STARTED -->
 ## 🚀 Getting Started
 
-The node can be installed via **ComfyUI Manager:** Find `ComfyUI-VibeVoice` and click "Install".
+The easiest way to install is through the **ComfyUI Manager:**
+1.  Go to `Manager` -> `Install Custom Nodes`.
+2.  Search for `ComfyUI-VibeVoice` and click "Install".
+3.  Restart ComfyUI.
 
-Alternatively, install it manually:
+Alternatively, to install manually:
 
 1.  **Clone the Repository:**
     Navigate to your `ComfyUI/custom_nodes/` directory and clone this repository:
@@ -54,18 +58,17 @@ Alternatively, install it manually:
     ```
 
 2.  **Install Dependencies:**
-    Open a terminal or command prompt, navigate into the cloned directory, and install the required Python packages. **For quantization support, ensure you install `bitsandbytes`**.
+    Open a terminal or command prompt, navigate into the cloned directory, and install the required Python packages. **For quantization support, you must install `bitsandbytes`**.
     ```sh
     cd ComfyUI-VibeVoice
     pip install -r requirements.txt
     ```
 
 3.  **Optional: Install SageAttention**
-    To enable the new `sage` attention mode, you must install the `sageattention` library in your ComfyUI Python environment. For Windows users, please refer to this [AI-windows-whl](https://github.com/wildminder/AI-windows-whl) for the required package.
-
+    To enable the `sage` attention mode, you must install the `sageattention` library. For Windows users, a pre-compiled wheel is available at [AI-windows-whl](https://github.com/wildminder/AI-windows-whl).
     > **Note:** This is only required if you intend to use the `sage` attention mode.
-  
-3.  **Start/Restart ComfyUI:**
+
+4.  **Start/Restart ComfyUI:**
     Launch ComfyUI. The "VibeVoice TTS" node will appear under the `audio/tts` category. The first time you use the node, it will automatically download the selected model to your `ComfyUI/models/tts/VibeVoice/` folder.
 
 ## Models
@@ -79,31 +82,55 @@ Alternatively, install it manually:
 <!-- USAGE EXAMPLES -->
 ## 🛠️ Usage
 
-The node is designed to be intuitive within the ComfyUI workflow.
+The node is designed for maximum flexibility within your ComfyUI workflow.
 
 1.  **Add Nodes:** Add the `VibeVoice TTS` node to your graph. Use ComfyUI's built-in `Load Audio` node to load your reference voice files.
-2.  **Connect Voices:** Connect the `AUDIO` output from each `Load Audio` node to the corresponding `speaker_*_voice` input on the VibeVoice TTS node.
-3.  **Write Script:** In the `text` input, write your dialogue. Assign lines to speakers using the format `Speaker 1: ...`, `Speaker 2: ...`, etc., on separate lines.
+2.  **Connect Voices (Optional):** Connect the `AUDIO` output from each `Load Audio` node to the corresponding `speaker_*_voice` input.
+3.  **Write Your Script:** In the `text` input, write your dialogue using one of the supported formats.
 4.  **Generate:** Queue the prompt. The node will process the script and generate a single audio file containing the full conversation.
 
 > **Tip:** For a complete workflow, you can drag the example image from the `example_workflows` folder onto your ComfyUI canvas.
 
+### Scripting and Voice Modes
+
+#### Speaker Tagging
+You can assign lines to speakers in two ways. Both are treated identically.
+
+*   **Modern Format (Recommended):** `[1] This is the first speaker.`
+*   **Classic Format:** `Speaker 1: This is the first speaker.`
+
+You can also add an optional colon to the modern format (e.g., `[1]: ...`). The node handles all variations consistently.
+
+#### Hybrid Voice Generation
+This is a powerful feature that lets you mix cloned voices and generated (zero-shot) voices.
+
+*   **To Clone a Voice:** Connect a `Load Audio` node to the speaker's input (e.g., `speaker_1_voice`).
+*   **To Generate a Voice:** Leave the speaker's input empty. The model will create a unique, high-quality voice for that speaker.
+
+**Example Hybrid Script:**
+```
+[1] This line will use the audio from speaker_1_voice.
+[2] This line will have a new, unique voice generated for it.
+[1] I'm back with my cloned voice.
+```
+In this example, you would only connect an audio source to `speaker_1_voice`.
+
 ### Node Inputs
 
 *   **`model_name`**: Select the VibeVoice model to use (`1.5B` or `Large`).
-*   **`quantize_llm_4bit`**: **(Overhauled!)** Enable to run the LLM component in 4-bit (NF4) mode. This dramatically reduces VRAM usage.
-*   **`attention_mode`**: **(New!)** Select the attention implementation: `eager` (safest), `sdpa` (balanced), `flash_attention_2` (fastest), or `sage` (quantized high-performance).
-*   **`text`**: The conversational script. Lines must be prefixed with `Speaker <number>:` (e.g., `Speaker 1:`).
-*   **`cfg_scale`**: Controls how strongly the model adheres to the reference voice's timbre.
-*   **`inference_steps`**: Number of diffusion steps for the audio decoder.
-*   **`seed`**: A seed for reproducibility.
+*   **`text`**: The conversational script. See "Scripting and Voice Modes" above for formatting.
+*   **`quantize_llm_4bit`**: Enable to run the LLM component in 4-bit (NF4) mode, dramatically reducing VRAM usage.
+*   **`attention_mode`**: Select the attention implementation: `eager` (safest), `sdpa` (balanced), `flash_attention_2` (fastest), or `sage` (quantized high-performance).
+*   **`cfg_scale`**: Controls how strongly the model adheres to the reference voice's timbre. Higher values are stricter. Recommended: `1.3`.
+*   **`inference_steps`**: Number of diffusion steps for audio generation. Recommended: `10`.
+*   **`seed`**: A seed for reproducibility. Set to 0 for a random seed on each run.
 *   **`do_sample`, `temperature`, `top_p`, `top_k`**: Standard sampling parameters for controlling the creativity and determinism of the speech generation.
 *   **`force_offload`**: Forces the model to be completely offloaded from VRAM after generation.
 
 <!-- PERFORMANCE SECTION -->
 ## ⚙️ Performance & Advanced Features
 
-This update introduces a sophisticated system for managing performance, memory, and stability. The node will automatically select the best configuration based on your choices.
+This node features a sophisticated system for managing performance, memory, and stability.
 
 ### Feature Compatibility & VRAM Matrix
 
@@ -119,47 +146,32 @@ This update introduces a sophisticated system for managing performance, memory, 
 | **ON**       | `sage`              | **Recommended for stability.** Uses `fp32` compute to ensure numerical stability with quantization, resulting in slightly higher VRAM usage.     | **Medium**    |
 
 
-A key feature of this node is the optional **4-bit quantization** for the language model component. This is highly recommended for users with memory-constrained GPUs (e.g., <= 16GB VRAM) who wish to run the larger `VibeVoice-Large-pt` model.
-
-**Benefits of `quantize_llm = Enabled`:**
-
-| Model | Performance Impact | VRAM Savings |
-|---|---|---|
-| **VibeVoice-Large (7B)** | **~8.5x faster** inference | Saves **>4.4 GB** (over 36%) |
-| **VibeVoice-1.5B** | ~1.5x slower inference | Saves **~5.5 GB** (over 63%) |
-
-As shown, quantization provides a massive speedup and VRAM reduction for the 7B model, making it accessible on a wider range of hardware. While it slightly slows down the 1.5B model, the significant VRAM savings may still be beneficial for complex workflows.
-
-*\*Note: `flash_attention_2` with Q4 automatically falls back to `sdpa`.*
-
 <!-- CHANGELOG -->
 ## Changelog
+
+<details open>
+<summary><strong>v1.5.0 - Stability and Prompting</strong></summary>
+
+### ✨ New Features & Improvements
+*   **Total Generation Stability:** Fixed the bug where a speaker's voice could unintentionally change or blend with another reference voice mid-sentence.
+*   **Improved Voice Cloning Fidelity** 
+*   **Consistent Speaker Tagging:** The node now intelligently handles multiple script formats (`[1]`, `[1]:`, and `Speaker 1:`) to produce identical, high-quality results, removing all previous inconsistencies.
+*   **Hybrid Voice Generation:** Mix and match cloned voices with high-quality, zero-shot generated voices in the same script. If a speaker's voice input is empty, a unique voice will be generated for them automatically.
+</details>
 
 <details>
 <summary><strong>v1.3.0 - SageAttention & Quantization Overhaul</strong></summary>
 
-### ✨ New Features
 *   **SageAttention Support:** Full integration with the `sageattention` library for a high-performance, mixed-precision attention option.
 *   **Robust 4-Bit LLM Quantization:** The "Quantize LLM (4-bit)" option is now highly stable and delivers significant VRAM savings.
 *   **Smart Configuration & Fallbacks:** The node now automatically handles incompatible settings (e.g., 4-bit with `flash_attention_2`) by gracefully falling back to a stable alternative (`sdpa`) and notifying the user.
-
-### 🐛 Bug Fixes & Stability Improvements
-*   **Fixed SageAttention Crashes** 
-*   **Fixed Numerical Instability (`NaN`/`Inf` Errors)**
-*   **Resolved All `dtype` Mismatches**
-*   **Corrected SageAttention Kernel Assertions**
-*   **Addressed Deprecation Warning**
 </details>
 
 <details>
 <summary><strong>v1.2.0 - Compatibility Update</strong></summary>
 
-### ✅ Compatibility
 *   **Transformers Library:** Includes automatic detection and compatibility for both older and newer versions of the Transformers library (pre- and post-4.56).
-
-### 🐛 Bug Fixes
-*   **Force Offload:** Resolved an `AttributeError` to ensure the force offload option works correctly with all versions of ComfyUI.
-*   **Multi-Speaker DynamicCache:** Fixed a `'DynamicCache' object has no attribute 'key_cache'` error when using multiple speakers with newer versions of the Transformers library.
+*   **Bug Fixes:** Resolved issues with `Force Offload` and multi-speaker generation on newer Transformers versions.
 </details>
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
