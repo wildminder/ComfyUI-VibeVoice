@@ -238,6 +238,7 @@ class VibeVoiceConfig(PretrainedConfig):
         self.acoustic_vae_dim = getattr(self.acoustic_tokenizer_config, 'vae_dim', 64)
         self.semantic_vae_dim = getattr(self.semantic_tokenizer_config, 'vae_dim', 128)
 
+        self.num_hidden_layers = self.decoder_config.num_hidden_layers
         super().__init__(**kwargs)
 
 __all__ = [
