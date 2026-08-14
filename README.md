@@ -37,7 +37,7 @@ The custom node handles everything from model downloading and memory management 
 **✨ Key Features:**
 *   **Multi-Speaker TTS:** Generate conversations with up to 4 distinct voices in a single audio output.
 *   **High-Fidelity Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.
-*   **Hybrid Generation Mode:** Mix and match cloned voices with high-quality, zero-shot generated voices in the same script.
+*   **Hybrid Voice Cloning:** Mix and match cloned speakers in the same script — at least one `speaker_*_voice` reference audio is required; other speakers are cloned from the provided reference(s).
 *   **Flexible Scripting:** Use simple `[1]` tags or the classic `Speaker 1:` format to write your dialogue.
 *   **Advanced Attention Mechanisms:** Choose between `eager`, `sdpa`, `flash_attention_2`, and the high-performance `sage` attention for fine-tuned control over speed and compatibility.
 *   **Robust 4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage.
@@ -106,18 +106,18 @@ You can assign lines to speakers in two ways. Both are treated identically.
 You can also add an optional colon to the modern format (e.g., `[1]: ...`). The node handles all variations consistently.
 
 #### Hybrid Voice Generation
-This is a powerful feature that lets you mix cloned voices and generated (zero-shot) voices.
+This is a powerful feature that lets you mix cloned voices in the same script. **At least one `speaker_*_voice` reference audio is required** — VibeVoice anchors the timbre of every speaker to a provided reference, so you cannot generate a fully reference-free ("zero-shot") voice for any speaker.
 
 *   **To Clone a Voice:** Connect a `Load Audio` node to the speaker's input (e.g., `speaker_1_voice`).
-*   **To Generate a Voice:** Leave the speaker's input empty. The model will create a unique, high-quality voice for that speaker.
+*   **To Reuse a Cloned Voice:** Any other speaker may be left empty. When a speaker has no reference, its voice is cloned from the provided reference(s) rather than generated from scratch.
 
 **Example Hybrid Script:**
 ```
 [1] This line will use the audio from speaker_1_voice.
-[2] This line will have a new, unique voice generated for it.
+[2] This line will reuse the cloned voice from speaker 1.
 [1] I'm back with my cloned voice.
 ```
-In this example, you would only connect an audio source to `speaker_1_voice`.
+In this example, you would connect an audio source to `speaker_1_voice`; speakers `[2]` are cloned from it.
 
 ### Node Inputs
 
@@ -154,13 +154,27 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.0.0 - V3 Extension &amp; VRAM Parity</strong></summary>
+
+### ✨ Highlights
+*   **V3 Extension API:** Migrated the custom-node entrypoint to the ComfyUI V3 `ComfyExtension` / `io.ComfyNode` schema — type-filtered model dropdowns and declarative inputs/outputs.
+*   **VRAM Parity (ASR) — CRIT-001:** The ASR path now runs under the same `VibeVoicePatcher` / `model_management.load_model_gpu` orchestration as TTS, clearing the dedicated ASR cache on unload.
+*   **Warm Re-attach — NTH-004:** `force_offload` can retain model tensors on the intermediate device for a fast re-attach on the next run instead of reloading from disk.
+*   **Streaming TTS Node — NTH-001:** `VibeVoice-Realtime-0.5B` is now reachable through a dedicated `VibeVoice Realtime TTS` node that shares the patcher / attention machinery.
+*   **Maintainability — IMP-004:** TTS/ASR download, discovery, and sharded-load logic is now shared via `BaseVibeVoiceLoader`.
+*   **Device &amp; Attention Honesty — IMP-003 / IMP-001:** MPS/XPU/NPU device selection is honored when available; `flash_attention_2` is only offered when `flash-attn` + CUDA are present.
+*   **Docs Consistency — CRIT-003:** README zero-shot wording now matches `generate_audio` (at least one reference voice is required).
+
+</details>
+
+<details>
 <summary><strong>v1.5.0 - Stability and Prompting</strong></summary>
 
 ### ✨ New Features & Improvements
 *   **Total Generation Stability:** Fixed the bug where a speaker's voice could unintentionally change or blend with another reference voice mid-sentence.
 *   **Improved Voice Cloning Fidelity** 
 *   **Consistent Speaker Tagging:** The node now intelligently handles multiple script formats (`[1]`, `[1]:`, and `Speaker 1:`) to produce identical, high-quality results, removing all previous inconsistencies.
-*   **Hybrid Voice Generation:** Mix and match cloned voices with high-quality, zero-shot generated voices in the same script. If a speaker's voice input is empty, a unique voice will be generated for them automatically.
+*   **Hybrid Voice Cloning:** Mix and match cloned speakers in the same script — at least one reference audio is required; speakers without their own reference are cloned from the provided reference(s).
 </details>
 
 <details>
