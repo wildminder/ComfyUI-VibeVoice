@@ -659,9 +659,17 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         # 4. Decode latents to waveform.
         speech_outputs = None
         if return_speech:
-            # Apply scaling/bias factors if they were computed during forward.
+            # The diffusion head is trained on (and therefore outputs) the
+            # *scaled* acoustic features `audio_features = (tokens + bias) *
+            # scaling`. The VAE decoder expects the *raw* latent tokens, so we
+            # must apply the INVERSE transform before decoding. (This mirrors
+            # the streaming inference path: `latent / scaling - bias`.) The
+            # original `(sampled + bias) * scaling` doubly-scaled the output and
+            # produced a silent/garbage waveform.
             if not torch.isnan(self.model.speech_scaling_factor) and not torch.isnan(self.model.speech_bias_factor):
-                sampled = (sampled + self.model.speech_bias_factor) * self.model.speech_scaling_factor
+                sf = self.model.speech_scaling_factor.to(sampled.device)
+                bf = self.model.speech_bias_factor.to(sampled.device)
+                sampled = sampled / sf - bf
             # Decode expects (batch, vae_dim, frames) or (batch, frames, vae_dim).
             latents = sampled.unsqueeze(0)  # (1, N, vae_dim)
             audio = self.model.acoustic_tokenizer.decode(latents)
