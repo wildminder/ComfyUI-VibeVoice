@@ -1,0 +1,467 @@
+"""Tests for modules/generation.py - Model loading and audio generation."""
+
+import numpy as np
+import torch
+import pytest
+from unittest.mock import patch, MagicMock
+
+from ComfyUI_VibeVoice.modules.generation import (
+    load_vibevoice_model,
+    generate_audio,
+    force_offload_model,
+)
+
+
+def _mock_voice_sample(length: int = 24000) -> np.ndarray:
+    """Create a mock 1-D voice sample numpy array."""
+    return np.random.randn(length).astype(np.float32)
+
+
+class TestLoadVibevoiceModel:
+    """Test load_vibevoice_model function."""
+
+    def test_load_model_cache_miss(self):
+        """When not cached, a new patcher should be created."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        mock_patcher = MagicMock()
+        mock_patcher.model.model = MagicMock()
+        mock_patcher.model.processor = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.VibeVoiceModelHandler") as mock_handler_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.VibeVoicePatcher", return_value=mock_patcher), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            mock_handler = MagicMock()
+            mock_handler.size = 1000
+            mock_handler_cls.return_value = mock_handler
+
+            patcher, model, processor = load_vibevoice_model(
+                model_name="TestModel",
+                device="cpu",
+                dtype="fp32",
+                attention_mode="sdpa",
+                quantize_4bit=False,
+            )
+
+            assert patcher == mock_patcher
+            assert model is not None
+            assert processor is not None
+
+    def test_load_model_cache_hit(self):
+        """When cached, the existing patcher should be returned."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+
+        mock_patcher = MagicMock()
+        mock_patcher.model.model = MagicMock()
+        mock_patcher.model.processor = MagicMock()
+        cache_key = "TestModel_attn_sdpa_q4_0"
+        VIBEVOICE_PATCHER_CACHE[cache_key] = mock_patcher
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            patcher, model, processor = load_vibevoice_model(
+                model_name="TestModel",
+                device="cpu",
+                dtype="fp32",
+                attention_mode="sdpa",
+                quantize_4bit=False,
+            )
+
+            assert patcher == mock_patcher
+
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    def test_load_model_force_reload(self):
+        """force_reload should clear cache and create new patcher."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+
+        old_patcher = MagicMock()
+        cache_key = "TestModel_attn_sdpa_q4_0"
+        VIBEVOICE_PATCHER_CACHE[cache_key] = old_patcher
+
+        new_patcher = MagicMock()
+        new_patcher.model.model = MagicMock()
+        new_patcher.model.processor = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.VibeVoiceModelHandler") as mock_handler_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.VibeVoicePatcher", return_value=new_patcher), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"), \
+             patch("ComfyUI_VibeVoice.modules.generation.cleanup_old_models"):
+            mock_handler = MagicMock()
+            mock_handler.size = 1000
+            mock_handler_cls.return_value = mock_handler
+
+            patcher, model, processor = load_vibevoice_model(
+                model_name="TestModel",
+                device="cpu",
+                dtype="fp32",
+                attention_mode="sdpa",
+                quantize_4bit=False,
+                force_reload=True,
+            )
+
+            assert patcher == new_patcher
+
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    def test_load_model_raises_on_none_model(self):
+        """Should raise RuntimeError if model is None after loading."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        mock_patcher = MagicMock()
+        mock_patcher.model.model = None
+        mock_patcher.model.processor = None
+
+        with patch("ComfyUI_VibeVoice.modules.generation.VibeVoiceModelHandler") as mock_handler_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.VibeVoicePatcher", return_value=mock_patcher), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            mock_handler = MagicMock()
+            mock_handler.size = 1000
+            mock_handler_cls.return_value = mock_handler
+
+            with pytest.raises(RuntimeError, match="could not be loaded"):
+                load_vibevoice_model(
+                    model_name="TestModel",
+                    device="cpu",
+                    dtype="fp32",
+                    attention_mode="sdpa",
+                    quantize_4bit=False,
+                )
+
+
+class TestGenerateAudio:
+    """Test generate_audio function."""
+
+    def test_generate_audio_basic(self):
+        """Test basic audio generation with mocked model."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+
+        # Mock the generate output
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            waveform, sample_rate = generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Hello world",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+                cfg_scale=1.3,
+                inference_steps=10,
+                seed=42,
+                do_sample=True,
+                temperature=0.95,
+                top_p=0.95,
+                top_k=0,
+            )
+
+            assert waveform is not None
+            assert sample_rate == 24000
+            assert waveform.ndim == 3  # [1, 1, T]
+
+    def test_generate_audio_calls_set_ddpm_and_generate_with_correct_kwargs(self):
+        """Verify generate_audio calls model.set_ddpm_inference_steps and
+        model.generate with the non-streaming API contract.
+
+        The non-streaming VibeVoiceForConditionalGeneration.generate() expects
+        acoustic_input_mask (mapped from the processor's speech_input_mask),
+        cfg_scale, inference_steps, and return_speech — NOT the streaming
+        kwargs (max_new_tokens, tokenizer, generation_config, stop_check_fn).
+        """
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        # Processor returns speech_input_mask (not acoustic_input_mask)
+        mock_processor.return_value = {
+            "input_ids": torch.randint(0, 100, (1, 10)),
+            "speech_input_mask": torch.zeros(1, 10, dtype=torch.bool),
+        }
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Hello world",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+                cfg_scale=2.0,
+                inference_steps=15,
+            )
+
+        # set_ddpm_inference_steps must be called with the requested steps
+        mock_model.set_ddpm_inference_steps.assert_called_once_with(num_steps=15)
+
+        # generate() must receive the non-streaming kwargs
+        gen_kwargs = mock_model.generate.call_args.kwargs
+        assert gen_kwargs.get("cfg_scale") == 2.0
+        assert gen_kwargs.get("inference_steps") == 15
+        assert gen_kwargs.get("return_speech") is True
+        # speech_input_mask from the processor must be remapped to acoustic_input_mask
+        assert "acoustic_input_mask" in gen_kwargs
+        assert gen_kwargs.get("speech_input_mask") is None
+        # Streaming-only kwargs must NOT be passed
+        assert "max_new_tokens" not in gen_kwargs
+        assert "tokenizer" not in gen_kwargs
+        assert "generation_config" not in gen_kwargs
+        assert "stop_check_fn" not in gen_kwargs
+
+    def test_generate_audio_processor_called_with_text_param(self):
+        """Verify processor is called with 'text=' parameter containing normalized script text.
+
+        The user's input format '[N] text' is converted to 'Speaker N: text' format
+        that the vendored processor's _parse_script() expects.
+        """
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        test_script = "[1] Hello world"
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text=test_script,
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+            )
+
+            # Verify processor was called with 'text' keyword (not 'parsed_scripts')
+            call_kwargs = mock_processor.call_args.kwargs
+            assert "text" in call_kwargs, "Processor must be called with 'text=' parameter"
+            assert "parsed_scripts" not in call_kwargs, "Processor must NOT be called with 'parsed_scripts='"
+            assert "speaker_ids_for_prompt" not in call_kwargs, "Processor must NOT be called with 'speaker_ids_for_prompt='"
+            # Verify the script is normalized to "Speaker N: text" format
+            # Input "[1] Hello world" → parsed as (0, "Hello world") → normalized to "Speaker 1:Hello world"
+            assert call_kwargs["text"] == ["Speaker 1:Hello world"], \
+                "Processor must receive normalized 'Speaker N: text' format, not raw '[N] text' format"
+
+    def test_generate_audio_multi_speaker_bracket_format_normalized(self):
+        """Verify multi-speaker '[N] text' format is normalized to 'Speaker N: text'."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        # Multi-speaker script in [N] format
+        test_script = "[1] Hello world\n[2] Hi there"
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text=test_script,
+                voice_samples=[
+                    {"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000},
+                    {"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000},
+                ],
+                speaker_ids=[1, 2],
+            )
+
+            call_kwargs = mock_processor.call_args.kwargs
+            # Verify both speakers are normalized to "Speaker N: text" format
+            expected = "Speaker 1:Hello world\nSpeaker 2:Hi there"
+            assert call_kwargs["text"] == [expected], \
+                f"Multi-speaker [N] format must be normalized to 'Speaker N: text'. Got: {call_kwargs['text']}"
+
+    def test_generate_audio_speaker_format_passthrough(self):
+        """Verify 'Speaker N: text' format passes through correctly (already normalized)."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        # Script already in "Speaker N: text" format
+        test_script = "Speaker 1: Hello world"
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text=test_script,
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+            )
+
+            call_kwargs = mock_processor.call_args.kwargs
+            # Should be normalized to the same format
+            assert call_kwargs["text"] == ["Speaker 1:Hello world"], \
+                f"'Speaker N: text' format should pass through. Got: {call_kwargs['text']}"
+
+    def test_generate_audio_empty_script_raises(self):
+        """Empty script should raise ValueError."""
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+
+        with pytest.raises(ValueError, match="empty or invalid"):
+            generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="",
+                voice_samples=[],
+                speaker_ids=[],
+            )
+
+    def test_generate_audio_no_valid_voice_samples_raises(self):
+        """No valid voice samples should raise ValueError."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_processor = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=None):
+            with pytest.raises(ValueError, match="No valid voice samples"):
+                generate_audio(
+                    model=mock_model,
+                    processor=mock_processor,
+                    text="[1] Hello world",
+                    voice_samples=[None],
+                    speaker_ids=[1],
+                )
+
+    def test_generate_audio_requires_voice_sample(self):
+        """White-box lock for CRIT-003: an all-None multi-speaker voice list must
+        raise ValueError before any model use (matches README's required-reference rule)."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_processor = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=None):
+            with pytest.raises(ValueError, match="voice sample"):
+                generate_audio(
+                    model=mock_model,
+                    processor=mock_processor,
+                    text="[1] Hello\n[2] World",
+                    voice_samples=[None, None],
+                    speaker_ids=[1, 2],
+                )
+            # The model must never be touched when validation fails early.
+            mock_model.generate.assert_not_called()
+
+    def test_generate_audio_output_shape(self):
+        """Output should be [1, 1, T] shape."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(48000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            waveform, sr = generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Test",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+            )
+
+            assert waveform.shape[0] == 1
+            assert waveform.shape[1] == 1
+
+    def test_generate_audio_sample_rate(self):
+        """Sample rate should be 24000."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(1000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            _, sr = generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Test",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+            )
+
+            assert sr == 24000
+
+
+class TestForceOffloadModel:
+    """Test force_offload_model function."""
+
+    def test_force_offload_calls_unpatch(self):
+        mock_patcher = MagicMock()
+        mock_patcher.is_loaded = True
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
+            force_offload_model(mock_patcher, "TestModel")
+
+            mock_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True)
+
+    def test_force_offload_skips_when_not_loaded(self):
+        mock_patcher = MagicMock()
+        mock_patcher.is_loaded = False
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
+            force_offload_model(mock_patcher, "TestModel")
+
+            mock_patcher.unpatch_model.assert_not_called()
+
+    def test_force_offload_passes_warm_flag(self):
+        """NTH-004: warm=True must be forwarded to unpatch_model."""
+        mock_patcher = MagicMock()
+        mock_patcher.is_loaded = True
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
+            force_offload_model(mock_patcher, "TestModel", warm=True)
+
+        mock_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True, warm=True)
