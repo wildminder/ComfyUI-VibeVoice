@@ -117,11 +117,13 @@ class TestPreprocessComfyAudio:
         assert not np.any(np.isnan(result))
 
     def test_preprocess_comfy_audio_resample(self):
-        """Resampling path should call resample_audio (scipy-based)."""
+        """Resampling path should call the backend's tensor resampler."""
+        from ComfyUI_VibeVoice.modules import audio_backend
+
         waveform = torch.randn(1, 1, 16000)
         audio = {"waveform": waveform, "sample_rate": 16000}
-        with patch("ComfyUI_VibeVoice.modules.audio_utils.resample_audio",
-                    wraps=resample_audio) as mock_resample:
+        with patch.object(audio_backend, "resample_audio_tensor",
+                          wraps=audio_backend.resample_audio_tensor) as mock_resample:
             result = preprocess_comfy_audio(audio, target_sr=24000)
             assert result is not None
             mock_resample.assert_called_once()
@@ -129,14 +131,38 @@ class TestPreprocessComfyAudio:
             assert result.shape[0] > 16000
 
     def test_preprocess_comfy_audio_no_resample_needed(self):
-        """When sample rates match, resample_audio must NOT be called."""
+        """When sample rates match, the backend resampler must NOT be called."""
+        from ComfyUI_VibeVoice.modules import audio_backend
+
         waveform = torch.randn(1, 1, 24000)
         audio = {"waveform": waveform, "sample_rate": 24000}
-        with patch("ComfyUI_VibeVoice.modules.audio_utils.resample_audio",
-                    wraps=resample_audio) as mock_resample:
+        with patch.object(audio_backend, "resample_audio_tensor",
+                          wraps=audio_backend.resample_audio_tensor) as mock_resample:
             result = preprocess_comfy_audio(audio, target_sr=24000)
             assert result is not None
             mock_resample.assert_not_called()
+
+    def test_preprocess_comfy_audio_resamples_in_tensor_space(self):
+        """The tensor resampler must receive a torch.Tensor (no numpy round-trip)."""
+        from ComfyUI_VibeVoice.modules import audio_backend
+
+        original = audio_backend.resample_audio_tensor
+        received = {}
+
+        def spy(tensor, orig_sr, target_sr):
+            received["type"] = type(tensor)
+            received["orig_sr"] = orig_sr
+            received["target_sr"] = target_sr
+            return original(tensor, orig_sr, target_sr)
+
+        waveform = torch.randn(1, 1, 16000)
+        audio = {"waveform": waveform, "sample_rate": 16000}
+        with patch.object(audio_backend, "resample_audio_tensor", side_effect=spy):
+            result = preprocess_comfy_audio(audio, target_sr=24000)
+        assert result is not None
+        assert received["type"] is torch.Tensor
+        assert received["orig_sr"] == 16000
+        assert received["target_sr"] == 24000
 
     def test_preprocess_comfy_audio_extreme_values_normalized(self):
         waveform = torch.tensor([[[100.0, 200.0, 50.0]]])
@@ -182,7 +208,7 @@ class TestExtractAudioTensor:
 
 
 class TestResampleAudio:
-    """Test resample_audio (scipy-based, librosa-free)."""
+    """Test resample_audio (backend-delegated: torchaudio primary)."""
 
     def test_resample_downsample_length(self):
         x = np.sin(2 * np.pi * 440 * np.arange(24000) / 24000).astype(np.float32)

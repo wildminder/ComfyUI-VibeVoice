@@ -72,6 +72,12 @@ Alternatively, to install manually:
     To enable the `sage` attention mode, you must install the `sageattention` library. For Windows users, a pre-compiled wheel is available at [AI-windows-whl](https://github.com/wildminder/AI-windows-whl).
     > **Note:** This is only required if you intend to use the `sage` attention mode.
 
+> **Audio backend:** Audio resampling uses **`torchaudio`** (the ComfyUI-core idiom) as the primary
+> library; file decoding uses **PyAV** (`av`, bundled with ComfyUI) with `soundfile` as fallback.
+> **`librosa` is not required** — it is only an optional last-resort fallback, and the node
+> degrades gracefully when it (or `scipy`) is absent. To install the optional fallbacks:
+> `pip install scipy librosa` (or `pip install ComfyUI-VibeVoice[audio-extra]`).
+
 4.  **Start/Restart ComfyUI:**
     Launch ComfyUI. The "VibeVoice TTS" node will appear under the `audio/tts` category. The first time you use the node, it will automatically download the selected model to your `ComfyUI/models/tts/VibeVoice/` folder.
 
@@ -154,6 +160,38 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.1.0 - torchaudio-Primary Audio Backend (librosa now optional)</strong></summary>
+
+### ✨ Highlights
+*   **torchaudio is now the primary audio library.** Resampling uses `torchaudio.functional.resample`
+    (Kaiser-windowed sinc — the same family ComfyUI core uses), matching the ComfyUI-core idiom.
+*   **`librosa` is no longer a hard dependency.** It was declared but never actually imported
+    (a phantom dependency). It is now an *optional* last-resort fallback; the node never crashes
+    when librosa (or scipy) is missing or broken (e.g. the empty librosa namespace stub shipped in
+    some embedded Pythons).
+*   **ComfyUI built-ins adopted:** file decoding now uses PyAV (`av`) — ComfyUI's own audio decoder —
+    with `soundfile`/`torchaudio`/`librosa` as guarded fallbacks. This also fixes `.m4a`/`.ogg`
+    reference-audio loading, which `soundfile` (libsndfile) cannot decode.
+*   **Dependency surface minimized:** `librosa` and `scipy` moved to the optional
+    `[audio-extra]` group; `torchaudio` + `soundfile` remain the working default.
+
+### 🔧 Changes
+*   New `modules/audio_backend.py`: single dependency-resilient backend for resample / load / save
+    with import-time capability detection (`_HAS_*` flags) and graceful fallback ordering.
+*   `modules/audio_utils.py`: `resample_audio()` delegates to the backend; `preprocess_comfy_audio()`
+    now resamples in tensor space (no numpy round-trip).
+*   Vendored processors (`_load_audio_from_path`, `save_audio`, ASR file loading) route through the
+    backend; no hard `ffmpeg`/`soundfile` requirement for the common wav/flac path.
+
+### 🧪 Tests
+*   New `tests/test_audio_backend.py` (41 tests): import resilience with any optional lib blocked,
+    resample correctness/priority/fallbacks, numpy↔tensor parity, file I/O roundtrips, `f32_pcm`.
+*   New `tests/test_processor_io_backend.py` (17 tests): real vendored processor I/O via the backend.
+*   Extended `tests/test_audio_utils.py`, `tests/test_pyproject.py`, `tests/test_imports.py`.
+
+</details>
+
+<details>
 <summary><strong>v2.0.2 - Negative-Branch RoPE Position Fix (SDPA Shape Crash)</strong></summary>
 
 ### 🐛 Fixes

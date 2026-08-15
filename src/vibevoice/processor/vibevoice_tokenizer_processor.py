@@ -15,6 +15,7 @@ from transformers.utils import logging
 
 from .audio_utils import AudioNormalizer
 from ....modules.audio_utils import resample_audio
+from ....modules import audio_backend
 
 logger = logging.get_logger(__name__)
 
@@ -213,11 +214,10 @@ class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
         file_ext = os.path.splitext(audio_path)[1].lower()
         
         if file_ext in ['.wav', '.mp3', '.flac', '.m4a', '.ogg']:
-            # Audio file - use soundfile (librosa is unreliable in some envs)
-            import soundfile as sf
-            audio_array, sr = sf.read(audio_path, dtype='float32')
-            if audio_array.ndim > 1:
-                audio_array = audio_array.mean(axis=1)  # Convert to mono
+            # Audio file - decode via the audio backend (PyAV primary, the
+            # ComfyUI-core decoder; soundfile/torchaudio/librosa fallbacks).
+            # This also fixes .m4a/.ogg which libsndfile cannot decode.
+            audio_array, sr = audio_backend.load_audio_file(audio_path)
             if sr != self.sampling_rate:
                 audio_array = resample_audio(audio_array, sr, self.sampling_rate)
             return audio_array.astype(np.float32)
@@ -308,13 +308,8 @@ class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
         if sampling_rate is None:
             sampling_rate = self.sampling_rate
         
-        try:
-            import soundfile as sf
-        except ImportError:
-            raise ImportError(
-                "soundfile is required to save audio files. "
-                "Install it with: pip install soundfile"
-            )
+        # Encoding is delegated to the audio backend (soundfile primary,
+        # torchaudio.save guarded fallback). No hard soundfile requirement.
         
         # Ensure audio is in the right format
         if isinstance(audio, torch.Tensor):
@@ -345,7 +340,7 @@ class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
             for i, audio_item in enumerate(audio_np):
                 audio_item = self._prepare_audio_for_save(audio_item, normalize)
                 file_path = os.path.join(output_dir, f"{batch_prefix}{i}.wav")
-                sf.write(file_path, audio_item, sampling_rate)
+                audio_backend.save_audio_file(file_path, audio_item, sampling_rate)
                 saved_paths.append(file_path)
                 
         else:
@@ -371,18 +366,18 @@ class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
                         
                         single_audio = self._prepare_audio_for_save(single_audio, normalize)
                         file_path = os.path.join(output_dir, f"{batch_prefix}{i}.wav")
-                        sf.write(file_path, single_audio, sampling_rate)
+                        audio_backend.save_audio_file(file_path, single_audio, sampling_rate)
                         saved_paths.append(file_path)
                 else:
                     # Single audio with batch and channel dims
                     audio_item = audio_np.squeeze()  # Remove batch and channel dimensions
                     audio_item = self._prepare_audio_for_save(audio_item, normalize)
-                    sf.write(output_path, audio_item, sampling_rate)
+                    audio_backend.save_audio_file(output_path, audio_item, sampling_rate)
                     saved_paths.append(output_path)
             else:
                 # Single audio without batch dimension
                 audio_item = self._prepare_audio_for_save(audio_np, normalize)
-                sf.write(output_path, audio_item, sampling_rate)
+                audio_backend.save_audio_file(output_path, audio_item, sampling_rate)
                 saved_paths.append(output_path)
         
         return saved_paths

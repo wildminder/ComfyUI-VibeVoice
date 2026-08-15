@@ -15,13 +15,14 @@ from transformers.tokenization_utils_base import BatchEncoding
 from transformers.utils import TensorType, logging
 from .vibevoice_tokenizer_processor import VibeVoiceTokenizerProcessor, AudioNormalizer
 from ....modules.audio_utils import resample_audio
+from ....modules import audio_backend
 
 try:
     from .audio_utils import load_audio_use_ffmpeg
     HAS_FFMPEG_UTILS = True
 except ImportError:
     HAS_FFMPEG_UTILS = False
-    warnings.warn("audio_utils not available, will fall back to soundfile for audio loading")
+    warnings.warn("audio_utils not available; the audio backend (PyAV/soundfile) handles file loading")
 
 logger = logging.get_logger(__name__)
 
@@ -287,23 +288,11 @@ class VibeVoiceASRProcessor:
         """
         # Process audio through audio processor
         if isinstance(audio, str):
-            # Load from file using ffmpeg for better format support
-            if HAS_FFMPEG_UTILS:
-                try:
-                    audio_array, file_sr = load_audio_use_ffmpeg(audio, resample=False)
-                except Exception as e:
-                    # Fall back to soundfile if ffmpeg fails
-                    warnings.warn(f"ffmpeg loading failed, falling back to soundfile: {e}")
-                    import soundfile as sf
-                    audio_array, file_sr = sf.read(audio)
-                    if audio_array.ndim > 1:
-                        audio_array = audio_array.mean(axis=1)  # Convert to mono
-            else:
-                import soundfile as sf
-                audio_array, file_sr = sf.read(audio)
-                if audio_array.ndim > 1:
-                    audio_array = audio_array.mean(axis=1)  # Convert to mono
-            
+            # Load from file via the audio backend (PyAV primary — the
+            # ComfyUI-core decoder — with soundfile/torchaudio/librosa
+            # fallbacks). No hard ffmpeg dependency.
+            audio_array, file_sr = audio_backend.load_audio_file(audio)
+
             # Resample if needed
             if file_sr != self.target_sample_rate:
                 audio_array = resample_audio(
