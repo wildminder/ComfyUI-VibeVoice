@@ -20,8 +20,6 @@ from .base_loader import BaseVibeVoiceLoader
 from ..src.vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from ..src.vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 
-from huggingface_hub import snapshot_download
-
 logger = logging.getLogger(__name__)
 
 # Separate cache for ASR models
@@ -139,7 +137,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
         model_dtype = resolve_dtype(dtype_str, load_device)
 
         # Resolve attention mode
-        attention_mode = resolve_attention_mode(attention_mode, use_llm_4bit=False)
+        attention_mode = resolve_attention_mode(attention_mode, quantize_4bit=False)
         attn_implementation = get_attn_implementation_for_load(attention_mode)
 
         try:

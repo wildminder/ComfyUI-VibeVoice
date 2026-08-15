@@ -97,8 +97,15 @@ class TestGetTorchDevice:
             assert device.type == DEVICE_XPU
 
     def test_npu_available(self):
+        # NPU requires a special torch build that registers the "npu" device type.
+        # On standard builds torch.device("npu") raises, so skip there.
+        try:
+            torch.device(DEVICE_NPU)
+        except RuntimeError:
+            pytest.skip("torch build does not support the 'npu' device type")
+
         with patch("ComfyUI_VibeVoice.modules.device_utils._get_model_management") as mock_mm, \
-             patch("torch.npu") as mock_npu:
+             patch("torch.npu", create=True) as mock_npu:
             mock_npu.is_available.return_value = True
             mock_mm.return_value.get_torch_device.return_value = torch.device("cuda")
             device = get_torch_device(DEVICE_NPU)

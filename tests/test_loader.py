@@ -96,7 +96,7 @@ class TestVibeVoiceLoaderResolvePaths:
         with patch("ComfyUI_VibeVoice.modules.loader.AVAILABLE_VIBEVOICE_MODELS", {
             "TestModel": {"type": "official", "repo_id": "test/repo"}
         }), patch("ComfyUI_VibeVoice.modules.loader.folder_paths") as mock_fp, \
-             patch("ComfyUI_VibeVoice.modules.loader.snapshot_download") as mock_dl, \
+             patch("huggingface_hub.snapshot_download") as mock_dl, \
              patch("os.path.exists", return_value=True):
             mock_fp.get_folder_paths.return_value = [str(tmp_path)]
             model_path, config_path, preproc_path, tokenizer_dir = \
@@ -507,3 +507,254 @@ class TestTTSLoaderBaseInheritance:
 
     def test_tts_loader_uses_base(self):
         assert isinstance(VibeVoiceLoader(), BaseVibeVoiceLoader)
+
+
+# ====================================================================
+# AUDIT PHASE B — B2: config loading & streaming detection
+# ====================================================================
+class TestLoadConfig:
+    """B2: _load_config must pick the right config class + fallback."""
+
+    def test_streaming_json_uses_streaming_config_class(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"model_type": "vibevoice_streaming"}))
+
+        with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceStreamingConfig") as mock_stream, \
+             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceConfig") as mock_base:
+            VibeVoiceLoader._load_config(str(config_path), "SomeModel")
+            mock_stream.from_pretrained.assert_called_once_with(str(config_path))
+            mock_base.from_pretrained.assert_not_called()
+
+    def test_non_streaming_json_uses_base_config_class(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"model_type": "vibevoice"}))
+
+        with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceStreamingConfig") as mock_stream, \
+             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceConfig") as mock_base:
+            VibeVoiceLoader._load_config(str(config_path), "SomeModel")
+            mock_base.from_pretrained.assert_called_once_with(str(config_path))
+            mock_stream.from_pretrained.assert_not_called()
+
+    def test_missing_config_falls_back_to_large_default(self):
+        with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceConfig") as mock_base:
+            VibeVoiceLoader._load_config("/nonexistent/config.json", "VibeVoice-Large")
+            mock_base.from_pretrained.assert_called_once()
+            fallback_arg = mock_base.from_pretrained.call_args[0][0]
+            assert "default_VibeVoice-Large_config.json" in fallback_arg
+
+    def test_missing_config_falls_back_to_15b_default(self):
+        with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceConfig") as mock_base:
+            VibeVoiceLoader._load_config("/nonexistent/config.json", "VibeVoice-1.5B")
+            fallback_arg = mock_base.from_pretrained.call_args[0][0]
+            assert "default_VibeVoice-1.5B_config.json" in fallback_arg
+
+
+# ====================================================================
+# AUDIT PHASE B — B3: tokenizer acquisition order
+# ====================================================================
+class TestLoadTokenizer:
+    """B3: existing file -> packaged copy -> HF download -> RuntimeError."""
+
+    def test_existing_tokenizer_no_copy_no_download(self, tmp_path):
+        (tmp_path / "tokenizer.json").write_text("{}")
+        with patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile") as mock_copy, \
+             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download") as mock_dl, \
+             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast") as mock_tok:
+            VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
+            mock_copy.assert_not_called()
+            mock_dl.assert_not_called()
+            mock_tok.assert_called_once_with(
+                tokenizer_file=str(tmp_path / "tokenizer.json")
+            )
+
+    def test_packaged_fallback_copied_no_download(self, tmp_path):
+        # No tokenizer.json in the model dir; packaged copy exists (mocked).
+        def fake_copy(src, dst):
+            with open(dst, "w") as f:
+                f.write("{}")
+
+        with patch("os.path.exists", side_effect=lambda p: (
+            True if "configs" in p else os.path.isfile(p)
+        )), patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile", side_effect=fake_copy) as mock_copy, \
+             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download") as mock_dl, \
+             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
+            VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
+            mock_copy.assert_called_once()
+            mock_dl.assert_not_called()
+
+    def test_download_fallback_second_repo_succeeds(self, tmp_path):
+        calls = []
+
+        def fake_download(repo_id=None, filename=None, local_dir=None):
+            calls.append(repo_id)
+            if repo_id == "Qwen/Qwen2.5-1.5B":
+                raise RuntimeError("offline")
+            # second repo succeeds
+            with open(os.path.join(local_dir, "tokenizer.json"), "w") as f:
+                f.write("{}")
+
+        with patch("os.path.exists", side_effect=lambda p: os.path.isfile(p)), \
+             patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile"), \
+             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download", side_effect=fake_download), \
+             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
+            VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
+            assert calls == ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"]
+
+    def test_all_sources_fail_raises_runtime_error(self, tmp_path):
+        with patch("os.path.exists", return_value=False), \
+             patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile"), \
+             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download",
+                   side_effect=RuntimeError("offline")), \
+             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
+            with pytest.raises(RuntimeError, match="Could not get 'tokenizer.json'"):
+                VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
+
+
+# ====================================================================
+# AUDIT PHASE B — B6: load_model orchestration (fully mocked)
+# ====================================================================
+class TestLoadModelOrchestration:
+    """B6: full load_model sequence, cache, and failure isolation."""
+
+    def _model_registry(self, model_type="official"):
+        return {"TestModel": {"type": model_type, "repo_id": "test/repo", "path": "x"}}
+
+    def test_unknown_model_raises_value_error(self):
+        with patch("ComfyUI_VibeVoice.modules.loader.AVAILABLE_VIBEVOICE_MODELS", {}):
+            with pytest.raises(ValueError, match="Unknown VibeVoice model"):
+                VibeVoiceLoader.load_model("Nope", torch.device("cpu"))
+
+    def test_cache_hit_short_circuits(self):
+        LOADED_MODELS_CACHE.clear()
+        sentinel = ("cached_model", "cached_processor")
+        LOADED_MODELS_CACHE["TestModel_attn_sdpa_q4_0"] = sentinel
+        try:
+            with patch("ComfyUI_VibeVoice.modules.loader.AVAILABLE_VIBEVOICE_MODELS",
+                       self._model_registry()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_model_paths") as mock_rp:
+                result = VibeVoiceLoader.load_model(
+                    "TestModel", torch.device("cpu"), attention_mode="sdpa"
+                )
+                assert result == sentinel
+                mock_rp.assert_not_called()  # no work done on cache hit
+        finally:
+            LOADED_MODELS_CACHE.clear()
+
+    def test_full_sequence_and_cache_store(self):
+        LOADED_MODELS_CACHE.clear()
+        ledger = []
+
+        fake_model = MagicMock()
+        fake_model.to.return_value = fake_model
+        fake_processor = MagicMock()
+        fake_config = MagicMock(spec=[])  # not a VibeVoiceStreamingConfig instance
+
+        # isinstance() needs a real class, not a MagicMock.
+        class _FakeStreamingCfg:
+            pass
+
+        try:
+            with patch("ComfyUI_VibeVoice.modules.loader.AVAILABLE_VIBEVOICE_MODELS",
+                       self._model_registry()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceStreamingConfig", _FakeStreamingCfg), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_model_paths",
+                       side_effect=lambda n: (ledger.append("paths"), ("mp", "cp", "pp", "td"))[1]), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_config",
+                       side_effect=lambda cp, n: (ledger.append("config"), fake_config)[1]), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_tokenizer",
+                       side_effect=lambda td, n: (ledger.append("tokenizer"), MagicMock())[1]), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_processor",
+                       side_effect=lambda tok, pp, is_streaming=False: (
+                           ledger.append("processor"), fake_processor)[1]), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._instantiate_model",
+                       side_effect=lambda **kw: (ledger.append("instantiate"), fake_model)[1]), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_state_dict_into_model",
+                       side_effect=lambda **kw: (ledger.append("state_dict"), fake_model)[1]):
+                model, processor = VibeVoiceLoader.load_model(
+                    "TestModel", torch.device("cpu"), attention_mode="sdpa"
+                )
+
+            assert model is fake_model
+            assert processor is fake_processor
+            assert ledger == ["paths", "config", "tokenizer", "processor",
+                              "instantiate", "state_dict"]
+            # model moved to device+dtype, eval'd, cached
+            fake_model.to.assert_called()
+            fake_model.eval.assert_called_once()
+            assert LOADED_MODELS_CACHE["TestModel_attn_sdpa_q4_0"] == (fake_model, fake_processor)
+        finally:
+            LOADED_MODELS_CACHE.clear()
+
+    def test_exception_mid_load_wraps_and_does_not_pollute_cache(self):
+        LOADED_MODELS_CACHE.clear()
+
+        class _FakeStreamingCfg:
+            pass
+
+        try:
+            with patch("ComfyUI_VibeVoice.modules.loader.AVAILABLE_VIBEVOICE_MODELS",
+                       self._model_registry()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceStreamingConfig", _FakeStreamingCfg), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_model_paths",
+                       return_value=("mp", "cp", "pp", "td")), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_config",
+                       return_value=MagicMock(spec=[])), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_tokenizer",
+                       return_value=MagicMock()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_processor",
+                       return_value=MagicMock()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._instantiate_model",
+                       side_effect=RuntimeError("boom")):
+                with pytest.raises(RuntimeError, match="Failed to load model"):
+                    VibeVoiceLoader.load_model(
+                        "TestModel", torch.device("cpu"), attention_mode="sdpa"
+                    )
+            # Cache must NOT contain a partial entry.
+            assert "TestModel_attn_sdpa_q4_0" not in LOADED_MODELS_CACHE
+        finally:
+            LOADED_MODELS_CACHE.clear()
+
+    def test_4bit_builds_bnb_config_and_replaces_linears(self):
+        LOADED_MODELS_CACHE.clear()
+        fake_model = MagicMock()
+        fake_model.to.return_value = fake_model
+
+        class _FakeStreamingCfg:
+            pass
+
+        # AUD-014: patch the import target that actually resolves on this
+        # transformers version (integrations on 5.x, utils on 4.x).
+        try:
+            import transformers.integrations.bitsandbytes as _bnb_mod
+            _bnb_target = "transformers.integrations.bitsandbytes.replace_with_bnb_linear"
+        except ImportError:
+            _bnb_target = "transformers.utils.bitsandbytes.replace_with_bnb_linear"
+
+        try:
+            with patch("ComfyUI_VibeVoice.modules.loader.AVAILABLE_VIBEVOICE_MODELS",
+                       self._model_registry()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceStreamingConfig", _FakeStreamingCfg), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_model_paths",
+                       return_value=("mp", "cp", "pp", "td")), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_config",
+                       return_value=MagicMock(spec=[])), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_tokenizer",
+                       return_value=MagicMock()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_processor",
+                       return_value=MagicMock()), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._instantiate_model",
+                       return_value=fake_model), \
+                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_state_dict_into_model",
+                       return_value=fake_model), \
+                 patch("ComfyUI_VibeVoice.modules.loader.BitsAndBytesConfig") as mock_bnb, \
+                 patch(_bnb_target) as mock_replace:
+                VibeVoiceLoader.load_model(
+                    "TestModel", torch.device("cpu"),
+                    attention_mode="sdpa", use_llm_4bit=True,
+                )
+                mock_bnb.assert_called_once()
+                assert mock_bnb.call_args.kwargs["load_in_4bit"] is True
+                mock_replace.assert_called_once()
+                assert getattr(fake_model, "_llm_4bit") is True
+        finally:
+            LOADED_MODELS_CACHE.clear()

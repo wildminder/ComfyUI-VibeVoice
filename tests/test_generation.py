@@ -175,8 +175,10 @@ class TestGenerateAudio:
 
         The non-streaming VibeVoiceForConditionalGeneration.generate() expects
         acoustic_input_mask (mapped from the processor's speech_input_mask),
-        cfg_scale, inference_steps, and return_speech — NOT the streaming
-        kwargs (max_new_tokens, tokenizer, generation_config, stop_check_fn).
+        cfg_scale, inference_steps, return_speech, the processor tokenizer (so
+        generate() can resolve speech_end_id and terminate the AR loop), and an
+        optional max_new_tokens length budget — NOT the streaming-only kwargs
+        (generation_config, stop_check_fn, all_prefilled_outputs, tts_text_ids).
         """
         mock_model = MagicMock()
         mock_model.device = torch.device("cpu")
@@ -217,9 +219,12 @@ class TestGenerateAudio:
         # speech_input_mask from the processor must be remapped to acoustic_input_mask
         assert "acoustic_input_mask" in gen_kwargs
         assert gen_kwargs.get("speech_input_mask") is None
-        # Streaming-only kwargs must NOT be passed
+        # The processor tokenizer must be forwarded (needed for speech_end_id EOS).
+        assert gen_kwargs.get("tokenizer") is mock_processor.tokenizer
+        # max_new_tokens defaults to None and is dropped by the None-filter; when
+        # unset it must NOT appear, but it is a legitimate non-streaming kwarg.
         assert "max_new_tokens" not in gen_kwargs
-        assert "tokenizer" not in gen_kwargs
+        # Streaming-only kwargs must NOT be passed
         assert "generation_config" not in gen_kwargs
         assert "stop_check_fn" not in gen_kwargs
 

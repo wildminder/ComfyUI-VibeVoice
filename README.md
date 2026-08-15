@@ -154,6 +154,30 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.0.2 - Negative-Branch RoPE Position Fix (SDPA Shape Crash)</strong></summary>
+
+### 🐛 Fixes
+*   **BUG-011 — Negative-branch RoPE `position_ids` desync:** Fixed a `RuntimeError: Expected size for first two dimensions of batch2 tensor to be: [12, 3] but got: [12, 2]` crash during TTS generation. In the non-streaming `generate()` CFG loop, the negative (unconditional) forward fed a **single-token** `inputs_embeds` `(B,1,H)` together with a **full-length** `position_ids` `(B, step+1)`. In transformers 5.x the explicit `position_ids` drive RoPE directly, so q/k silently broadcast against full-length cos/sin and expanded to seq-len `step+1` while v (never rotated) stayed length 1 — the KV cache accumulated `step+1` keys but only 1 value per step, and SDPA's `attn @ value` crashed at AR step 1. The negative forward now passes **current-only** `position_ids` (`neg_position_ids[:, -1:]`), matching its single input token; the attention mask stays full-length.
+
+### 🧪 Tests
+*   New `tests/test_generate_neg_position_ids.py` (4 tests): drives the real `generate()` through several AR steps with a recording inner LM and locks the invariant that `position_ids` length always equals `inputs_embeds` sequence length (red/green verified against the buggy code).
+
+</details>
+
+<details>
+<summary><strong>v2.0.1 - CPU-First Model Loading (VRAM Round-Trip Fix)</strong></summary>
+
+### 🐛 Fixes
+*   **Load Device Flow — DF-001..DF-006:** Fixed a GPU→RAM→GPU round-trip during model loading. Previously the checkpoint state dict was loaded directly onto CUDA (a full-model VRAM spike outside ComfyUI's arbitration), copied back to CPU-resident parameters, then moved to CUDA again. Now the loader builds the model **entirely on CPU** (state dict, `load_state_dict`, dtype cast, and 4-bit quantization all on CPU), and `VibeVoicePatcher.patch_model` owns the **single** host-to-device transfer after ComfyUI's `load_models_gpu` VRAM arbitration. Peak VRAM during load drops from ≈2× model size to ≈1× model size.
+*   **Dtype Threading — DF-004 / AUD-008:** The user-selected dtype is now threaded from the node through the handler into the loader and applied on CPU before the transfer; the patcher's dtype cast is now a mismatch-only guard (no redundant GPU cast).
+*   **Handler No-Move — DF-003:** `VibeVoiceModelHandler.load_model` no longer moves the model; device placement is owned solely by the patcher.
+
+### 🧪 Tests
+*   New `tests/test_load_device_flow.py` (36 tests): device-ledger doubles asserting CPU-only loading, single H2D transfer, no round-trip, dtype threading, cast guard, VRAM arbitration, and a `[GPU-OPTIONAL]` peak-VRAM measurement.
+
+</details>
+
+<details>
 <summary><strong>v2.0.0 - V3 Extension &amp; VRAM Parity</strong></summary>
 
 ### ✨ Highlights

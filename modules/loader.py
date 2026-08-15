@@ -20,8 +20,6 @@ import comfy.utils
 import folder_paths
 import comfy.model_management as model_management
 
-import transformers
-
 from transformers import BitsAndBytesConfig
 
 from ..src.vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
@@ -47,7 +45,7 @@ from .dtype_utils import resolve_dtype, get_dtype_str
 if SAGE_ATTENTION_AVAILABLE:
     from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
 
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +91,21 @@ class VibeVoiceModelHandler(torch.nn.Module):
     actual heavy model is loaded on demand.
     """
 
-    def __init__(self, model_pack_name: str, attention_mode: str = "eager", use_llm_4bit: bool = False):
+    def __init__(
+        self,
+        model_pack_name: str,
+        attention_mode: str = "eager",
+        use_llm_4bit: bool = False,
+        dtype_str: str = "auto",
+    ):
         super().__init__()
         self.model_pack_name = model_pack_name
         self.attention_mode = attention_mode
         self.use_llm_4bit = use_llm_4bit
+        # DF-004/AUD-008: the user-selected dtype is threaded into the loader
+        # so the final dtype is applied ON CPU during load (before the single
+        # H2D transfer), instead of being re-resolved to "auto" here.
+        self.dtype_str = dtype_str
         self.cache_key = f"{self.model_pack_name}_attn_{attention_mode}_q4_{int(use_llm_4bit)}"
         self.model = None
         self.processor = None
@@ -113,15 +121,22 @@ class VibeVoiceModelHandler(torch.nn.Module):
     def load_model(self, device, attention_mode: str = "eager"):
         """Load the model and processor into memory.
 
+        Device contract (DF-003 fix): the loader builds the model entirely on
+        CPU and this handler performs NO device move. The single host-to-
+        device transfer is owned by ``VibeVoicePatcher.patch_model``.
+
         Args:
-            device: Target device for the model.
+            device: Target device (used for dtype-auto resolution inside the
+                loader; NOT used for placement here).
             attention_mode: Attention implementation to use.
         """
         self.model, self.processor = VibeVoiceLoader.load_model(
-            self.model_pack_name, device, attention_mode, use_llm_4bit=self.use_llm_4bit
+            self.model_pack_name,
+            device,
+            attention_mode,
+            use_llm_4bit=self.use_llm_4bit,
+            dtype_str=self.dtype_str,
         )
-        if self.model.device != device:
-            self.model.to(device)
 
 
 class VibeVoiceLoader(BaseVibeVoiceLoader):
@@ -457,29 +472,41 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         standalone path, then loads the state dict (handling sharded checkpoints)
         and loads it into the model.
 
+        Device contract (DF-001/DF-002 fix): the state dict is ALWAYS loaded
+        onto CPU, regardless of the ``device`` argument. Loading it directly
+        onto CUDA caused a disk->VRAM->RAM->VRAM round-trip (full-model VRAM
+        spike outside ComfyUI's arbitration, then a GPU->CPU copy into the
+        CPU-resident parameters). The single host-to-device transfer is owned
+        by ``VibeVoicePatcher.patch_model`` after ComfyUI has arbitrated VRAM.
+
         Args:
             model: Model instance (already instantiated).
             model_path: Path to model directory (for official/local_dir) or None.
             model_type: "official", "local_dir", or "standalone".
             model_info: Model info dict (for standalone path).
-            device: Target device for loading.
+            device: Reserved for signature compatibility; NOT used for
+                placement — the state dict is always loaded onto CPU.
 
         Returns:
-            The model with loaded state dict.
+            The model with loaded state dict (on CPU).
         """
         # Resolve checkpoint path (handles single-file and sharded checkpoints)
         ckpt_path, is_sharded = VibeVoiceLoader._resolve_checkpoint_path(
             model_path, model_type, model_info
         )
 
+        # DF-001/DF-002: always load weights onto CPU. The patcher performs
+        # the single H2D transfer after ComfyUI's VRAM arbitration.
+        cpu_device = torch.device("cpu")
+
         if is_sharded:
-            # Load and merge sharded checkpoint
+            # Load and merge sharded checkpoint (onto CPU)
             model_dir = model_path if model_type != "standalone" else os.path.dirname(ckpt_path)
-            state_dict = VibeVoiceLoader._load_sharded_state_dict(ckpt_path, model_dir, device)
+            state_dict = VibeVoiceLoader._load_sharded_state_dict(ckpt_path, model_dir, cpu_device)
         else:
-            # Load single checkpoint file
+            # Load single checkpoint file (onto CPU)
             logger.info(f"Loading state dict from: {ckpt_path}")
-            state_dict = comfy.utils.load_torch_file(ckpt_path, device=device)
+            state_dict = comfy.utils.load_torch_file(ckpt_path, device=cpu_device)
 
         # Load state dict with strict=False to handle any missing/unexpected keys
         # (e.g., tied weights, quantized layers)
@@ -610,12 +637,21 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 device=load_device,
             )
 
-            # Step 3: Move to target device and apply dtype
-            model = model.to(device=load_device, dtype=final_load_dtype)
+            # Step 3: Apply the final dtype ON CPU (DF-002/DF-003 fix).
+            # The model leaves the loader on CPU; the single host-to-device
+            # transfer is owned by VibeVoicePatcher.patch_model after
+            # ComfyUI's VRAM arbitration. Casting here (on CPU) avoids a
+            # redundant GPU-side cast later.
+            model = model.to(dtype=final_load_dtype)
 
             # Step 4: Apply 4-bit quantization if requested (post-load)
             if quant_config is not None:
-                from transformers.utils.bitsandbytes import replace_with_bnb_linear
+                # AUD-014: the module moved from transformers.utils.bitsandbytes
+                # (<= 4.x) to transformers.integrations.bitsandbytes (5.x).
+                try:
+                    from transformers.integrations.bitsandbytes import replace_with_bnb_linear
+                except ImportError:
+                    from transformers.utils.bitsandbytes import replace_with_bnb_linear
                 replace_with_bnb_linear(
                     model,
                     quantization_config=quant_config,

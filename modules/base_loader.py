@@ -57,18 +57,24 @@ class BaseVibeVoiceLoader:
 
         Skips the download when ``config.json`` already exists in ``local_dir``
         (the standard HuggingFace marker for a complete checkout).
+
+        AUD-013: ``local_dir_use_symlinks`` was removed in huggingface_hub >= 0.23
+        (and is absent in 1.x); passing it raises ``TypeError`` on the first
+        official-model download. Only pass it when the installed version still
+        accepts it.
         """
         if not repo_id:
             return
         if os.path.exists(os.path.join(local_dir, "config.json")):
             return
         logger.info(f"Downloading official VibeVoice model: {model_name or local_dir}...")
+        import inspect
         from huggingface_hub import snapshot_download
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=local_dir,
-            local_dir_use_symlinks=False,
-        )
+
+        kwargs = {"repo_id": repo_id, "local_dir": local_dir}
+        if "local_dir_use_symlinks" in inspect.signature(snapshot_download).parameters:
+            kwargs["local_dir_use_symlinks"] = False
+        snapshot_download(**kwargs)
 
     # ------------------------------------------------------------------
     # Tokenizer repo
