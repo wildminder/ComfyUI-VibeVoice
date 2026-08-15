@@ -12,6 +12,8 @@ import logging
 from typing import Optional, Tuple, List, Dict, Any
 
 import comfy.model_management as model_management
+from comfy.utils import ProgressBar
+from transformers.generation import BaseStreamer
 
 from .asr_loader import VibeVoiceASRLoader, VibeVoiceASRModelHandler, LOADED_ASR_MODELS_CACHE, cleanup_asr_models
 from .patcher import VibeVoiceASRPatcher
@@ -22,6 +24,40 @@ from .audio_utils import extract_audio_tensor
 from .attention_utils import resolve_attention_mode
 
 logger = logging.getLogger(__name__)
+
+
+class _ASRProgressStreamer(BaseStreamer):
+    """Token streamer that drives the standard ComfyUI progress bar during ASR.
+
+    HF ``GenerationMixin`` calls ``put(next_tokens)`` once per generated token
+    (prompt tokens are NOT streamed). Each call advances the bar by the number
+    of tokens in the batch and checks for user interruption, so cancelling an
+    ASR transcription becomes responsive. ``end()`` sends the final 100% event.
+
+    Only attached for greedy/sampling decoding (``num_beams <= 1``); beam
+    search is not compatible with a plain token streamer and falls back to a
+    single 0->100% bar.
+    """
+
+    def __init__(self, pbar: "ProgressBar", total: int):
+        self.pbar = pbar
+        self.total = max(1, int(total))
+        self.count = 0
+
+    def put(self, value):
+        # Responsive cancellation (raises InterruptProcessingException).
+        model_management.throw_exception_if_processing_interrupted()
+        if isinstance(value, torch.Tensor):
+            n = int(value.numel())
+        elif isinstance(value, (list, tuple)):
+            n = len(value)
+        else:
+            n = 1
+        self.count = min(self.count + n, self.total)
+        self.pbar.update_absolute(self.count, total=self.total)
+
+    def end(self):
+        self.pbar.update_absolute(self.total)
 
 
 def load_asr_model(
@@ -226,11 +262,19 @@ def transcribe_audio(
     # Remove None values
     generation_config = {k: v for k, v in generation_config.items() if v is not None}
 
+    # Standard ComfyUI progress bar. HF generate() reports per-token progress
+    # through a streamer (greedy/sampling only; beam search falls back to a
+    # single 0->100% bar because plain token streamers are beam-incompatible).
+    pbar = ProgressBar(max_new_tokens)
+    use_streamer = generation_config.get("num_beams", 1) <= 1
+    streamer = _ASRProgressStreamer(pbar, total=max_new_tokens) if use_streamer else None
+
     try:
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
                 **generation_config,
+                **({"streamer": streamer} if streamer is not None else {}),
             )
 
         # Decode output (exclude input tokens)
@@ -264,6 +308,10 @@ def transcribe_audio(
     except Exception as e:
         logger.error(f"ASR transcription failed: {e}")
         raise RuntimeError(f"Transcription failed: {e}")
+    finally:
+        # Guarantee the final 100% event even when generation stopped early
+        # (EOS before max_new_tokens) or raised.
+        pbar.update_absolute(pbar.total)
 
 
 def force_offload_asr_model(model_name: str, patcher=None) -> None:

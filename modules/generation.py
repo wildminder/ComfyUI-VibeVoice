@@ -237,17 +237,28 @@ def generate_audio(
 
     # Generate
     with torch.no_grad():
+        # Standard ComfyUI progress bar. The initial total is only an estimate
+        # (diffusion steps); the vendored AR loop reports its real budget
+        # (max_steps) through `progress_callback`, and `update_absolute(value,
+        # total=...)` re-sets the bar's total dynamically on the first callback.
         pbar = ProgressBar(inference_steps)
 
+        def _progress(current: int, total: int) -> None:
+            # Responsive cancellation: raises InterruptProcessingException when
+            # the user pressed cancel (checked once per AR step).
+            model_management.throw_exception_if_processing_interrupted()
+            pbar.update_absolute(current, total=total)
+
         try:
-            outputs = model.generate(**gen_inputs)
-            pbar.update(inference_steps - pbar.current)
+            outputs = model.generate(**gen_inputs, progress_callback=_progress)
 
         except model_management.InterruptProcessingException:
             logger.info("VibeVoice generation interrupted by user")
             raise
         finally:
-            pbar.update_absolute(inference_steps)
+            # Guarantee the final 100% event even when the AR loop stopped
+            # early (EOS before max_steps) or generation raised.
+            pbar.update_absolute(pbar.total)
 
     # Post-process output
     output_waveform = outputs.speech_outputs[0]
@@ -419,7 +430,27 @@ def generate_streaming_audio(
         gen_kwargs["return_speech"] = True
 
     with torch.no_grad():
-        outputs = model.generate(**gen_kwargs)
+        # Standard ComfyUI progress bar. The streaming loop's real total
+        # (tts_lm max_length) is only known inside the vendored generate();
+        # the initial total=1 placeholder is corrected on the first callback
+        # via update_absolute(value, total=...).
+        pbar = ProgressBar(1)
+
+        def _progress(current: int, total: int) -> None:
+            # Responsive cancellation: raises InterruptProcessingException when
+            # the user pressed cancel (checked once per loop step).
+            model_management.throw_exception_if_processing_interrupted()
+            pbar.update_absolute(current, total=total)
+
+        try:
+            outputs = model.generate(**gen_kwargs, progress_callback=_progress)
+        except model_management.InterruptProcessingException:
+            logger.info("VibeVoice streaming generation interrupted by user")
+            raise
+        finally:
+            # Guarantee the final 100% event even when the loop stopped early
+            # (EOS classifier) or generation raised.
+            pbar.update_absolute(pbar.total)
 
     speech_outputs = outputs.speech_outputs
     if not speech_outputs or speech_outputs[0] is None:

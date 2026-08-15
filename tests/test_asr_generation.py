@@ -300,3 +300,108 @@ class TestForceOffloadASRPatcher:
 
         LOADED_ASR_MODELS_CACHE.clear()
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+
+class TestASRProgressReporting:
+    """Phase 5 (2026-08-15 progress plan): ASR transcription must drive the
+    standard ComfyUI ProgressBar through an HF token streamer."""
+
+    @staticmethod
+    def _make_mocks():
+        mock_model = MagicMock()
+        mock_param = MagicMock()
+        mock_param.device = torch.device("cpu")
+        mock_model.parameters.return_value = iter([mock_param])
+        mock_output = torch.tensor([[1, 2, 3, 4, 5, 0]])
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.tensor([[1, 2, 3]])}
+        mock_processor.pad_id = 0
+        mock_processor.tokenizer.eos_token_id = 0
+        mock_processor.decode.return_value = "Hello world"
+        mock_processor.post_process_transcription.return_value = []
+        return mock_model, mock_processor
+
+    def _transcribe(self, mock_model, mock_processor, **kwargs):
+        with patch("ComfyUI_VibeVoice.modules.asr_generation.extract_audio_tensor") as mock_extract, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.throw_exception_if_processing_interrupted") as mock_interrupt:
+            mock_extract.return_value = (torch.randn(24000), 24000)
+            mock_pbar = MagicMock()
+            mock_pbar.total = kwargs.get("max_new_tokens", 32768)
+            mock_pbar_cls.return_value = mock_pbar
+
+            result = transcribe_audio(
+                model=mock_model,
+                processor=mock_processor,
+                audio_input={"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000},
+                **kwargs,
+            )
+            return result, mock_model, mock_pbar_cls, mock_pbar, mock_interrupt
+
+    def test_streamer_put_advances_progress(self):
+        """T5.1: streamer.put() of a 2-token tensor advances the bar to 2."""
+        from ComfyUI_VibeVoice.modules.asr_generation import _ASRProgressStreamer
+
+        mock_pbar = MagicMock()
+        streamer = _ASRProgressStreamer(mock_pbar, total=100)
+        streamer.put(torch.tensor([[7, 8]]))
+
+        assert streamer.count == 2
+        mock_pbar.update_absolute.assert_called_once_with(2, total=100)
+
+    def test_streamer_end_sends_final_total(self):
+        """T5.2: streamer.end() sends the final total update."""
+        from ComfyUI_VibeVoice.modules.asr_generation import _ASRProgressStreamer
+
+        mock_pbar = MagicMock()
+        streamer = _ASRProgressStreamer(mock_pbar, total=50)
+        streamer.end()
+        mock_pbar.update_absolute.assert_called_once_with(50)
+
+    def test_generate_receives_streamer_for_sampling(self):
+        """T5.3a: model.generate receives streamer= when num_beams == 1."""
+        mock_model, mock_processor = self._make_mocks()
+        _, mock_model, _, _, _ = self._transcribe(mock_model, mock_processor, num_beams=1)
+
+        gen_kwargs = mock_model.generate.call_args.kwargs
+        assert "streamer" in gen_kwargs
+        assert gen_kwargs["streamer"] is not None
+
+    def test_generate_no_streamer_for_beam_search(self):
+        """T5.3b: model.generate must NOT receive streamer= when num_beams > 1."""
+        mock_model, mock_processor = self._make_mocks()
+        _, mock_model, _, _, _ = self._transcribe(mock_model, mock_processor, num_beams=4)
+
+        gen_kwargs = mock_model.generate.call_args.kwargs
+        assert "streamer" not in gen_kwargs
+
+    def test_streamer_put_checks_interrupt(self):
+        """T5.4: put() calls throw_exception_if_processing_interrupted; a raised
+        interrupt propagates."""
+        import comfy.model_management as mm
+        from ComfyUI_VibeVoice.modules.asr_generation import _ASRProgressStreamer
+
+        with patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.throw_exception_if_processing_interrupted") as mock_interrupt:
+            mock_interrupt.side_effect = mm.InterruptProcessingException()
+            mock_pbar = MagicMock()
+            streamer = _ASRProgressStreamer(mock_pbar, total=100)
+
+            with pytest.raises(mm.InterruptProcessingException):
+                streamer.put(torch.tensor([7]))
+            mock_interrupt.assert_called()
+
+    def test_transcription_output_unchanged_with_progress(self):
+        """T5.5: progress plumbing must not change the transcription output."""
+        mock_model, mock_processor = self._make_mocks()
+        (raw_text, segments), _, mock_pbar_cls, mock_pbar, _ = self._transcribe(
+            mock_model, mock_processor, max_new_tokens=100
+        )
+
+        assert raw_text == "Hello world"
+        assert segments == []
+        # Bar created with the max_new_tokens budget and driven to 100% at the end.
+        mock_pbar_cls.assert_called_once_with(100)
+        final_call = mock_pbar.update_absolute.call_args_list[-1]
+        assert final_call.args == (100,)

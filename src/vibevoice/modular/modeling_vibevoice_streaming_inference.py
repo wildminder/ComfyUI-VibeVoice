@@ -593,6 +593,7 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         return_speech: bool = True,
         cfg_scale: float = 1.0,
         stop_check_fn: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
         **kwargs,
     ) -> Union[torch.LongTensor, VibeVoiceGenerationOutput]:
         """
@@ -610,6 +611,15 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             cfg_scale: Classifier-free guidance scale for speech diffusion.
             return_speech: If False, skips audio decode concatenation.
             stop_check_fn: External early-stop hook (returns True to halt).
+            progress_callback: Optional framework-agnostic hook invoked as
+                ``progress_callback(current, total)`` after each text-window
+                prefill and after each generated speech token, where
+                ``total == tts_lm_generation_config.max_length``. ``current``
+                is monotonic non-decreasing and bounded by ``total``. ``None``
+                disables reporting. The callback may raise to interrupt
+                generation (the exception propagates out of ``generate()``);
+                callers use this for progress UI and cancellation. Orthogonal
+                to the console ``tqdm`` bar (``show_progress_bar``).
 
         Returns:
             VibeVoiceGenerationOutput with:
@@ -748,6 +758,9 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                 if progress_bar is not None:
                     progress_bar.update(cur_input_tts_text_ids.shape[1])
                     progress_bar.set_description(f"Prefilled {total_prefilled_text_tokens} text tokens, generated {total_generated_speech_tokens} speech tokens, current step ({step} / {tts_lm_generation_config.max_length})")
+                # Framework-agnostic progress hook (ComfyUI progress bar).
+                if progress_callback is not None:
+                    progress_callback(step, tts_lm_generation_config.max_length)
 
                 model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
                 # Forward pass through the model
@@ -815,6 +828,9 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                 if progress_bar is not None:
                     progress_bar.update(1)
                     progress_bar.set_description(f"Prefilled {total_prefilled_text_tokens} text tokens, generated {total_generated_speech_tokens} speech tokens, current step ({step} / {tts_lm_generation_config.max_length})")
+                # Framework-agnostic progress hook (ComfyUI progress bar).
+                if progress_callback is not None:
+                    progress_callback(step, tts_lm_generation_config.max_length)
 
                 tts_lm_model_inputs = self.prepare_inputs_for_generation(tts_lm_input_ids, **tts_lm_model_kwargs)
                 tts_lm_additional_inputs = {

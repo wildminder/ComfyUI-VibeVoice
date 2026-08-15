@@ -705,6 +705,7 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         top_p: float = 0.95,
         top_k: int = 0,
         tokenizer: Optional[Any] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
         **kwargs,
     ) -> "VibeVoiceGenerationOutput":
         """Non-streaming text-to-speech generation (faithful original-protocol port).
@@ -752,6 +753,13 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
                 are accepted for interface compatibility but unused -- the original
                 protocol samples with a constrained softmax (multinomial) or argmax.
             tokenizer: processor tokenizer; supplies the speech control-token ids.
+            progress_callback: Optional framework-agnostic hook invoked as
+                ``progress_callback(current, total)`` — once with ``(0, max_steps)``
+                before the AR loop and once after each completed AR step with
+                ``(step, max_steps)``. ``current`` is monotonic non-decreasing and
+                bounded by ``total``. ``None`` disables reporting. The callback may
+                raise to interrupt generation (the exception propagates out of
+                ``generate()``); callers use this for progress UI and cancellation.
 
         Returns:
             VibeVoiceGenerationOutput with ``sequences`` (input ids) and
@@ -827,6 +835,10 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         max_length = seq_len + max_new_tokens
         max_length_times = int(kwargs.get("max_length_times", 2))
         max_steps = max(1, min(max_new_tokens, int(max_length_times * seq_len)))
+
+        # Progress reporting: announce the loop budget before the first step.
+        if progress_callback is not None:
+            progress_callback(0, max_steps)
 
         # Diffusion steps.
         num_steps = inference_steps or getattr(
@@ -1041,6 +1053,10 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
             else:
                 break
             step += 1
+
+            # Progress reporting: one callback per completed AR step.
+            if progress_callback is not None:
+                progress_callback(step, max_steps)
 
         # ------------------------------------------------------------------
         # Assemble the per-sample waveform(s).

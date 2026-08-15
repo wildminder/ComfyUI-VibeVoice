@@ -470,3 +470,147 @@ class TestForceOffloadModel:
             force_offload_model(mock_patcher, "TestModel", warm=True)
 
         mock_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True, warm=True)
+
+
+class TestGenerateAudioProgressReporting:
+    """Phase 2 (2026-08-15 progress plan): generate_audio() must drive the
+    standard ComfyUI ProgressBar through the vendored progress_callback."""
+
+    @staticmethod
+    def _run(progress_callback_capture: list, generate_side_effect=None):
+        """Run generate_audio with a mocked model/processor; capture the
+        progress_callback kwarg handed to model.generate."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        if generate_side_effect is not None:
+            mock_model.generate.side_effect = generate_side_effect
+        else:
+            mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted") as mock_interrupt, \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            mock_pbar = MagicMock()
+            mock_pbar.total = 10
+            mock_pbar_cls.return_value = mock_pbar
+
+            # Capture the callback the wrapper passes into the vendored loop.
+            def _capture(**kwargs):
+                progress_callback_capture.append(kwargs.get("progress_callback"))
+                return mock_output
+
+            if generate_side_effect is None:
+                mock_model.generate.side_effect = _capture
+
+            result = generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Hello world",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+                inference_steps=10,
+            )
+            return result, mock_model, mock_pbar_cls, mock_pbar, mock_interrupt
+
+    def test_generate_receives_callable_progress_callback(self):
+        """T2.1: model.generate must receive a callable progress_callback kwarg."""
+        captured = []
+        self._run(captured)
+        assert captured, "model.generate was not called"
+        assert captured[0] is not None and callable(captured[0])
+
+    def test_callback_maps_to_update_absolute_with_total(self):
+        """T2.2: callback(current, total) -> pbar.update_absolute(current, total=total)."""
+        captured = []
+        _, _, _, mock_pbar, _ = self._run(captured)
+        mock_pbar.update_absolute.reset_mock()
+
+        captured[0](3, 10)
+        mock_pbar.update_absolute.assert_called_once_with(3, total=10)
+
+    def test_callback_checks_interrupt(self):
+        """T2.3: the callback must call throw_exception_if_processing_interrupted;
+        a raised interrupt propagates to the caller. The callback is invoked
+        INSIDE the patch context so the interrupt mock is still active."""
+        import comfy.model_management as mm
+
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted") as mock_interrupt, \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            mock_pbar = MagicMock()
+            mock_pbar.total = 10
+            mock_pbar_cls.return_value = mock_pbar
+            mock_interrupt.side_effect = mm.InterruptProcessingException()
+
+            generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Hello world",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+                inference_steps=10,
+            )
+
+            cb = mock_model.generate.call_args.kwargs.get("progress_callback")
+            assert cb is not None and callable(cb)
+            with pytest.raises(mm.InterruptProcessingException):
+                cb(1, 10)
+            mock_interrupt.assert_called()
+
+    def test_final_update_reaches_total_on_success(self):
+        """T2.4: after successful generation the bar is driven to 100%."""
+        captured = []
+        _, _, mock_pbar_cls, mock_pbar, _ = self._run(captured)
+
+        # Initial estimate = inference_steps.
+        mock_pbar_cls.assert_called_once_with(10)
+        # The very last update_absolute call must be the final (total) event.
+        final_call = mock_pbar.update_absolute.call_args_list[-1]
+        assert final_call.args == (10,), f"final update must be (total,), got {final_call}"
+
+    def test_final_update_sent_even_when_generate_raises(self):
+        """T2.5: the finally-block final update fires when model.generate raises."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_model.generate.side_effect = RuntimeError("boom")
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            mock_pbar = MagicMock()
+            mock_pbar.total = 10
+            mock_pbar_cls.return_value = mock_pbar
+
+            with pytest.raises(RuntimeError, match="boom"):
+                generate_audio(
+                    model=mock_model,
+                    processor=mock_processor,
+                    text="[1] Hello world",
+                    voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                    speaker_ids=[1],
+                    inference_steps=10,
+                )
+
+            # The final absolute update must still have been sent.
+            final_call = mock_pbar.update_absolute.call_args_list[-1]
+            assert final_call.args == (10,)
