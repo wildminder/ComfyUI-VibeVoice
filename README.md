@@ -160,6 +160,38 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.1.1 - Standard ComfyUI Progress Bar During Inference</strong></summary>
+
+### ✨ Highlights
+*   **Live progress bar:** All three nodes (TTS, Realtime TTS, ASR) now drive the standard
+    ComfyUI frontend progress bar during inference. Previously the bar sat at 0% for the whole
+    generation and jumped to 100% only at the end.
+*   **Responsive cancel:** the progress hook checks ComfyUI's interrupt flag on every loop step,
+    so pressing cancel stops generation promptly instead of waiting for the current blocking call.
+*   **Guaranteed 100%:** a final progress event is always emitted, even when generation stops
+    early (EOS) or raises.
+
+### 🔧 Changes
+*   Vendored `generate()` (non-streaming + streaming) gained an optional, framework-agnostic
+    `progress_callback(current, total)` hook fired once per AR loop step (vendored code stays
+    `comfy`-free; `None` = disabled, fully backward compatible).
+*   `modules/generation.py`: `generate_audio()` / `generate_streaming_audio()` wrap the hook with
+    `comfy.utils.ProgressBar` (throttled WebSocket updates; the bar total self-corrects via
+    `update_absolute(value, total=...)` once the loop reports its real budget).
+*   `modules/asr_generation.py`: ASR reports per-token progress through an HF `BaseStreamer`
+    (greedy/sampling only; beam search falls back to a single 0→100% bar).
+
+### 🧪 Tests
+*   New `tests/test_generate_progress_callback.py` (5 tests) and
+    `tests/test_streaming_progress_callback.py` (4 tests): drive the real vendored loops with
+    scripted mocks and lock the callback contract (monotonic, bounded, call counts, interrupt
+    propagation, output determinism).
+*   New `tests/test_streaming_progress.py` (4 tests); extended `tests/test_generation.py` (+5),
+    `tests/test_asr_generation.py` (+6), `tests/test_integration.py` (+3 node-level tests).
+
+</details>
+
+<details>
 <summary><strong>v2.1.0 - torchaudio-Primary Audio Backend (librosa now optional)</strong></summary>
 
 ### ✨ Highlights
