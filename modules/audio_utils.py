@@ -6,6 +6,11 @@ Contains:
 - extract_audio_tensor(): Extract waveform + sample_rate from audio dict
 - set_seed(): Set random seeds for reproducibility
 - check_for_interrupt(): Check if processing was interrupted
+
+Resampling is delegated to :mod:`modules.audio_backend`, which uses
+``torchaudio.functional.resample`` as the primary backend (the ComfyUI-core
+idiom) with scipy/librosa as optional fallbacks. ``librosa`` is never
+required: the node degrades gracefully when it (or scipy) is absent.
 """
 
 import re
@@ -17,25 +22,25 @@ from typing import Optional, Tuple
 
 from comfy.model_management import throw_exception_if_processing_interrupted
 
-try:
-    import scipy.signal as sp_signal
-    _HAS_SCIPY = True
-except ImportError:
-    sp_signal = None
-    _HAS_SCIPY = False
-    logger = logging.getLogger(__name__)
-    logger.warning("VibeVoice Node: `scipy` is not installed. Resampling of reference audio will not be available.")
+from . import audio_backend
 
 logger = logging.getLogger(__name__)
+
+if audio_backend._active_resample_backend() == "none":
+    logger.warning(
+        "VibeVoice Node: no audio resampling backend available "
+        "(torchaudio/scipy/librosa all missing). Resampling of reference "
+        "audio will fail. Install torchaudio (preferred) or scipy."
+    )
 
 
 def resample_audio(waveform: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
     """Resample a numpy audio array from ``orig_sr`` to ``target_sr``.
 
-    Uses :func:`scipy.signal.resample_poly` with integer up/down factors derived
-    from the greatest common divisor of the two sample rates. This avoids
-    depending on ``librosa``, which may be a broken stub/namespace package in
-    some embedded Python environments (e.g. ComfyUI's portable Python).
+    Thin facade over :func:`modules.audio_backend.resample_audio`. The
+    primary backend is ``torchaudio.functional.resample`` (Kaiser sinc —
+    the same family of resampler ComfyUI core uses); scipy and librosa are
+    optional fallbacks, so this never hard-requires any single library.
 
     Args:
         waveform: 1-D (or 2-D) float audio array.
@@ -44,28 +49,13 @@ def resample_audio(waveform: np.ndarray, orig_sr: int, target_sr: int) -> np.nda
 
     Returns:
         Resampled audio array with the same dtype/shape semantics as input.
+        If the rates are equal, the same array object is returned unchanged.
 
     Raises:
-        ImportError: If scipy is not installed.
         ValueError: If sample rates are invalid.
+        RuntimeError: If no resampling backend is available.
     """
-    if not _HAS_SCIPY:
-        raise ImportError(
-            "`scipy` is required for audio resampling but is not installed. "
-            "Please install it with `pip install scipy`."
-        )
-    if orig_sr <= 0 or target_sr <= 0:
-        raise ValueError(f"Invalid sample rates for resampling: orig_sr={orig_sr}, target_sr={target_sr}")
-    if int(orig_sr) == int(target_sr):
-        return waveform
-
-    orig_sr = int(orig_sr)
-    target_sr = int(target_sr)
-    gcd = np.gcd(orig_sr, target_sr)
-    up = target_sr // gcd
-    down = orig_sr // gcd
-    # resample_poly operates along the last axis; works for 1-D and (N, channels).
-    return sp_signal.resample_poly(waveform, up, down)
+    return audio_backend.resample_audio(waveform, orig_sr, target_sr)
 
 
 def set_seed(seed: int) -> None:
@@ -151,6 +141,10 @@ def parse_script_1_based(script: str) -> tuple[list[tuple[int, str]], list[int]]
 def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> Optional[np.ndarray]:
     """Convert a ComfyUI AUDIO dict to a mono NumPy array, resampling if necessary.
 
+    Resampling happens in tensor space via
+    :func:`modules.audio_backend.resample_audio_tensor` (torchaudio primary —
+    the ComfyUI-core idiom), avoiding a numpy round-trip.
+
     Args:
         audio_dict: ComfyUI audio dict with 'waveform' and 'sample_rate' keys.
         target_sr: Target sample rate for resampling.
@@ -159,7 +153,7 @@ def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> Optional
         Mono float32 numpy array, or None if input is empty/invalid.
 
     Raises:
-        ImportError: If scipy is needed for resampling but not installed.
+        RuntimeError: If resampling is needed but no backend is available.
     """
     if not audio_dict:
         return None
@@ -167,16 +161,23 @@ def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> Optional
     if waveform_tensor is None or waveform_tensor.numel() == 0:
         return None
 
-    waveform = waveform_tensor[0].cpu().numpy()
-    original_sr = audio_dict['sample_rate']
+    original_sr = int(audio_dict['sample_rate'])
 
-    if waveform.ndim > 1:
-        waveform = np.mean(waveform, axis=0)
+    # Tensor-native path: strip batch dim and mix to mono in tensor space.
+    tensor = waveform_tensor[0]
+    if tensor.dim() > 1:
+        tensor = tensor.mean(dim=0)
 
-    # Check for invalid values
-    if np.any(np.isnan(waveform)) or np.any(np.isinf(waveform)):
+    # Scrub invalid values BEFORE resampling (NaN would poison the sinc filter).
+    if not torch.isfinite(tensor).all():
         logger.error("Audio contains NaN or Inf values, replacing with zeros")
-        waveform = np.nan_to_num(waveform, nan=0.0, posinf=0.0, neginf=0.0)
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if original_sr != int(target_sr):
+        logger.warning(f"Resampling reference audio from {original_sr}Hz to {target_sr}Hz.")
+        tensor = audio_backend.resample_audio_tensor(tensor, original_sr, int(target_sr))
+
+    waveform = tensor.cpu().numpy()
 
     # Ensure audio is not completely silent or has extreme values
     if np.all(waveform == 0):
@@ -187,10 +188,6 @@ def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> Optional
     if max_val > 10.0:
         logger.warning(f"Audio values are very large (max: {max_val}), normalizing")
         waveform = waveform / max_val
-
-    if original_sr != target_sr:
-        logger.warning(f"Resampling reference audio from {original_sr}Hz to {target_sr}Hz.")
-        waveform = resample_audio(waveform, original_sr, target_sr)
 
     # Final check after resampling
     if np.any(np.isnan(waveform)) or np.any(np.isinf(waveform)):

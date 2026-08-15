@@ -63,3 +63,49 @@ class TestPyprojectCompliance:
     def test_version(self):
         data = _load_pyproject()
         assert "version" in data["project"]
+
+
+class TestAudioDependencySurface:
+    """Phase 4: librosa/scipy must be optional; torchaudio is the primary audio lib."""
+
+    @staticmethod
+    def _dep_names(data):
+        deps = data["project"]["dependencies"]
+        return [d.split(">=")[0].split("==")[0].split("[")[0].strip() for d in deps]
+
+    def test_librosa_not_in_hard_dependencies(self):
+        data = _load_pyproject()
+        assert "librosa" not in self._dep_names(data), \
+            "librosa must be optional, not a hard dependency"
+
+    def test_scipy_not_in_hard_dependencies(self):
+        data = _load_pyproject()
+        assert "scipy" not in self._dep_names(data), \
+            "scipy must be optional (torchaudio is the primary resampler)"
+
+    def test_torchaudio_in_hard_dependencies(self):
+        data = _load_pyproject()
+        assert "torchaudio" in self._dep_names(data), \
+            "torchaudio is the primary audio library and must stay a hard dependency"
+
+    def test_soundfile_in_hard_dependencies(self):
+        data = _load_pyproject()
+        assert "soundfile" in self._dep_names(data), \
+            "soundfile is the primary audio encoder and must stay a hard dependency"
+
+    def test_audio_extra_optional_group_declared(self):
+        data = _load_pyproject()
+        extras = data["project"].get("optional-dependencies", {})
+        assert "audio-extra" in extras, "optional-dependencies.audio-extra must exist"
+        extra_names = [d.split(">=")[0].split("==")[0].strip() for d in extras["audio-extra"]]
+        assert "scipy" in extra_names
+        assert "librosa" in extra_names
+
+    def test_requirements_txt_has_no_librosa(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "requirements.txt"), "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        names = [ln.split(">=")[0].split("==")[0].strip() for ln in lines]
+        assert "librosa" not in names
+        assert "scipy" not in names
+        assert "torchaudio" in names

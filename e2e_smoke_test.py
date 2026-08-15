@@ -28,6 +28,7 @@ The final verdict is YOUR EARS: play the .wav files and confirm the words match 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 import wave
@@ -36,27 +37,69 @@ from pathlib import Path
 import numpy as np
 
 
+def _bootstrap_package_alias() -> None:
+    """Register this custom-node folder under the stable ``ComfyUI_VibeVoice``
+    alias so ``from ComfyUI_VibeVoice.modules...`` works when the script is run
+    standalone (outside pytest, which does this in conftest.py).
+
+    The on-disk directory is ``ComfyUI-VibeVoice`` (hyphen), which is not a valid
+    Python identifier, so a plain PYTHONPATH entry is not enough — we must build
+    the package spec explicitly, mirroring conftest.py §3.
+    """
+    alias = "ComfyUI_VibeVoice"
+    if alias in sys.modules:
+        return
+    root = os.path.dirname(os.path.abspath(__file__))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    spec = importlib.util.spec_from_file_location(
+        alias,
+        os.path.join(root, "__init__.py"),
+        submodule_search_locations=[root],
+    )
+    pkg = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = pkg
+    try:
+        spec.loader.exec_module(pkg)
+    except Exception:
+        # __init__.py may exit early under a pytest/ComfyUI guard; the alias is
+        # still registered so submodule imports resolve.
+        pass
+    for sub in ("modules", "nodes", "src"):
+        sub_path = os.path.join(root, sub)
+        sub_alias = f"{alias}.{sub}"
+        if os.path.isdir(sub_path) and sub_alias not in sys.modules:
+            sub_spec = importlib.util.spec_from_file_location(
+                sub_alias,
+                os.path.join(sub_path, "__init__.py"),
+                submodule_search_locations=[sub_path],
+            )
+            sub_pkg = importlib.util.module_from_spec(sub_spec)
+            sys.modules[sub_alias] = sub_pkg
+            try:
+                sub_spec.loader.exec_module(sub_pkg)
+            except Exception:
+                pass
+
+
+_bootstrap_package_alias()
+
+
 def _load_voice(path: str, target_sr: int = 24000):
     """Load a wav into a mono float32 numpy array at target_sr. Falls back to a
-    synthetic 220 Hz tone if the file cannot be read (so the pipeline still runs)."""
+    synthetic 220 Hz tone if the file cannot be read (so the pipeline still runs).
+
+    Uses the node's audio backend (PyAV primary — the ComfyUI-core decoder —
+    with soundfile/torchaudio/librosa fallbacks) and torchaudio-quality
+    resampling, so the smoke test exercises the exact production code path.
+    """
     try:
-        try:
-            import soundfile as sf
+        from ComfyUI_VibeVoice.modules import audio_backend
 
-            data, sr = sf.read(path, dtype="float32", always_2d=False)
-        except Exception:
-            import torchaudio  # type: ignore
-
-            data, sr = torchaudio.load(path)
-            data = data.numpy()[0] if data.ndim > 1 else data.numpy()
+        data, sr = audio_backend.load_audio_file(path)
         data = np.asarray(data, dtype=np.float32)
-        if data.ndim > 1:
-            data = np.mean(data, axis=0)
         if sr != target_sr:
-            # crude resample via numpy interp (fine for a smoke test)
-            x_old = np.linspace(0, 1, data.shape[-1], endpoint=False)
-            x_new = np.linspace(0, 1, int(data.shape[-1] * target_sr / sr), endpoint=False)
-            data = np.interp(x_new, x_old, data)
+            data = audio_backend.resample_audio(data, sr, target_sr)
         if np.abs(data).max() > 1.0:
             data = data / np.abs(data).max()
         return data.astype(np.float32)

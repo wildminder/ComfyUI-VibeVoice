@@ -1,11 +1,9 @@
 torch
 accelerate
 torchaudio
-librosa
 numpy
 huggingface_hub
 einops
-scipy
 tokenizers
 soundfile
 s3tokenizer
@@ -15,3 +13,7 @@ transformers>=4.51.3
 diffusers
 tqdm
 bitsandbytes
+# Optional audio-resampling fallbacks (torchaudio is the primary resampler;
+# the node never requires librosa and degrades gracefully without it):
+# scipy
+# librosa
