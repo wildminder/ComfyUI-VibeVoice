@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union, Callable
+from typing import Any, Dict, List, Optional, Tuple, Union, Callable
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -330,14 +330,12 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
                         dist.all_reduce(scaling_factor, op=dist.ReduceOp.SUM)
                         dist.all_reduce(bias_factor, op=dist.ReduceOp.SUM)
                         world_size = dist.get_world_size()
-                        self.model.speech_scaling_factor.copy_(scaling_factor / world_size)  
+                        self.model.speech_scaling_factor.copy_(scaling_factor / world_size)
                         self.model.speech_bias_factor.copy_(bias_factor / world_size)
-                        print(f"Speech scaling factor (distributed): {self.model.speech_scaling_factor}, bias factor: {self.model.speech_bias_factor}", flush=True)
                     else:
                         # Single process case
-                        self.model.speech_scaling_factor.copy_(scaling_factor)  
+                        self.model.speech_scaling_factor.copy_(scaling_factor)
                         self.model.speech_bias_factor.copy_(bias_factor)
-                        print(f"Speech scaling factor (single process): {self.model.speech_scaling_factor}, bias factor: {self.model.speech_bias_factor}", flush=True)
                     
                 audio_features = (audio_tokens + self.model.speech_bias_factor) * self.model.speech_scaling_factor
             
@@ -549,6 +547,146 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         default = self.config.diffusion_head_config.ddpm_num_inference_steps
         self.ddpm_inference_steps = num_steps or default
 
+    # ------------------------------------------------------------------
+    # Option C helpers — autoregressive target-speech generation (BUG-006 fix)
+    #
+    # The non-streaming model is a SINGLE-LM design: `language_model` + `lm_head`
+    # generate both text and target speech tokens (the Qwen backbone is split into
+    # text layers + upper speech layers; see configuration_vibevoice_streaming.py:79).
+    # The previous generate() mirrored ONLY the diffusion half and conditioned on the
+    # *reference-prompt* hidden states, emitting reference-length latents -> gibberish.
+    # The helpers + generate() below autoregressively generate the *target* speech
+    # tokens via `lm_head`, condition the diffusion head on the *generated* positions,
+    # and feed each produced latent back through `acoustic_connector` as the next-step
+    # embedding (the single-LM analogue of the streaming tts_lm acoustic feedback).
+    # ------------------------------------------------------------------
+
+    def _build_prefix_embeds(self, input_ids, acoustic_input_mask, speech_tensors, speech_masks):
+        """Embed `input_ids` and inject reference speech features at `acoustic_input_mask`.
+
+        Mirrors the inference branch of the training `forward` (modeling_vibevoice.py:
+        414-421): reference VAE tokens are replaced by `acoustic_connector` features so
+        the LM "hears" the reference voice. As a side effect this also computes
+        `speech_scaling_factor` / `speech_bias_factor` (used later to invert the
+        diffusion output before VAE decode).
+        """
+        x = self.get_input_embeddings()(input_ids)
+        if (
+            speech_tensors is not None
+            and acoustic_input_mask is not None
+            and acoustic_input_mask.any()
+        ):
+            with torch.no_grad():
+                _, connect_features = self.forward_speech_features(
+                    speech_tensors=speech_tensors.type_as(x) if speech_tensors is not None else None,
+                    speech_masks=speech_masks,
+                    speech_type="audio",
+                )
+            x[acoustic_input_mask] = connect_features
+        return x
+
+    def _sample_one_latent(self, condition, neg_condition, cfg_scale, num_steps):
+        """Sample ONE acoustic latent conditioned on `condition` (CFG).
+
+        Reuses the 2N/2N classifier-free-guidance layout fixed in BUG-004, then applies
+        the inverse scaling (`latent / scaling - bias`) so the VAE decoder receives raw
+        latents (BUG-005 fix). Returns a `(B, vae_dim)` tensor.
+        """
+        # BUG-006 scheduler-index fix: reset the multistep scheduler's internal step
+        # counter at the START of every latent. `generate()` calls set_timesteps() once
+        # before the AR loop, but this method runs once PER AR step. The vendored
+        # DPMSolverMultistepScheduler only resets `_step_index` inside set_timesteps();
+        # without a per-latent reset, from the 2nd latent the final-step
+        # `lower_order_final` guard never triggers and the 2nd-order update reads
+        # `sigmas[step_index + 1]` -> IndexError. The streaming reference
+        # (sample_speech_tokens, L891) does exactly this.
+        self.model.noise_scheduler.set_timesteps(num_steps)
+        head_dev = self.model.prediction_head.device
+        condition = condition.to(head_dev)
+        neg_condition = neg_condition.to(head_dev)
+        cond_in = torch.cat([condition, neg_condition], dim=0)
+        vae_dim = self.config.acoustic_tokenizer_config.vae_dim
+        speech = torch.randn(condition.shape[0], vae_dim, device=head_dev, dtype=condition.dtype)
+        for t in self.model.noise_scheduler.timesteps:
+            combined = torch.cat([speech, speech], dim=0)
+            eps = self.model.prediction_head(
+                combined,
+                t.repeat(combined.shape[0]).to(combined.device),
+                condition=cond_in,
+            )
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
+        # Invert the diffusion output scaling before VAE decode (BUG-005).
+        sf = self.model.speech_scaling_factor
+        bf = self.model.speech_bias_factor
+        if not torch.isnan(sf) and not torch.isnan(bf):
+            sf = sf.to(speech.device)
+            bf = bf.to(speech.device)
+            speech = speech / sf - bf
+        return speech  # (B, vae_dim)
+
+    def _decode_latent(self, latent):
+        """Decode a single `(B, vae_dim)` latent to a waveform chunk (inverse scaling applied)."""
+        latents = latent.reshape(latent.shape[0], 1, -1)  # (B, 1, vae_dim)
+        audio = self.model.acoustic_tokenizer.decode(latents)
+        if isinstance(audio, (list, tuple)):
+            audio = audio[0]
+        if audio is None:
+            return None
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        return audio  # (B, T)
+
+    @staticmethod
+    def _sample_next_token(logits, do_sample=True, temperature=1.0, top_p=1.0, top_k=0):
+        """Sample the next speech token id from `logits` (B, vocab) -> (B,)."""
+        logits = logits.float()
+        if not do_sample:
+            return logits.argmax(dim=-1)
+        if temperature > 0:
+            logits = logits / max(temperature, 1e-6)
+        if top_k and top_k > 0:
+            k = min(top_k, logits.size(-1))
+            kth = torch.topk(logits, k).values[..., -1, None]
+            logits = logits.masked_fill(logits < kth, -float("inf"))
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+            cumulative = torch.cumsum(torch.softmax(sorted_logits, -1), -1)
+            remove = cumulative > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            logits = logits.masked_fill(remove.gather(-1, sorted_idx), -float("inf"))
+        probs = torch.softmax(logits, -1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    @torch.no_grad()
+    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+        """Sample acoustic latents conditioned on positive/negative LM hidden states.
+
+        Faithful port of the original ``VibeVoiceForConditionalGenerationInference.
+        sample_speech_tokens``: builds a 2N batch (positive || negative), runs the
+        DPM-Solver diffusion head with real classifier-free guidance (the negative
+        branch is the unconditional/negative forward, NOT zeros), and returns the
+        scaled positive latents ``(N, acoustic_vae_dim)``.
+        """
+        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
+        condition = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
+        speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
+        for t in self.model.noise_scheduler.timesteps:
+            half = speech[: len(speech) // 2]
+            combined = torch.cat([half, half], dim=0)
+            eps = self.model.prediction_head(
+                combined,
+                t.repeat(combined.shape[0]).to(combined),
+                condition=condition,
+            )
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            eps = torch.cat([half_eps, half_eps], dim=0)
+            speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
+        return speech[: len(speech) // 2]
+
     @torch.no_grad()
     def generate(
         self,
@@ -561,126 +699,365 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         cfg_scale: float = 1.3,
         inference_steps: Optional[int] = None,
         return_speech: bool = True,
+        max_new_tokens: Optional[int] = None,
+        do_sample: bool = True,
+        temperature: float = 0.95,
+        top_p: float = 0.95,
+        top_k: int = 0,
+        tokenizer: Optional[Any] = None,
         **kwargs,
     ) -> "VibeVoiceGenerationOutput":
-        """Non-streaming text-to-speech generation.
+        """Non-streaming text-to-speech generation (faithful original-protocol port).
 
-        Runs the language model forward pass to obtain condition features for
-        the speech diffusion head, samples speech latents via the DDPM
-        scheduler, and decodes the latents to a waveform with the acoustic
-        tokenizer.
+        This is a faithful port of Microsoft's ``VibeVoiceForConditionalGeneration
+        Inference.generate`` for the single-LM 1.5B checkpoint. The previous custom
+        loop was replaced because it (a) decoded a latent on *every* AR step instead
+        of only on ``speech_diffusion_id`` steps, (b) faked CFG with
+        ``neg_condition = zeros`` instead of a real parallel negative forward, (c)
+        fed ``acoustic_connector(latent)`` as the next embedding unconditionally
+        (no semantic feedback, no token constraint), and (d) only terminated on EOS
+        / a hard cap -- producing minutes of broken syllables (BUG-010).
+
+        The protocol implemented here:
+
+        * **Token-constrained control stream.** ``lm_head`` may only emit
+          ``{speech_start_id, speech_end_id, speech_diffusion_id, eos, bos}``. This
+          bounds generation to a short control sequence and is what prevents the
+          runaway loop.
+        * **Diffusion gated to diffusion steps.** A latent is sampled *only* when the
+          emitted token is ``speech_diffusion_id``, conditioned on
+          ``last_hidden_state[diffusion_indices, -1, :]``.
+        * **Real CFG.** A parallel *negative* forward (conditioned on the
+          ``speech_start_id`` / unconditional branch) produces ``neg_condition``;
+          ``sample_speech_tokens`` combines them as
+          ``uncond + cfg_scale * (cond - uncond)``.
+        * **Semantic feedback.** Each decoded latent is re-encoded to semantic
+          features; the next-step embedding is
+          ``acoustic_connector(latent) + semantic_connector(semantic_features)``.
+        * **Streaming caches.** ``acoustic_cache`` / ``semantic_cache`` are cleared
+          (``set_to_zero``) on ``speech_end_id``.
 
         Args:
-            input_ids: Token ids of shape (batch, seq).
-            attention_mask: Attention mask of shape (batch, seq).
-            speech_tensors: Reference speech latents/audio for voice cloning.
-            speech_masks: Masks for speech_tensors.
-            acoustic_input_mask: Boolean mask marking acoustic (speech) positions.
-            semantic_speech_tensors: Semantic speech features (optional).
+            input_ids / attention_mask / speech_tensors / speech_masks /
+                acoustic_input_mask: from the processor. ``acoustic_input_mask`` marks
+                reference (voice-clone) positions used to inject reference features.
             cfg_scale: Classifier-free guidance scale for diffusion sampling.
-            inference_steps: Number of diffusion steps (defaults to
-                self.ddpm_inference_steps or config default).
-            return_speech: If True, decode latents to waveform and return them.
+            inference_steps: DDPM steps (defaults to the model setting; also applied
+                via ``set_ddpm_inference_steps``).
+            return_speech: If True, decode latents to a waveform and return it.
+            max_new_tokens: Hard cap on generated *control* tokens. ``None`` derives
+                from ``max_position_embeddings - prompt_len`` (original default), then
+                the loop is further bounded by ``max_length_times * prompt_len``.
+            do_sample / temperature / top_p / top_k: ``temperature``/``top_p``/``top_k``
+                are accepted for interface compatibility but unused -- the original
+                protocol samples with a constrained softmax (multinomial) or argmax.
+            tokenizer: processor tokenizer; supplies the speech control-token ids.
 
         Returns:
-            VibeVoiceGenerationOutput with `sequences` (input ids) and
-            `speech_outputs` (list of waveform tensors, or None).
+            VibeVoiceGenerationOutput with ``sequences`` (input ids) and
+            ``speech_outputs`` (list with one waveform tensor per sample, or None).
         """
-        device = next(self.parameters()).device
+        if input_ids is not None:
+            device = input_ids.device
+        else:
+            try:
+                device = next(self.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
         if input_ids is not None:
             input_ids = input_ids.to(device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
+        if speech_tensors is not None:
+            speech_tensors = speech_tensors.to(device)
+        if speech_masks is not None:
+            speech_masks = speech_masks.to(device)
+        if acoustic_input_mask is not None:
+            acoustic_input_mask = acoustic_input_mask.to(device)
 
-        # 1. Language-model forward pass to obtain condition features.
-        outputs = self.forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            speech_tensors=speech_tensors,
-            speech_masks=speech_masks,
-            acoustic_input_mask=acoustic_input_mask,
-            semantic_speech_tensors=semantic_speech_tensors,
-            return_dict=True,
-            **kwargs,
-        )
-        # The diffusion condition is the LM *hidden states* (dim = model hidden_size),
-        # NOT the vocab logits. `forward` returns `hidden_states` (= last_hidden_state).
-        hidden_states = outputs.hidden_states if outputs.hidden_states is not None else None
-        if hidden_states is None:
-            fwd = self.forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                speech_tensors=speech_tensors,
-                speech_masks=speech_masks,
-                acoustic_input_mask=acoustic_input_mask,
-                semantic_speech_tensors=semantic_speech_tensors,
-                return_dict=True,
-                **kwargs,
+        # ------------------------------------------------------------------
+        # Resolve speech control-token ids from the tokenizer (BUG-010: the 1.5B
+        # single-LM class has no dedicated tts_eos_classifier, so it stops on a
+        # discrete EOS token emitted by lm_head).
+        # ------------------------------------------------------------------
+        speech_start_id = speech_end_id = speech_diffusion_id = eos_id = None
+        bos_id = None
+        tok = tokenizer if tokenizer is not None else getattr(self, "tokenizer", None)
+        if tok is not None:
+            speech_start_id = getattr(tok, "speech_start_id", None)
+            speech_end_id = getattr(tok, "speech_end_id", None)
+            speech_diffusion_id = getattr(tok, "speech_diffusion_id", None)
+            eos_id = getattr(tok, "eos_id", None)
+            if eos_id is None:
+                eos_id = getattr(tok, "eos_token_id", None)
+            bos_id = getattr(tok, "bos_token_id", None)
+        if eos_id is None:
+            eos_id = getattr(getattr(self, "config", None), "eos_token_id", None)
+        if speech_start_id is None or speech_end_id is None or speech_diffusion_id is None:
+            raise ValueError(
+                "generate() requires a tokenizer that exposes "
+                "speech_start_id / speech_end_id / speech_diffusion_id "
+                "(e.g. VibeVoiceTextTokenizer)."
             )
-            hidden_states = fwd.hidden_states
 
-        # Condition features: hidden states at acoustic positions.
-        if acoustic_input_mask is not None and acoustic_input_mask.any():
-            condition = hidden_states[acoustic_input_mask]
-        else:
-            condition = hidden_states
+        # ------------------------------------------------------------------
+        # Prefix embeddings (reference injected at acoustic_input_mask positions).
+        # ------------------------------------------------------------------
+        inputs_embeds = self._build_prefix_embeds(
+            input_ids, acoustic_input_mask, speech_tensors, speech_masks
+        )  # (B, S, H)
+        seq_len = input_ids.shape[1]
+        batch_size = input_ids.shape[0]
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
 
-        if condition.ndim == 3:
-            condition = condition.reshape(-1, condition.shape[-1])
+        # ------------------------------------------------------------------
+        # Length budget (control tokens). Mirrors the original:
+        #   max_new_tokens = max_position_embeddings - prompt_len   (if auto)
+        #   max_steps      = min(max_new_tokens, max_length_times * prompt_len)
+        # The token constraint + EOS termination keep this from running away.
+        # ------------------------------------------------------------------
+        if max_new_tokens is None:
+            max_position = getattr(self.config.decoder_config, "max_position_embeddings", None)
+            if max_position:
+                max_new_tokens = int(max_position) - seq_len
+            else:
+                max_new_tokens = min(int(seq_len * 12), 2000)
+        max_new_tokens = max(1, min(int(max_new_tokens), 8192))
+        max_length = seq_len + max_new_tokens
+        max_length_times = int(kwargs.get("max_length_times", 2))
+        max_steps = max(1, min(max_new_tokens, int(max_length_times * seq_len)))
 
-        # 2. Configure diffusion scheduler.
+        # Diffusion steps.
         num_steps = inference_steps or getattr(
-            self, "ddpm_inference_steps",
-            self.config.diffusion_head_config.ddpm_num_inference_steps
+            self, "ddpm_inference_steps", self.config.diffusion_head_config.ddpm_num_inference_steps
         )
+        self.set_ddpm_inference_steps(num_steps)
         self.model.noise_scheduler.set_timesteps(num_steps)
 
-        # 3. Sample speech latents via the diffusion head (CFG).
-        vae_dim = self.config.acoustic_tokenizer_config.vae_dim
-        speech = torch.randn(condition.shape[0], vae_dim, device=device, dtype=condition.dtype)
-        neg_condition = torch.zeros_like(condition)
+        # Streaming caches (cleared on speech_end_id).
+        acoustic_cache = VibeVoiceTokenizerStreamingCache()
+        semantic_cache = VibeVoiceTokenizerStreamingCache()
 
-        for t in self.model.noise_scheduler.timesteps:
-            # Classifier-free guidance: run conditioned + unconditioned together.
-            cond_in = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
-            combined = torch.cat([speech, speech], dim=0)
-            eps = self.model.prediction_head(
-                combined,
-                t.repeat(combined.shape[0]).to(combined.device),
-                condition=cond_in,
+        # Token-constraint mask: only the 4 (+bos) control tokens are allowed.
+        valid_tokens = [int(speech_start_id), int(speech_end_id), int(speech_diffusion_id), int(eos_id)]
+        if bos_id is not None:
+            valid_tokens.append(int(bos_id))
+        valid_tokens_t = torch.tensor(valid_tokens, dtype=torch.long, device=device)
+        constraint = torch.full((1, self.vocab_size), float("-inf"), device=device)
+        constraint[0, valid_tokens_t] = 0.0
+
+        embed = self.get_input_embeddings()
+        head_dev = self.model.prediction_head.device
+        lm_dev = getattr(self.lm_head.weight, "device", None) or device
+        ac_dev = self.model.acoustic_tokenizer.device
+        sf = self.model.speech_scaling_factor
+        bf = self.model.speech_bias_factor
+
+        # ------------------------------------------------------------------
+        # Prefill (positive) forward -- build the KV cache over the prompt.
+        # ------------------------------------------------------------------
+        cache_position = torch.arange(0, seq_len, device=device)
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+        outputs = self.model.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cache_position=cache_position,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        past_key_values = outputs.past_key_values
+        hidden = outputs.last_hidden_state  # (B, S, H)
+
+        # ------------------------------------------------------------------
+        # Negative (unconditional) pass bookkeeping. The negative sequence is
+        # seeded with a single `speech_start_id` token and grows by one token per
+        # AR step, mirroring the original `refresh_negative=False` semantics: the
+        # negative forward is fed the SAME per-step embedding as the positive but
+        # through its own (unconditionally-seeded) KV cache -> real CFG signal.
+        # ------------------------------------------------------------------
+        neg_input_ids = torch.full((batch_size, 1), int(speech_start_id), dtype=torch.long, device=device)
+        neg_attention_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+        neg_position_ids = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+        neg_past = None
+        neg_cur_pos = 0
+        # `last_embeds` is the embedding fed to the positive forward of the CURRENT
+        # step; the negative forward reuses it (original's inputs_embeds override).
+        # At step 0 the original falls back to the negative's own [speech_start_id]
+        # embedding, so we start last_embeds as the prefix and use the neg_past is
+        # None branch for the first negative forward.
+        last_embeds = inputs_embeds
+
+        audio_chunks = [[] for _ in range(batch_size)]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        cur_pos = seq_len
+
+        step = 0
+        while cur_pos < max_length and step < max_steps and not finished.all():
+            # 1) Sample the next control token (token-constrained).
+            logits = self.lm_head(hidden[:, -1, :].to(lm_dev))  # (B, vocab)
+            scores = logits.float() + constraint  # -inf everywhere except valid
+            if do_sample:
+                probs = torch.softmax(scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+            else:
+                next_tokens = scores.argmax(dim=-1)  # (B,)
+            next_tokens = next_tokens.clone()
+            next_tokens[finished] = int(eos_id)
+
+            # 2) Negative (unconditional) forward for this step.
+            if neg_past is None:
+                neg_embeds = embed(neg_input_ids)  # (B,1,H) == [speech_start_id]
+            else:
+                neg_embeds = last_embeds
+            # BUG-011 fix: `neg_embeds` is a SINGLE token (B,1,H), so the RoPE
+            # `position_ids` must be the CURRENT position only. Passing the
+            # full-length `neg_position_ids` (B, step+1) made q/k broadcast
+            # against full-length cos/sin and silently expand to seq-len
+            # step+1 while v (never rotated) stayed length 1 -> the KV cache
+            # accumulated step+1 keys but only 1 value per step, and SDPA's
+            # `attn @ value` crashed with "Expected size for first two
+            # dimensions of batch2 tensor to be: [B*H, keys] but got:
+            # [B*H, values]" (e.g. [12, 3] but got: [12, 2] at step 1).
+            # The attention mask stays full-length (it addresses the whole
+            # cache); only position_ids must match the single input token.
+            neg_out = self.model.language_model(
+                inputs_embeds=neg_embeds.to(lm_dev),
+                attention_mask=neg_attention_mask,
+                position_ids=neg_position_ids[:, -1:],
+                cache_position=torch.tensor([neg_cur_pos], device=device, dtype=torch.long),
+                past_key_values=neg_past,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
             )
-            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-            # Collapse the two branches into a single CFG prediction for the N samples.
-            eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-            speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
+            neg_past = neg_out.past_key_values
+            neg_hidden = neg_out.last_hidden_state[:, -1, :]  # (B, H)
+            neg_attention_mask = torch.cat(
+                [neg_attention_mask, torch.ones((batch_size, 1), dtype=torch.long, device=device)], dim=-1
+            )
+            neg_position_ids = torch.cat(
+                [neg_position_ids, neg_position_ids[:, -1:] + 1], dim=-1
+            )
+            neg_cur_pos += 1
+            neg_input_ids = torch.cat([neg_input_ids, next_tokens[:, None]], dim=-1)
 
-        sampled = speech
+            # 3) Default next embedding = plain token embedding.
+            next_inputs_embeds = embed(next_tokens).unsqueeze(1)  # (B,1,H)
 
-        # 4. Decode latents to waveform.
-        speech_outputs = None
-        if return_speech:
-            # The diffusion head is trained on (and therefore outputs) the
-            # *scaled* acoustic features `audio_features = (tokens + bias) *
-            # scaling`. The VAE decoder expects the *raw* latent tokens, so we
-            # must apply the INVERSE transform before decoding. (This mirrors
-            # the streaming inference path: `latent / scaling - bias`.) The
-            # original `(sampled + bias) * scaling` doubly-scaled the output and
-            # produced a silent/garbage waveform.
-            if not torch.isnan(self.model.speech_scaling_factor) and not torch.isnan(self.model.speech_bias_factor):
-                sf = self.model.speech_scaling_factor.to(sampled.device)
-                bf = self.model.speech_bias_factor.to(sampled.device)
-                sampled = sampled / sf - bf
-            # Decode expects (batch, vae_dim, frames) or (batch, frames, vae_dim).
-            latents = sampled.unsqueeze(0)  # (1, N, vae_dim)
-            audio = self.model.acoustic_tokenizer.decode(latents)
-            if isinstance(audio, (list, tuple)):
-                audio = audio[0]
-            speech_outputs = [audio]
+            # 4) EOS marks a sample finished (no more audio for it).
+            eos_now = (next_tokens == int(eos_id))
+            finished = finished | eos_now
+
+            # 5) On speech_end: clear the streaming tokenizer caches.
+            end_idx = (next_tokens == int(speech_end_id)).nonzero(as_tuple=False).squeeze(1)
+            if end_idx.numel() > 0:
+                acoustic_cache.set_to_zero(end_idx)
+                semantic_cache.set_to_zero(end_idx)
+
+            # 6) Diffusion is gated to speech_diffusion_id steps only.
+            diffusion_idx = (~finished & (next_tokens == int(speech_diffusion_id))).nonzero(as_tuple=False).squeeze(1)
+            if diffusion_idx.numel() > 0:
+                pos_cond = hidden[:, -1, :][diffusion_idx].to(head_dev)  # (Nd, H)
+                neg_cond = neg_hidden[diffusion_idx].to(head_dev)        # (Nd, H)
+                latent = self.sample_speech_tokens(pos_cond, neg_cond, cfg_scale=cfg_scale)  # (Nd, vae_dim), scaled
+                # Invert the diffusion scaling before VAE decode (BUG-005).
+                if not torch.isnan(sf) and not torch.isnan(bf):
+                    sf_d = sf.to(latent.device)
+                    bf_d = bf.to(latent.device)
+                    scaled_latent = latent / sf_d - bf_d
+                else:
+                    scaled_latent = latent
+                scaled_latent = scaled_latent.unsqueeze(1)  # (Nd, 1, vae_dim)
+                audio_chunk = self.model.acoustic_tokenizer.decode(
+                    scaled_latent.to(ac_dev),
+                    cache=acoustic_cache,
+                    sample_indices=diffusion_idx.to(ac_dev),
+                    use_cache=True,
+                    debug=False,
+                )
+                # Normalize audio_chunk to (Nd, T) for storage + semantic encode.
+                if audio_chunk is not None:
+                    if isinstance(audio_chunk, (list, tuple)):
+                        audio_chunk = audio_chunk[0]
+                    if isinstance(audio_chunk, torch.Tensor):
+                        if audio_chunk.dim() == 3:
+                            audio_chunk = audio_chunk.squeeze(1)
+                        if audio_chunk.dim() == 1:
+                            audio_chunk = audio_chunk.unsqueeze(0)
+                if audio_chunk is not None and isinstance(audio_chunk, torch.Tensor):
+                    if return_speech:
+                        for i, idx in enumerate(diffusion_idx.tolist()):
+                            if not finished[idx]:
+                                audio_chunks[idx].append(audio_chunk[i])
+                    # Semantic feedback: encode the chunk, combine with acoustic connector.
+                    # acoustic_tokenizer.decode yields waveform (Nd, T); the semantic tokenizer's
+                    # StreamingConv1d expects (Nd, C, T) with C=1 (mono), so add the channel dim
+                    # for the encode ONLY. `audio_chunk` itself is left intact because it is still
+                    # appended to audio_chunks[i] for waveform assembly below (kept 1-D/2-D on purpose).
+                    sem_input = audio_chunk
+                    if sem_input.dim() == 2:
+                        sem_input = sem_input.unsqueeze(1)                # (Nd, T) -> (Nd, 1, T)
+                    elif sem_input.dim() == 1:
+                        sem_input = sem_input.unsqueeze(0).unsqueeze(0)   # (T,)   -> (1, 1, T)
+                    semantic_features = self.model.semantic_tokenizer.encode(
+                        sem_input,
+                        cache=semantic_cache,
+                        sample_indices=diffusion_idx,
+                        use_cache=True,
+                        debug=False,
+                    ).mean  # (Nd, semantic_vae_dim, T_sem); consumed by semantic_connector
+                    acoustic_embed = self.model.acoustic_connector(latent)             # (Nd, H)
+                    semantic_embed = self.model.semantic_connector(semantic_features)  # (Nd, H)
+                    next_inputs_embeds[diffusion_idx] = acoustic_embed + semantic_embed
+
+            # 7) Forward the positive model for the next step.
+            last_embeds = next_inputs_embeds
+            if not finished.all():
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones((batch_size, 1), dtype=torch.long, device=device)], dim=-1
+                )
+                cache_position = torch.tensor([cur_pos], device=device, dtype=torch.long)
+                pos_ids = cache_position.unsqueeze(0)
+                outputs = self.model.language_model(
+                    inputs_embeds=next_inputs_embeds.to(lm_dev),
+                    attention_mask=attention_mask,
+                    position_ids=pos_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    use_cache=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                past_key_values = outputs.past_key_values
+                hidden = outputs.last_hidden_state  # (B, 1, H)
+                cur_pos += 1
+            else:
+                break
+            step += 1
+
+        # ------------------------------------------------------------------
+        # Assemble the per-sample waveform(s).
+        # ------------------------------------------------------------------
+        final_audio = []
+        for chunks in audio_chunks:
+            if chunks:
+                final_audio.append(torch.cat(chunks, dim=-1))
+            else:
+                final_audio.append(None)
+        speech_outputs = final_audio if return_speech else None
 
         return VibeVoiceGenerationOutput(
             sequences=input_ids,
             speech_outputs=speech_outputs,
         )
+
 
 AutoModel.register(VibeVoiceConfig, VibeVoiceModel, exist_ok=True)
 AutoModelForCausalLM.register(VibeVoiceConfig, VibeVoiceForConditionalGeneration, exist_ok=True)

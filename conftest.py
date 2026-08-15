@@ -183,14 +183,20 @@ def comfyui_env():
 class _TinyHandler(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = torch.nn.Linear(8, 8)
+        # AUD-010: mirror the real VibeVoiceModelHandler — the heavy model is
+        # lazily created by load_model(), not pre-set in __init__. This lets the
+        # patcher's lazy-load branch (``if self.model.model is None``) be
+        # exercised by the behavioral tests.
+        self.model = None
         self.processor = object()
         self.model_pack_name = "tiny"
         self.cache_key = "tiny"
         self.size = 1024
 
     def load_model(self, device, attention_mode: str = "sdpa"):
-        # Mirror the real handler: move the inner model onto the target device.
+        # Mirror the real handler: lazy instantiation + move onto target device.
+        if self.model is None:
+            self.model = torch.nn.Linear(8, 8)
         self.model.to(device)
 
 

@@ -152,6 +152,14 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     step=1,
                     tooltip="Top-K sampling. Restricts sampling to the K most likely next tokens. Set to 0 to disable. Active only if 'do_sample' is enabled.",
                 ),
+                io.Int.Input(
+                    "max_new_tokens",
+                    default=0,
+                    min=0,
+                    max=8192,
+                    step=1,
+                    tooltip="Max generated speech tokens (utterance length budget). 0 = auto (~30x the prompt length). If the voice model exposes a speech-end token, generation stops earlier; raise this if output is cut off, lower it if output is too long.",
+                ),
                 # System parameters
                 io.Boolean.Input(
                     "force_offload",
@@ -217,6 +225,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
         force_offload: bool,
         device: str,
         dtype: str,
+        max_new_tokens: int = 0,
         speaker_1_voice: Optional[dict] = None,
         speaker_2_voice: Optional[dict] = None,
         speaker_3_voice: Optional[dict] = None,
@@ -263,6 +272,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                max_new_tokens=max_new_tokens if max_new_tokens else None,
             )
 
             output_audio = {

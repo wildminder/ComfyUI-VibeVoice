@@ -149,6 +149,20 @@ def _make_model(hidden_size: int = 64):
 
     inner.side_effect = _inner_forward
 
+    # The non-streaming generate() calls self.model.language_model(...) directly
+    # (one forward per autoregressive step), so provide a working inner LM that
+    # returns a real hidden-state tensor (mirrors the wrapper used by forward()).
+    def _lm_forward(inputs_embeds=None, **kwargs):
+        x = kwargs.get("inputs_embeds")
+        if not isinstance(x, torch.Tensor):
+            x = torch.randn(1, 4, hidden_size)
+        result = MagicMock()
+        result.last_hidden_state = x
+        result.past_key_values = None
+        return result
+
+    inner.language_model = MagicMock(side_effect=_lm_forward)
+
     # Mock acoustic_tokenizer.decode to return a waveform tensor
     inner.acoustic_tokenizer.decode = MagicMock(return_value=torch.randn(1, 24000))
 
@@ -278,10 +292,16 @@ def _make_model_with_encoder_output(hidden_size: int = 64):
 
     model.model.acoustic_tokenizer.encode = MagicMock(side_effect=_encode)
     model.model.acoustic_tokenizer.std_dist_type = "fix"
-    # acoustic_connector must accept [B, T, vae_dim] and return [B, T, hidden]
-    model.model.acoustic_connector.side_effect = lambda f: torch.randn(
-        f.shape[0], f.shape[1], hidden_size
-    )
+    # acoustic_connector must accept both:
+    #   - [B, T, vae_dim] (from forward_speech_features, the reference prefix) -> [B, T, hidden]
+    #   - [B, vae_dim] (a single generated latent fed back in the AR loop)   -> [B, hidden]
+    # matching the real SpeechConnector's (input_dim -> hidden_size) contract.
+    def _acoustic_connector(f):
+        if f.dim() == 3:
+            return torch.randn(f.shape[0], f.shape[1], hidden_size)
+        return torch.randn(f.shape[0], hidden_size)
+
+    model.model.acoustic_connector.side_effect = _acoustic_connector
     return model
 
 

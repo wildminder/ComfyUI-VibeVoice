@@ -42,7 +42,17 @@ class TestEnsureDownloaded:
         _, kwargs = mock_dl.call_args
         assert kwargs.get("repo_id") == repo_id
         assert kwargs.get("local_dir") == str(local_dir)
-        assert kwargs.get("local_dir_use_symlinks") is False
+        # AUD-013: the symlinks kwarg is only passed when the installed
+        # huggingface_hub still accepts it (removed in >= 0.23 / 1.x).
+        import inspect
+        import huggingface_hub
+        supports_symlinks = "local_dir_use_symlinks" in inspect.signature(
+            huggingface_hub.snapshot_download
+        ).parameters
+        if supports_symlinks:
+            assert kwargs.get("local_dir_use_symlinks") is False
+        else:
+            assert "local_dir_use_symlinks" not in kwargs
 
     def test_ensure_downloaded_skips_when_config_present(self, tmp_path):
         local_dir = tmp_path / "model"

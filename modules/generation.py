@@ -73,6 +73,7 @@ def load_vibevoice_model(
             model_name,
             attention_mode=actual_attention_mode,
             use_llm_4bit=quantize_4bit,
+            dtype_str=dtype,
         )
 
         patcher = VibeVoicePatcher(
@@ -112,6 +113,7 @@ def generate_audio(
     temperature: float = 0.95,
     top_p: float = 0.95,
     top_k: int = 0,
+    max_new_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, int]:
     """Generate audio using the VibeVoice model.
 
@@ -128,6 +130,10 @@ def generate_audio(
         temperature: Sampling temperature.
         top_p: Nucleus sampling threshold.
         top_k: Top-K sampling (0 to disable).
+        max_new_tokens: Hard cap on generated speech tokens (utterance length budget).
+            None = auto (~30x prompt length). Passed through to ``model.generate``
+            so the non-streaming AR loop terminates; when the processor tokenizer
+            exposes ``speech_end_id`` it also stops on the EOS speech token.
 
     Returns:
         Tuple of (output audio tensor [1, 1, T], sample_rate).
@@ -216,6 +222,15 @@ def generate_audio(
         "cfg_scale": cfg_scale,
         "inference_steps": inference_steps,
         "return_speech": True,
+        # Option C: pass the processor tokenizer so generate() can resolve
+        # `speech_end_id` and terminate the AR loop on the EOS speech token.
+        # Also forward the sampling controls + utterance-length budget.
+        "tokenizer": processor.tokenizer,
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "max_new_tokens": max_new_tokens,
     }
     # Drop None values so the model uses its own defaults where appropriate.
     gen_inputs = {k: v for k, v in gen_inputs.items() if v is not None}

@@ -36,6 +36,16 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         self._warm_offloaded = False
 
     @property
+    def _model_cache(self) -> dict:
+        """The (model, processor) cache dict this patcher's cold offload clears.
+
+        AUD-012: TTS and ASR patchers own *separate* caches. The cold-offload
+        path must only evict from this patcher's own registry so an ASR offload
+        can never drop a TTS cache entry (and vice versa).
+        """
+        return LOADED_MODELS_CACHE
+
+    @property
     def is_loaded(self) -> bool:
         """Check if the model's core components are loaded."""
         return (
@@ -83,10 +93,19 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         # ComfyUI's load() can properly track model_loaded_weight_memory
         self.model.model.to(target_device)
 
-        # Apply dtype casting if specified
+        # Apply dtype casting ONLY if the model's dtype differs from the
+        # target (DF-004 fix). The loader now applies the final dtype on CPU
+        # before the H2D transfer, so this cast is normally a no-op guard;
+        # it still fires for models loaded by other paths (e.g. ASR) or when
+        # the dtype cannot be determined up front.
         if self.target_dtype is not None:
-            logger.debug(f"Casting model to dtype: {self.target_dtype}")
-            cast_model_to_dtype(self.model.model, self.target_dtype)
+            current_dtype = getattr(self.model.model, "dtype", None)
+            if current_dtype != self.target_dtype:
+                logger.debug(
+                    f"Casting model to dtype: {self.target_dtype} "
+                    f"(current: {current_dtype})"
+                )
+                cast_model_to_dtype(self.model.model, self.target_dtype)
 
         # Delegate to ComfyUI's standard patch_model() with load_weights=True
         # so that ComfyUI's load() properly tracks model_loaded_weight_memory
@@ -138,9 +157,10 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
             self.model.model = None
             self.model.processor = None
 
-            if self.cache_key in LOADED_MODELS_CACHE:
-                del LOADED_MODELS_CACHE[self.cache_key]
-                logger.info(f"Cleared LOADED_MODELS_CACHE for: {self.cache_key}")
+            cache = self._model_cache
+            if self.cache_key in cache:
+                del cache[self.cache_key]
+                logger.info(f"Cleared model cache for: {self.cache_key}")
 
             gc.collect()
             model_management.soft_empty_cache()
@@ -157,16 +177,14 @@ class VibeVoiceASRPatcher(VibeVoicePatcher):
     orchestration (``model_management.load_model_gpu`` / partial offload /
     cross-model VRAM arbitration) that the TTS path already uses, resolving
     CRIT-001.
+
+    AUD-012: cache isolation is achieved by overriding ``_model_cache`` (the
+    base cold-offload path evicts only from this dict) instead of a separate
+    ``unpatch_model`` override, which previously also ran the base cold path
+    and wrongly evicted the TTS cache for a colliding key.
     """
 
-    def unpatch_model(self, device_to=None, unpatch_weights=True, *args, **kwargs):
-        """Offload the ASR model and clear the ASR cache entry.
-
-        ``self.model.model`` / ``self.model.processor`` are nulled by the
-        base ``unpatch_model`` (via ``super()``); here we additionally drop
-        the ASR-specific cache key so the next run re-instantiates cleanly.
-        """
-        if unpatch_weights and self.cache_key in LOADED_ASR_MODELS_CACHE:
-            del LOADED_ASR_MODELS_CACHE[self.cache_key]
-            logger.info(f"Cleared LOADED_ASR_MODELS_CACHE for: {self.cache_key}")
-        return super().unpatch_model(device_to, unpatch_weights, *args, **kwargs)
+    @property
+    def _model_cache(self) -> dict:
+        """ASR patchers evict from the ASR cache only (never the TTS cache)."""
+        return LOADED_ASR_MODELS_CACHE

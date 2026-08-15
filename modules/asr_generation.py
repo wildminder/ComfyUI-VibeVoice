@@ -92,7 +92,7 @@ def load_asr_model_patched(
         Tuple of (patcher, model, processor).
     """
     # Resolve attention mode with internal fallback (no 4-bit for ASR).
-    actual_attn = resolve_attention_mode(attention_mode, use_llm_4bit=False)
+    actual_attn = resolve_attention_mode(attention_mode, quantize_4bit=False)
 
     # Device placement (mirrors load_vibevoice_model).
     if device == DEVICE_CPU:
