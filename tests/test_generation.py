@@ -7,6 +7,8 @@ from unittest.mock import patch, MagicMock
 
 from ComfyUI_VibeVoice.modules.generation import (
     load_vibevoice_model,
+    load_vibevoice_from_external,
+    ExternalVibeVoiceModelHandler,
     generate_audio,
     force_offload_model,
 )
@@ -128,6 +130,198 @@ class TestLoadVibevoiceModel:
                     attention_mode="sdpa",
                     quantize_4bit=False,
                 )
+
+
+class TestLoadFromExternal:
+    """Test load_vibevoice_from_external function."""
+
+    def _make_bundle(self):
+        """Create a minimal valid external model bundle."""
+        return {
+            "model": MagicMock(),
+            "processor": MagicMock(),
+            "model_name": "ExtModel",
+            "source_path": "/fake/model.safetensors",
+            "is_streaming": False,
+        }
+
+    def test_load_from_external_returns_patcher_model_processor(self):
+        """Returns a 3-tuple of (patcher, model, processor)."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            patcher, model, processor = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        assert patcher is not None
+        assert model is not None
+        assert processor is not None
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    def test_load_from_external_creates_patcher(self):
+        """A VibeVoicePatcher is created wrapping the external handler."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.patcher import VibeVoicePatcher
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            patcher, _, _ = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        assert isinstance(patcher, VibeVoicePatcher)
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    def test_load_from_external_calls_load_model_gpu(self):
+        """model_management.load_model_gpu is called with the patcher."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu") as mock_load_gpu:
+            patcher, _, _ = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        mock_load_gpu.assert_called_once_with(patcher)
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    def test_load_from_external_caches_patcher(self):
+        """The patcher is stored in VIBEVOICE_PATCHER_CACHE."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            patcher, _, _ = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        cache_key = "external_ExtModel_attn_sdpa"
+        assert cache_key in VIBEVOICE_PATCHER_CACHE
+        assert VIBEVOICE_PATCHER_CACHE[cache_key] is patcher
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    def test_load_from_external_handler_holds_preloaded_model(self):
+        """The handler's .model and .processor are the bundle's (not None)."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            patcher, _, _ = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        handler = patcher.model
+        assert handler.model is bundle["model"]
+        assert handler.processor is bundle["processor"]
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    def test_load_from_external_missing_model_raises(self):
+        """Bundle without 'model' → ValueError."""
+        bundle = self._make_bundle()
+        bundle["model"] = None
+
+        with pytest.raises(ValueError, match="model"):
+            load_vibevoice_from_external(bundle, device="cpu")
+
+    def test_load_from_external_missing_processor_raises(self):
+        """Bundle without 'processor' → ValueError."""
+        bundle = self._make_bundle()
+        bundle["processor"] = None
+
+        with pytest.raises(ValueError, match="processor"):
+            load_vibevoice_from_external(bundle, device="cpu")
+
+    def test_load_from_external_missing_model_name_raises(self):
+        """Bundle without 'model_name' → ValueError."""
+        bundle = self._make_bundle()
+        bundle["model_name"] = None
+
+        with pytest.raises(ValueError, match="model_name"):
+            load_vibevoice_from_external(bundle, device="cpu")
+
+    def test_load_from_external_cache_hit_reuses_patcher(self):
+        """A second call with the same bundle reuses the cached patcher."""
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            patcher1, _, _ = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+            patcher2, _, _ = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        assert patcher1 is patcher2
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+
+class TestExternalVibeVoiceModelHandler:
+    """Test the ExternalVibeVoiceModelHandler container."""
+
+    def test_handler_is_nn_module(self):
+        """Handler is a torch.nn.Module."""
+        handler = ExternalVibeVoiceModelHandler(
+            model=MagicMock(), processor=MagicMock(), model_pack_name="ext"
+        )
+        assert isinstance(handler, torch.nn.Module)
+
+    def test_handler_holds_model_and_processor(self):
+        """Handler stores the provided model and processor."""
+        model = MagicMock()
+        processor = MagicMock()
+        handler = ExternalVibeVoiceModelHandler(
+            model=model, processor=processor, model_pack_name="ext"
+        )
+        assert handler.model is model
+        assert handler.processor is processor
+
+    def test_handler_cache_key_namespaced(self):
+        """Cache key is prefixed with 'external_'."""
+        handler = ExternalVibeVoiceModelHandler(
+            model=MagicMock(), processor=MagicMock(),
+            model_pack_name="ext", attention_mode="sdpa",
+        )
+        assert handler.cache_key == "external_ext_attn_sdpa"
+
+    def test_handler_load_model_is_noop(self):
+        """load_model() does not replace the pre-loaded model."""
+        model = MagicMock()
+        handler = ExternalVibeVoiceModelHandler(
+            model=model, processor=MagicMock(), model_pack_name="ext"
+        )
+        handler.load_model(torch.device("cpu"))
+        assert handler.model is model
+
+    def test_handler_estimates_size_from_parameters(self):
+        """Size is estimated from a real nn.Module's parameters."""
+        real_model = torch.nn.Linear(8, 8)
+        handler = ExternalVibeVoiceModelHandler(
+            model=real_model, processor=MagicMock(), model_pack_name="ext"
+        )
+        expected = sum(p.numel() * p.element_size() for p in real_model.parameters())
+        assert handler.size == expected
+
+    def test_handler_size_fallback_for_mock(self):
+        """Size falls back to ~4GB when parameters cannot be summed."""
+        handler = ExternalVibeVoiceModelHandler(
+            model=MagicMock(), processor=MagicMock(), model_pack_name="ext"
+        )
+        assert handler.size > 0
 
 
 class TestGenerateAudio:

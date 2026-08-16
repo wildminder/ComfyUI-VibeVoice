@@ -261,6 +261,190 @@ class TestLoadASRModelPatched:
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
 
 
+class TestExternalVibeVoiceASRModelHandler:
+    """Phase 4: handler for an externally-loaded (pre-instantiated) ASR model."""
+
+    def _make_handler(self, model=None, processor=None, name="ext-asr", bundle=None):
+        from ComfyUI_VibeVoice.modules.asr_generation import ExternalVibeVoiceASRModelHandler
+        model = model if model is not None else torch.nn.Linear(8, 8)
+        processor = processor if processor is not None else object()
+        return ExternalVibeVoiceASRModelHandler(model, processor, name, bundle)
+
+    def test_handler_holds_preloaded_model_and_processor(self):
+        model = torch.nn.Linear(8, 8)
+        processor = object()
+        handler = self._make_handler(model=model, processor=processor)
+        assert handler.model is model
+        assert handler.processor is processor
+
+    def test_handler_model_is_not_none(self):
+        """The patcher's skip-reload contract requires model to be pre-set."""
+        handler = self._make_handler()
+        assert handler.model is not None
+
+    def test_handler_default_cache_key(self):
+        handler = self._make_handler(name="ext-asr")
+        assert handler.cache_key == "asr_external_ext-asr"
+
+    def test_handler_pack_name_matches(self):
+        handler = self._make_handler(name="ext-asr")
+        assert handler.model_pack_name == "ext-asr"
+        assert handler.model_name == "ext-asr"
+
+    def test_handler_size_from_bundle_hint(self):
+        bundle = {"size_gb": 2.0}
+        handler = self._make_handler(bundle=bundle)
+        assert handler.size == int(2.0 * (1024**3))
+
+    def test_handler_size_from_parameters_when_no_hint(self):
+        model = torch.nn.Linear(16, 16)
+        handler = self._make_handler(model=model, bundle=None)
+        expected = sum(p.numel() * p.element_size() for p in model.parameters())
+        assert handler.size == expected
+
+    def test_handler_load_model_is_noop(self):
+        """load_model must not replace the pre-loaded model."""
+        model = torch.nn.Linear(8, 8)
+        handler = self._make_handler(model=model)
+        handler.load_model(torch.device("cpu"))
+        assert handler.model is model
+
+
+class TestLoadASRFromExternal:
+    """Phase 4: load_asr_from_external wraps a pre-loaded bundle in a patcher."""
+
+    def _make_bundle(self, name="ext-asr"):
+        return {
+            "model": torch.nn.Linear(8, 8),
+            "processor": object(),
+            "model_name": name,
+            "source_path": "fake.safetensors",
+        }
+
+    def _patched_load(self, bundle, device="cpu", dtype="fp32", attention_mode="sdpa"):
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
+
+        with patch("comfy.model_patcher.ModelPatcher.patch_model"), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
+                   side_effect=lambda p: p.patch_model()), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device", return_value=torch.device("cpu")), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device", return_value=torch.device("cpu")):
+            return load_asr_from_external(
+                bundle, device=device, dtype=dtype, attention_mode=attention_mode
+            )
+
+    def test_missing_model_key_raises(self):
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
+        bundle = self._make_bundle()
+        del bundle["model"]
+        with pytest.raises(ValueError, match="model"):
+            load_asr_from_external(bundle)
+
+    def test_missing_processor_key_raises(self):
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
+        bundle = self._make_bundle()
+        del bundle["processor"]
+        with pytest.raises(ValueError, match="processor"):
+            load_asr_from_external(bundle)
+
+    def test_missing_model_name_key_raises(self):
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
+        bundle = self._make_bundle()
+        del bundle["model_name"]
+        with pytest.raises(ValueError, match="model_name"):
+            load_asr_from_external(bundle)
+
+    def test_none_model_value_raises(self):
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
+        bundle = self._make_bundle()
+        bundle["model"] = None
+        with pytest.raises(ValueError, match="model"):
+            load_asr_from_external(bundle)
+
+    def test_returns_patcher_model_processor(self):
+        from ComfyUI_VibeVoice.modules.patcher import VibeVoiceASRPatcher
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle()
+        patcher, model, processor = self._patched_load(bundle)
+
+        assert isinstance(patcher, VibeVoiceASRPatcher)
+        assert model is bundle["model"]
+        assert processor is bundle["processor"]
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+    def test_caches_patcher_under_external_key(self):
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle(name="ext-asr")
+        self._patched_load(bundle, attention_mode="sdpa")
+
+        assert "asr_external_ext-asr_attn_sdpa" in VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+    def test_registers_loaded_asr_cache_entry(self):
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle(name="ext-asr")
+        patcher, model, processor = self._patched_load(bundle)
+
+        key = "asr_external_ext-asr_attn_sdpa"
+        assert key in LOADED_ASR_MODELS_CACHE
+        assert LOADED_ASR_MODELS_CACHE[key] == (model, processor)
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+    def test_handler_cache_key_synced_with_patcher(self):
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle(name="ext-asr")
+        patcher, _, _ = self._patched_load(bundle)
+
+        # The handler's cache_key must match the patcher cache key so
+        # unpatch_model clears the correct LOADED_ASR_MODELS_CACHE entry.
+        assert patcher.model.cache_key == patcher.cache_key
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+    def test_cache_reuse_returns_same_patcher(self):
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+        bundle = self._make_bundle(name="ext-asr")
+        patcher1, _, _ = self._patched_load(bundle)
+        patcher2, _, _ = self._patched_load(bundle)
+
+        assert patcher1 is patcher2
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+
 class TestForceOffloadASRPatcher:
     """CRIT-001 S5: force_offload via patcher nulls the model and clears the cache."""
 

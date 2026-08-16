@@ -56,6 +56,16 @@ class TestVibeVoiceASRNodeSchema:
     def test_schema_has_force_offload(self):
         assert "force_offload" in self._get_input_ids()
 
+    def test_asr_schema_has_external_model_input(self):
+        """Phase 4.1: the ASR node exposes an optional external_model input."""
+        assert "external_model" in self._get_input_ids()
+
+    def test_asr_external_model_input_is_optional(self):
+        """Phase 4.1: external_model must be optional (dropdown path unchanged)."""
+        schema = self._get_schema()
+        ext_input = next(inp for inp in schema.inputs if inp.id == "external_model")
+        assert getattr(ext_input, "optional", False) is True
+
     def test_schema_has_two_outputs(self):
         """ASR node should have transcription + segments outputs."""
         schema = self._get_schema()
@@ -78,6 +88,15 @@ class TestVibeVoiceASRNodeValidate:
 
     def test_validate_none_model(self):
         result = VibeVoiceASRNode.validate_inputs(model_name=None)
+        assert result is True
+
+    def test_validate_external_model_bypasses_dropdown_check(self):
+        """Phase 4.1: an external model skips model_name validation entirely."""
+        bundle = {"model": MagicMock(), "processor": MagicMock(), "model_name": "ext-asr"}
+        # Even with an unknown model_name, validation passes when external_model is set.
+        result = VibeVoiceASRNode.validate_inputs(
+            model_name="NonExistent", external_model=bundle
+        )
         assert result is True
 
 
@@ -160,3 +179,187 @@ class TestVibeVoiceASRNodeExecute:
 
         # With force_offload=True the patcher must be handed to offload.
         mock_offload.assert_called_once_with("VibeVoice-ASR", stub_patcher)
+
+
+class TestVibeVoiceASRNodeExecuteExternal:
+    """Phase 4.1: execute() branches on the optional external_model input."""
+
+    @staticmethod
+    def _make_bundle(model_name="ext-asr", is_streaming=False):
+        return {
+            "model": MagicMock(),
+            "processor": MagicMock(),
+            "model_name": model_name,
+            "is_streaming": is_streaming,
+            "source_path": "fake.safetensors",
+        }
+
+    def test_asr_execute_with_external_model_calls_load_from_external(self):
+        """external_model present → load_asr_from_external is used."""
+        stub_patcher = MagicMock()
+        model = MagicMock()
+        processor = MagicMock()
+        bundle = self._make_bundle()
+        audio = {"waveform": MagicMock(), "sample_rate": 24000}
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_from_external",
+            return_value=(stub_patcher, model, processor),
+        ) as mock_ext, patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_model_patched"
+        ) as mock_std, patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.transcribe_audio",
+            return_value=("hello world", []),
+        ) as mock_transcribe:
+            result = VibeVoiceASRNode.execute(
+                model_name="VibeVoice-ASR",
+                audio=audio,
+                context_info="",
+                max_new_tokens=32768,
+                temperature=0.0,
+                top_p=1.0,
+                do_sample=False,
+                num_beams=1,
+                device="cpu",
+                dtype="auto",
+                attention_mode="sdpa",
+                force_offload=False,
+                external_model=bundle,
+            )
+
+        mock_ext.assert_called_once()
+        # The bundle itself must be passed through.
+        assert mock_ext.call_args.args[0] is bundle
+        # The standard dropdown loader must NOT be called.
+        mock_std.assert_not_called()
+        # Transcription uses the external model/processor.
+        assert mock_transcribe.call_args.kwargs["model"] is model
+        assert mock_transcribe.call_args.kwargs["processor"] is processor
+        assert result is not None
+
+    def test_asr_execute_without_external_model_calls_standard_loader(self):
+        """external_model=None → the standard patched loader is used."""
+        stub_patcher = MagicMock()
+        model = MagicMock()
+        processor = MagicMock()
+        audio = {"waveform": MagicMock(), "sample_rate": 24000}
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_model_patched",
+            return_value=(stub_patcher, model, processor),
+        ) as mock_std, patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_from_external"
+        ) as mock_ext, patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.transcribe_audio",
+            return_value=("hello world", []),
+        ):
+            VibeVoiceASRNode.execute(
+                model_name="VibeVoice-ASR",
+                audio=audio,
+                context_info="",
+                max_new_tokens=32768,
+                temperature=0.0,
+                top_p=1.0,
+                do_sample=False,
+                num_beams=1,
+                device="cpu",
+                dtype="auto",
+                attention_mode="sdpa",
+                force_offload=False,
+                external_model=None,
+            )
+
+        mock_std.assert_called_once()
+        mock_ext.assert_not_called()
+
+    def test_asr_execute_external_streaming_model_raises(self):
+        """A streaming external model must be rejected by the ASR node."""
+        bundle = self._make_bundle(is_streaming=True)
+        audio = {"waveform": MagicMock(), "sample_rate": 24000}
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_from_external"
+        ) as mock_ext, patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.transcribe_audio"
+        ):
+            with pytest.raises(ValueError, match="streaming"):
+                VibeVoiceASRNode.execute(
+                    model_name="VibeVoice-ASR",
+                    audio=audio,
+                    context_info="",
+                    max_new_tokens=32768,
+                    temperature=0.0,
+                    top_p=1.0,
+                    do_sample=False,
+                    num_beams=1,
+                    device="cpu",
+                    dtype="auto",
+                    attention_mode="sdpa",
+                    force_offload=False,
+                    external_model=bundle,
+                )
+
+        mock_ext.assert_not_called()
+
+    def test_asr_execute_external_tts_model_raises(self):
+        """A TTS external model (is_asr=False) must be rejected by the ASR node."""
+        bundle = self._make_bundle(is_streaming=False)
+        bundle["is_asr"] = False
+        audio = {"waveform": MagicMock(), "sample_rate": 24000}
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_from_external"
+        ) as mock_ext, patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.transcribe_audio"
+        ):
+            with pytest.raises(ValueError, match="TTS"):
+                VibeVoiceASRNode.execute(
+                    model_name="VibeVoice-ASR",
+                    audio=audio,
+                    context_info="",
+                    max_new_tokens=32768,
+                    temperature=0.0,
+                    top_p=1.0,
+                    do_sample=False,
+                    num_beams=1,
+                    device="cpu",
+                    dtype="auto",
+                    attention_mode="sdpa",
+                    force_offload=False,
+                    external_model=bundle,
+                )
+
+        mock_ext.assert_not_called()
+
+    def test_asr_execute_external_overrides_model_name_for_offload(self):
+        """The bundle's model_name is used for force_offload cache keying."""
+        stub_patcher = MagicMock()
+        bundle = self._make_bundle(model_name="ext-asr-custom")
+        audio = {"waveform": MagicMock(), "sample_rate": 24000}
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_from_external",
+            return_value=(stub_patcher, MagicMock(), MagicMock()),
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.transcribe_audio",
+            return_value=("hello world", []),
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.force_offload_asr_model"
+        ) as mock_offload:
+            VibeVoiceASRNode.execute(
+                model_name="VibeVoice-ASR",
+                audio=audio,
+                context_info="",
+                max_new_tokens=32768,
+                temperature=0.0,
+                top_p=1.0,
+                do_sample=False,
+                num_beams=1,
+                device="cpu",
+                dtype="auto",
+                attention_mode="sdpa",
+                force_offload=True,
+                external_model=bundle,
+            )
+
+        mock_offload.assert_called_once_with("ext-asr-custom", stub_patcher)

@@ -17,10 +17,16 @@ from ..modules.model_info import (
     is_model_type,
     MODEL_CONFIGS,
 )
-from ..modules.generation import load_vibevoice_model, generate_audio, force_offload_model
+from ..modules.generation import (
+    load_vibevoice_model,
+    load_vibevoice_from_external,
+    generate_audio,
+    force_offload_model,
+)
 from ..modules.attention_utils import ATTENTION_MODES, get_available_attention_modes
 from ..modules.device_utils import get_available_devices
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
+from ..modules.custom_types import VibeVoiceModel
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +188,16 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     default=DTYPE_AUTO,
                     tooltip="Data type for model precision. 'auto' selects optimal type for device.",
                 ),
+                # Optional external model input
+                VibeVoiceModel.Input(
+                    "external_model",
+                    optional=True,
+                    tooltip=(
+                        "Optional externally-loaded VibeVoice model (from the "
+                        "'Load VibeVoice Model' node). When connected, this "
+                        "overrides the model_name dropdown."
+                    ),
+                ),
                 # Optional speaker voice inputs
                 io.Audio.Input("speaker_1_voice", optional=True, tooltip="Reference audio for 'Speaker 1' or '[1]' in the script."),
                 io.Audio.Input("speaker_2_voice", optional=True, tooltip="Reference audio for 'Speaker 2' or '[2]' in the script."),
@@ -196,6 +212,10 @@ class VibeVoiceTTSNode(io.ComfyNode):
     @classmethod
     def validate_inputs(cls, **kwargs) -> bool | str:
         """Validate inputs, allowing dynamically-discovered custom TTS models."""
+        # An externally-loaded model bypasses the model_name dropdown entirely.
+        if kwargs.get("external_model") is not None:
+            return True
+
         model_name = kwargs.get("model_name")
         if model_name is not None:
             if model_name not in AVAILABLE_VIBEVOICE_MODELS:
@@ -241,17 +261,40 @@ class VibeVoiceTTSNode(io.ComfyNode):
         speaker_2_voice: Optional[dict] = None,
         speaker_3_voice: Optional[dict] = None,
         speaker_4_voice: Optional[dict] = None,
+        external_model: Optional[dict] = None,
     ) -> io.NodeOutput:
         """Execute VibeVoice TTS generation."""
 
-        # Load model
-        patcher, model, processor = load_vibevoice_model(
-            model_name=model_name,
-            device=device,
-            dtype=dtype,
-            attention_mode=attention_mode,
-            quantize_4bit=quantize_llm_4bit,
-        )
+        # Load model — external bundle overrides the model_name dropdown.
+        if external_model is not None:
+            # Guard: streaming (realtime) models must use the Realtime node.
+            if external_model.get("is_streaming"):
+                raise ValueError(
+                    "The provided external model is a streaming (realtime) model. "
+                    "Use the 'VibeVoice Realtime TTS' node for streaming models."
+                )
+            # Guard: ASR models cannot synthesize speech.
+            if external_model.get("is_asr"):
+                raise ValueError(
+                    "The provided external model is an ASR (speech-to-text) model. "
+                    "Use the 'VibeVoice ASR' node for ASR models."
+                )
+            patcher, model, processor = load_vibevoice_from_external(
+                external_model,
+                device=device,
+                dtype=dtype,
+                attention_mode=attention_mode,
+            )
+            # Use the bundle's model name for offload cache keying.
+            model_name = external_model.get("model_name", model_name)
+        else:
+            patcher, model, processor = load_vibevoice_model(
+                model_name=model_name,
+                device=device,
+                dtype=dtype,
+                attention_mode=attention_mode,
+                quantize_4bit=quantize_llm_4bit,
+            )
 
         # Collect speaker voice samples
         speaker_inputs = {

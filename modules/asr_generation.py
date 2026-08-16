@@ -60,6 +60,74 @@ class _ASRProgressStreamer(BaseStreamer):
         self.pbar.update_absolute(self.total)
 
 
+class ExternalVibeVoiceASRModelHandler(torch.nn.Module):
+    """Handler for an externally-loaded (pre-instantiated) VibeVoice ASR model.
+
+    ASR counterpart of
+    :class:`~modules.generation.ExternalVibeVoiceModelHandler`. Unlike
+    :class:`~modules.asr_loader.VibeVoiceASRModelHandler`, whose ``load_model``
+    loads weights from disk on demand, this handler already holds the loaded
+    model and processor. The patcher's ``patch_model`` sees
+    ``self.model.model is not None`` and skips the lazy-load branch, proceeding
+    directly to the single host-to-device transfer.
+    """
+
+    def __init__(
+        self,
+        model,
+        processor,
+        model_pack_name: str,
+        model_bundle: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+        self.model = model
+        self.processor = processor
+        self.model_name = model_pack_name
+        self.model_pack_name = model_pack_name
+        self.source_path = (model_bundle or {}).get("source_path", "")
+        # Default cache key; load_asr_from_external overrides this with the
+        # attention-aware key so the patcher and LOADED_ASR_MODELS_CACHE agree.
+        self.cache_key = f"asr_external_{model_pack_name}"
+        self.size = self._estimate_size(model, model_bundle)
+
+    @staticmethod
+    def _estimate_size(model, model_bundle: Optional[Dict[str, Any]] = None) -> int:
+        """Estimate the model's VRAM footprint in bytes.
+
+        Prefers an explicit ``size_gb`` hint from the bundle, then the sum of
+        parameter bytes, then a 15 GB fallback (matching the ASR default in
+        :class:`~modules.asr_loader.VibeVoiceASRModelHandler`).
+        """
+        try:
+            size_gb = (model_bundle or {}).get("size_gb")
+            if size_gb:
+                return int(float(size_gb) * (1024**3))
+        except (TypeError, ValueError):
+            pass
+        try:
+            total = 0
+            for p in model.parameters():
+                total += p.numel() * p.element_size()
+            if total > 0:
+                return total
+        except Exception:
+            pass
+        # Fallback: assume ~15 GB (ASR default) if the size cannot be determined.
+        return int(15.0 * (1024**3))
+
+    def load_model(self, device, dtype_str: str = "auto", attention_mode: str = "sdpa"):
+        """No-op: the model is already loaded.
+
+        The patcher only calls this when ``self.model is None``; for an external
+        handler the model is pre-set, so this branch is never reached. Kept for
+        interface compatibility with :class:`VibeVoiceASRModelHandler`.
+        """
+        logger.debug(
+            f"ExternalVibeVoiceASRModelHandler.load_model called but model is "
+            f"already loaded for '{self.model_pack_name}'"
+        )
+
+
 def load_asr_model(
     model_name: str,
     device: str = "auto",
@@ -175,6 +243,89 @@ def load_asr_model_patched(
         raise RuntimeError(
             f"Failed to load ASR model '{model_name}': model or processor is None after load."
         )
+
+    return patcher, model, processor
+
+
+def load_asr_from_external(
+    model_bundle: Dict[str, Any],
+    device: str = "auto",
+    dtype: str = "auto",
+    attention_mode: str = "auto",
+) -> Tuple[Any, Any, Any]:
+    """Load an externally-provided VibeVoice ASR model bundle onto the GPU.
+
+    Mirrors :func:`load_asr_model_patched` but skips the download/instantiation
+    step: the model and processor arrive pre-loaded (on CPU) inside
+    ``model_bundle`` (produced by ``modules.external_loader``). The bundle is
+    wrapped in an ``ExternalVibeVoiceASRModelHandler`` so ComfyUI's model
+    manager can schedule it through ``VibeVoiceASRPatcher`` exactly like a
+    standard ASR model.
+
+    Args:
+        model_bundle: Dict with keys ``model``, ``processor``, ``model_name``
+            (required) and optional ``size_gb`` / ``is_streaming``.
+        device: Target device string ("auto", "cuda", "cpu", ...).
+        dtype: Dtype string ("auto", "bf16", "fp16", "fp32").
+        attention_mode: Attention implementation ("auto", "sdpa", ...).
+
+    Returns:
+        Tuple of (patcher, model, processor).
+
+    Raises:
+        ValueError: If required bundle keys are missing or None.
+    """
+    for required_key in ("model", "processor", "model_name"):
+        if model_bundle.get(required_key) is None:
+            raise ValueError(
+                f"External ASR model bundle is missing required key '{required_key}'. "
+                "Ensure the bundle was produced by the VibeVoice external loader node."
+            )
+
+    model = model_bundle["model"]
+    processor = model_bundle["processor"]
+    model_name = model_bundle["model_name"]
+
+    # Resolve attention mode with internal fallback (no 4-bit for ASR).
+    actual_attn = resolve_attention_mode(attention_mode, quantize_4bit=False)
+
+    # Device placement (mirrors load_asr_model_patched).
+    if device == DEVICE_CPU:
+        load_device = torch.device(DEVICE_CPU)
+        offload_device = torch.device(DEVICE_CPU)
+    else:
+        load_device = get_torch_device(device)
+        offload_device = get_offload_device()
+
+    target_dtype = resolve_dtype(dtype, load_device)
+
+    cache_key = f"asr_external_{model_name}_attn_{actual_attn}"
+
+    if cache_key not in VIBEVOICE_ASR_PATCHER_CACHE:
+        handler = ExternalVibeVoiceASRModelHandler(model, processor, model_name, model_bundle)
+        # Keep the patcher cache key and the ASR model cache key in sync so
+        # VibeVoiceASRPatcher.unpatch_model clears the correct entry.
+        handler.cache_key = cache_key
+
+        patcher = VibeVoiceASRPatcher(
+            handler,
+            attention_mode=actual_attn,
+            load_device=load_device,
+            offload_device=offload_device,
+            size=handler.size,
+            dtype=target_dtype,
+        )
+        VIBEVOICE_ASR_PATCHER_CACHE[cache_key] = patcher
+        logger.debug(f"Created ASR patcher for external model {model_name} with attn={actual_attn}")
+
+    patcher = VIBEVOICE_ASR_PATCHER_CACHE[cache_key]
+    model_management.load_model_gpu(patcher)
+    model = patcher.model.model
+    processor = patcher.model.processor
+
+    # Register under the patcher key so the ASR cache reflects the live model
+    # and the patcher's unpatch_model() cleanup removes it.
+    LOADED_ASR_MODELS_CACHE[cache_key] = (model, processor)
 
     return patcher, model, processor
 

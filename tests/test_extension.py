@@ -6,6 +6,7 @@ import pytest
 from ComfyUI_VibeVoice.vibevoice_nodes import VibeVoiceExtension, comfy_entrypoint
 from ComfyUI_VibeVoice.nodes.tts_node import VibeVoiceTTSNode
 from ComfyUI_VibeVoice.nodes.realtime_node import VibeVoiceRealtimeNode
+from ComfyUI_VibeVoice.nodes.external_loader_node import VibeVoiceExternalLoaderNode
 
 
 class TestVibeVoiceExtension:
@@ -30,6 +31,11 @@ class TestVibeVoiceExtension:
         ext = VibeVoiceExtension()
         node_list = asyncio.get_event_loop().run_until_complete(ext.get_node_list())
         assert VibeVoiceRealtimeNode in node_list
+
+    def test_node_list_contains_external_loader_node(self):
+        ext = VibeVoiceExtension()
+        node_list = asyncio.get_event_loop().run_until_complete(ext.get_node_list())
+        assert VibeVoiceExternalLoaderNode in node_list
 
     def test_node_list_not_empty(self):
         ext = VibeVoiceExtension()

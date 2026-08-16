@@ -64,3 +64,37 @@ class TestNodeDocstringNoZeroShot:
         assert "generated via zero-shot TTS" not in text, (
             "tts_node.py tooltip still claims a speaker is generated via zero-shot TTS."
         )
+
+
+class TestReadmeExternalModelLoading:
+    """Phase 6.1: README must document external model loading."""
+
+    def test_readme_mentions_external_model_loading(self):
+        """README documents the 'Load VibeVoice Model' node and external_model input."""
+        text = _read(README_PATH)
+        assert "Load VibeVoice Model" in text, (
+            "README must document the 'Load VibeVoice Model' node."
+        )
+        assert "external_model" in text, (
+            "README must document the external_model input."
+        )
+
+    def test_readme_mentions_sidecar_configs(self):
+        """README documents the sidecar config binding convention."""
+        text = _read(README_PATH)
+        assert ".config.json" in text, (
+            "README must document the <weight>.config.json sidecar convention."
+        )
+        assert "preprocessor" in text, (
+            "README must document the preprocessor sidecar config."
+        )
+        assert "tokenizer.json" in text, (
+            "README must document the tokenizer.json sidecar."
+        )
+
+    def test_readme_mentions_diffusion_models_folder(self):
+        """README tells users where to place external weight files."""
+        text = _read(README_PATH)
+        assert "diffusion_models" in text, (
+            "README must state that external weights go in models/diffusion_models."
+        )

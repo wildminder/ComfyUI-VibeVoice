@@ -24,6 +24,158 @@ from .attention_utils import resolve_attention_mode
 logger = logging.getLogger(__name__)
 
 
+class ExternalVibeVoiceModelHandler(torch.nn.Module):
+    """Handler for an externally-loaded (pre-instantiated) VibeVoice model.
+
+    Unlike :class:`~modules.loader.VibeVoiceModelHandler`, whose ``load_model``
+    loads weights from disk on demand, this handler already holds the loaded
+    model and processor. The patcher's ``patch_model`` sees
+    ``self.model.model is not None`` and skips the lazy-load branch, proceeding
+    directly to the single host-to-device transfer.
+    """
+
+    def __init__(
+        self,
+        model,
+        processor,
+        model_pack_name: str,
+        attention_mode: str = "sdpa",
+        source_path: str = "",
+    ):
+        super().__init__()
+        self.model = model
+        self.processor = processor
+        self.model_pack_name = model_pack_name
+        self.attention_mode = attention_mode
+        self.source_path = source_path
+        self.cache_key = f"external_{model_pack_name}_attn_{attention_mode}"
+        self.device = None
+        self.size = self._estimate_size(model)
+
+    @staticmethod
+    def _estimate_size(model) -> int:
+        """Estimate the model's VRAM footprint in bytes from its parameters."""
+        try:
+            total = 0
+            for p in model.parameters():
+                total += p.numel() * p.element_size()
+            if total > 0:
+                return total
+        except Exception:
+            pass
+        # Fallback: assume ~4 GB if the size cannot be determined.
+        return int(4.0 * (1024**3))
+
+    def load_model(self, device, attention_mode: str = "sdpa"):
+        """No-op: the model is already loaded.
+
+        The patcher only calls this when ``self.model is None``; for an external
+        handler the model is pre-set, so this branch is never reached. Kept for
+        interface compatibility with :class:`VibeVoiceModelHandler`.
+        """
+        logger.debug(
+            f"ExternalVibeVoiceModelHandler.load_model called but model is "
+            f"already loaded for '{self.model_pack_name}'"
+        )
+
+
+def load_vibevoice_from_external(
+    model_bundle: dict,
+    device: str = "auto",
+    dtype: str = DTYPE_AUTO,
+    attention_mode: str = "sdpa",
+) -> Tuple[VibeVoicePatcher, Any, Any]:
+    """Wrap an externally-loaded VibeVoice model bundle in a patcher.
+
+    The bundle (produced by
+    :func:`~modules.external_loader.load_external_vibevoice_model`) already
+    contains an instantiated model + processor on CPU. This function wraps them
+    in an :class:`ExternalVibeVoiceModelHandler` + :class:`VibeVoicePatcher` and
+    loads the model to GPU via ComfyUI's memory management.
+
+    Args:
+        model_bundle: The ``VIBEVOICE_MODEL`` dict. Required keys:
+            ``model``, ``processor``, ``model_name``. Optional:
+            ``is_streaming``, ``source_path``, ``config``, ``state_dict``.
+        device: Device to load on ("auto", "cuda", "cpu", "mps", etc.).
+        dtype: Data type for model ("auto", "bf16", "fp16", "fp32").
+        attention_mode: Attention implementation.
+
+    Returns:
+        Tuple of (patcher, model, processor).
+
+    Raises:
+        ValueError: If the bundle is missing required keys.
+        RuntimeError: If the model fails to load to GPU.
+    """
+    # Validate required bundle keys (Phase 5.3 guard).
+    for required_key in ("model", "processor", "model_name"):
+        if model_bundle.get(required_key) is None:
+            raise ValueError(
+                f"External VibeVoice model bundle is missing required key "
+                f"'{required_key}'. Got keys: {list(model_bundle.keys())}"
+            )
+
+    model = model_bundle["model"]
+    processor = model_bundle["processor"]
+    model_name = model_bundle["model_name"]
+    source_path = model_bundle.get("source_path", "")
+
+    # Resolve attention mode with fallback logic (no quantization on the
+    # external path — quantization is applied at load time by the loader node).
+    actual_attention_mode = resolve_attention_mode(attention_mode, False)
+
+    # Setup device
+    if device == DEVICE_CPU:
+        load_device = torch.device(DEVICE_CPU)
+        offload_device = torch.device(DEVICE_CPU)
+    else:
+        load_device = get_torch_device(device)
+        offload_device = get_offload_device()
+
+    # Resolve dtype
+    target_dtype = resolve_dtype(dtype, load_device)
+
+    # Build cache key (namespaced so it never collides with dropdown loaders).
+    cache_key = f"external_{model_name}_attn_{actual_attention_mode}"
+
+    if cache_key not in VIBEVOICE_PATCHER_CACHE:
+        model_handler = ExternalVibeVoiceModelHandler(
+            model=model,
+            processor=processor,
+            model_pack_name=model_name,
+            attention_mode=actual_attention_mode,
+            source_path=source_path,
+        )
+
+        patcher = VibeVoicePatcher(
+            model_handler,
+            attention_mode=actual_attention_mode,
+            load_device=load_device,
+            offload_device=offload_device,
+            size=model_handler.size,
+            dtype=target_dtype,
+        )
+        VIBEVOICE_PATCHER_CACHE[cache_key] = patcher
+        logger.debug(
+            f"Created new external patcher for {model_name} with "
+            f"attn={actual_attention_mode}"
+        )
+
+    patcher = VIBEVOICE_PATCHER_CACHE[cache_key]
+    model_management.load_model_gpu(patcher)
+    loaded_model = patcher.model.model
+    loaded_processor = patcher.model.processor
+
+    if loaded_model is None or loaded_processor is None:
+        raise RuntimeError(
+            f"External VibeVoice model and processor could not be loaded for "
+            f"'{model_name}'. Check logs for errors."
+        )
+
+    return patcher, loaded_model, loaded_processor
+
+
 def load_vibevoice_model(
     model_name: str,
     device: str = "auto",

@@ -137,6 +137,26 @@ In this example, you would connect an audio source to `speaker_1_voice`; speaker
 *   **`do_sample`, `temperature`, `top_p`, `top_k`**: Standard sampling parameters for controlling the creativity and determinism of the speech generation.
 *   **`force_offload`**: Forces the model to be completely offloaded from VRAM after generation.
 
+### Loading External Models
+
+By default the nodes download / load official VibeVoice checkpoints from the `models/tts/VibeVoice` folder. You can instead load **any VibeVoice weight file you already have on disk** (safetensors / `.bin` / `.gguf`) via the dedicated **`Load VibeVoice Model`** node, which outputs a `VIBEVOICE_MODEL` that plugs into the optional `external_model` input of the **TTS**, **Realtime TTS**, and **ASR** nodes.
+
+**Setup:**
+
+1.  Place your VibeVoice weight file in ComfyUI's `models/diffusion_models/` (a.k.a. `models/unet/`) folder.
+2.  *(Optional but recommended)* Place sidecar JSON files next to the weight file to bind the architecture config, audio preprocessor, and tokenizer:
+    *   `<weight_file>.config.json` — architecture config (preferred), or a `config.json` in the same directory.
+    *   `<weight_file>.preprocessor.json` — audio preprocessor config (preferred), or a `preprocessor_config.json` in the same directory.
+    *   `tokenizer.json` — Qwen2.5 text tokenizer (same directory). Falls back to the packaged tokenizer or a HuggingFace download if absent.
+3.  Add the **`Load VibeVoice Model`** node, select your file in `model_file`, and pick the matching architecture in `config_name` (`VibeVoice-1.5B`, `VibeVoice-Large`, `VibeVoice-Realtime-0.5B`, or `VibeVoice-ASR`). When no sidecar config is present, `config_name` selects the packaged default config (available for `1.5B` and `Large`).
+4.  Connect the node's `VIBEVOICE_MODEL` output to the `external_model` input of the TTS / Realtime TTS / ASR node. When connected, `external_model` **overrides** the `model_name` dropdown.
+
+**Notes:**
+
+*   The model is built entirely on **CPU**; the single host-to-device transfer is owned by ComfyUI's VRAM arbitration (same contract as the standard loader path).
+*   Type guards prevent mis-wiring: a streaming model on the TTS node, a TTS model on the ASR node, etc. raise a clear error pointing to the correct node.
+*   4-bit LLM quantization (`quantize_llm_4bit`) applies to TTS / Realtime models only; ASR models are always loaded at full precision.
+
 <!-- PERFORMANCE SECTION -->
 ## ⚙️ Performance & Advanced Features
 
@@ -160,6 +180,45 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.2.0 - External Model Input (Load Your Own Weights)</strong></summary>
+
+### ✨ Highlights
+*   **New `VibeVoiceLoadExternalModel` node:** load a VibeVoice checkpoint from your own
+    `.safetensors`/`.pt` file in `models/diffusion_models` (or `models/unet`) instead of the
+    built-in HuggingFace download path. ComfyUI's stock `Load Diffusion Model` cannot parse
+    VibeVoice weights, so this node provides a dedicated `VIBEVOICE_MODEL` output type.
+*   **Optional `external_model` input on all three nodes:** TTS, Realtime TTS, and ASR now accept
+    an externally loaded model bundle. When wired, the node skips its own loader entirely and uses
+    the provided model/processor.
+*   **Sidecar config binding:** the loader resolves architecture config via a sidecar
+    `<weight>.config.json` (or a `config.json` next to the file), falling back to the packaged
+    default for the selected `config_name`. Optional `<weight>.preprocessor.json` and a local
+    `tokenizer.json` are honored as well.
+*   **Type guards:** each node rejects mismatched model kinds with a clear error (e.g. a Realtime
+    model into the TTS node, an ASR model into TTS, a non-streaming model into Realtime).
+
+### 🔧 Changes
+*   New `modules/custom_types.py`: `VibeVoiceModel = io.Custom("VIBEVOICE_MODEL")`.
+*   New `modules/external_loader.py`: sidecar resolution + `load_external_vibevoice_model()`
+    (TTS/streaming) and `load_external_vibevoice_asr_model()` (ASR) — CPU-first load, in-memory
+    state-dict injection, dtype cast, optional 4-bit quantization (TTS only) and SageAttention.
+*   New `nodes/external_loader_node.py`: the loader node (registered in `vibevoice_nodes.py`).
+*   `modules/generation.py`: `ExternalVibeVoiceModelHandler` + `load_vibevoice_from_external()`.
+*   `modules/asr_generation.py`: `ExternalVibeVoiceASRModelHandler` + `load_asr_from_external()`.
+*   `nodes/tts_node.py`, `nodes/realtime_node.py`, `nodes/asr_node.py`: optional `external_model`
+    input, early validation pass-through, and execute-branch routing with kind guards.
+
+### 🧪 Tests
+*   New `tests/test_custom_types.py` (5), `tests/test_external_loader.py` (39),
+    `tests/test_external_loader_node.py` (13).
+*   Extended `tests/test_node_schema.py`, `tests/test_generation.py` (+15),
+    `tests/test_asr_generation.py` (+16), `tests/test_realtime_node.py` (+7),
+    `tests/test_asr_node.py`, `tests/test_patcher_behavioral.py`, `tests/test_integration.py`,
+    `tests/test_docs_consistency.py` (+3), `tests/test_workflow.py` (+5), `tests/test_imports.py`.
+
+</details>
+
+<details>
 <summary><strong>v2.1.1 - Standard ComfyUI Progress Bar During Inference</strong></summary>
 
 ### ✨ Highlights

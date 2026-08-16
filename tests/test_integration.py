@@ -371,3 +371,96 @@ class TestNodeProgressIntegration:
             values = [c.args[0] for c in mock_pbar.update_absolute.call_args_list if c.args]
             assert 1 in values and 2 in values and 3 in values
             assert values == sorted(values), f"progress must be monotonic, got {values}"
+
+
+class TestExternalModelFullFlow:
+    """Phase 7.2: end-to-end mock test from weight file → bundle → patcher → generate."""
+
+    def test_integration_external_model_full_flow(self, tmp_path):
+        """External model: load_external_vibevoice_model → load_vibevoice_from_external → generate_audio."""
+        from ComfyUI_VibeVoice.modules.external_loader import load_external_vibevoice_model
+        from ComfyUI_VibeVoice.modules.generation import load_vibevoice_from_external, generate_audio
+
+        VIBEVOICE_PATCHER_CACHE.clear()
+        LOADED_MODELS_CACHE.clear()
+
+        # Create a real dummy weight file so os.path.isfile passes.
+        weight_file = tmp_path / "weight.safetensors"
+        weight_file.write_bytes(b"dummy")
+
+        # --- Stage 1: load_external_vibevoice_model (mocked internals) ---
+        fake_state_dict = {"model.language_model.weight": torch.zeros(2, 2)}
+        fake_config = MagicMock(spec=[])
+        fake_tokenizer = MagicMock()
+        fake_processor = MagicMock()
+        fake_model = MagicMock()
+        fake_model.load_state_dict.return_value = ([], [])
+        fake_model.to.return_value = fake_model
+
+        from ComfyUI_VibeVoice.modules import external_loader
+
+        with patch.object(external_loader.comfy.utils, "load_torch_file", return_value=fake_state_dict), \
+             patch.object(external_loader.VibeVoiceLoader, "_load_config", return_value=fake_config), \
+             patch.object(external_loader.VibeVoiceLoader, "_load_tokenizer", return_value=fake_tokenizer), \
+             patch.object(external_loader.VibeVoiceLoader, "_load_processor", return_value=fake_processor), \
+             patch.object(external_loader.VibeVoiceLoader, "_instantiate_model", return_value=fake_model), \
+             patch.object(external_loader, "resolve_sidecar_config", return_value="/fake/config.json"), \
+             patch.object(external_loader, "resolve_sidecar_preprocessor", return_value=""), \
+             patch.object(external_loader, "resolve_sidecar_tokenizer_dir", return_value="/fake/dir"), \
+             patch.object(external_loader, "resolve_dtype", return_value=torch.float32), \
+             patch.object(external_loader, "resolve_attention_mode", side_effect=lambda m, q: m), \
+             patch.object(external_loader, "get_attn_implementation_for_load", return_value="sdpa"), \
+             patch.object(external_loader, "VibeVoiceStreamingConfig", type("_FakeStreamingCfg", (), {})):
+            bundle = load_external_vibevoice_model(str(weight_file), "VibeVoice-1.5B")
+
+        # Bundle must have the correct structure.
+        assert bundle["model"] is fake_model
+        assert bundle["processor"] is fake_processor
+        assert bundle["model_name"] == "VibeVoice-1.5B"
+        assert bundle["is_streaming"] is False
+        assert bundle["is_asr"] is False
+
+        # --- Stage 2: load_vibevoice_from_external (wrap in patcher) ---
+        mock_patcher = MagicMock()
+        mock_patcher.model.model = fake_model
+        mock_patcher.model.processor = fake_processor
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ExternalVibeVoiceModelHandler") as mock_handler_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.VibeVoicePatcher", return_value=mock_patcher), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"):
+            mock_handler = MagicMock()
+            mock_handler.size = 1000
+            mock_handler_cls.return_value = mock_handler
+
+            patcher, model, processor = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        assert model is fake_model
+        assert processor is fake_processor
+
+        # --- Stage 3: generate_audio (mocked) ---
+        fake_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        fake_model.generate.return_value = mock_output
+        fake_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        fake_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio",
+                   return_value=_mock_voice_sample()):
+            waveform, sr = generate_audio(
+                model=model,
+                processor=processor,
+                text="[1] Hello world",
+                voice_samples=[_mock_audio_dict()],
+                speaker_ids=[1],
+            )
+
+        assert waveform is not None
+        assert sr == 24000
+        assert waveform.ndim == 3
+
+        VIBEVOICE_PATCHER_CACHE.clear()
+        LOADED_MODELS_CACHE.clear()

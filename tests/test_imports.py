@@ -45,8 +45,27 @@ class TestImportPaths:
         import ComfyUI_VibeVoice.modules.dtype_utils
         import ComfyUI_VibeVoice.modules.attention_utils
         import ComfyUI_VibeVoice.modules.utils
+        import ComfyUI_VibeVoice.modules.custom_types
         # loader, patcher, generation require heavy deps (transformers, etc.)
         # so we skip them here — they're tested via integration tests
+
+    def test_external_loader_node_importable(self):
+        """Phase 6.3: the external loader node must be importable."""
+        from ComfyUI_VibeVoice.nodes.external_loader_node import (
+            VibeVoiceExternalLoaderNode,
+        )
+        assert VibeVoiceExternalLoaderNode is not None
+
+    def test_external_loader_module_importable(self):
+        """Phase 6.3: the external loader module must be importable."""
+        from ComfyUI_VibeVoice.modules.external_loader import (
+            load_external_vibevoice_model,
+            load_external_vibevoice_asr_model,
+            EXTERNAL_CONFIG_OPTIONS,
+        )
+        assert callable(load_external_vibevoice_model)
+        assert callable(load_external_vibevoice_asr_model)
+        assert isinstance(EXTERNAL_CONFIG_OPTIONS, list)
 
     def test_no_old_vibevoice_directory(self):
         """The old vibevoice/ directory at root should not exist."""
