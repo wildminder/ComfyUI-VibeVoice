@@ -139,9 +139,31 @@ def generate_audio(
         Tuple of (output audio tensor [1, 1, T], sample_rate).
 
     Raises:
-        ValueError: If script is empty or invalid.
+        ValueError: If script is empty or invalid, or if a streaming
+            (realtime) model/processor is passed (those require
+            ``generate_streaming_audio`` / the VibeVoice Realtime TTS node).
         RuntimeError: If generation fails.
     """
+    # Guard: streaming (realtime) models/processors require the streaming
+    # generation path (generate_streaming_audio) — voice-prompt prefill +
+    # windowed AR loop. The non-streaming path below calls
+    # processor(text=..., voice_samples=...), which VibeVoiceStreamingProcessor
+    # does not support (its __call__ takes no arguments by design). Detect by
+    # class name to avoid importing the vendored chain (diffusers-dependent).
+    _streaming_class_names = {
+        "VibeVoiceStreamingProcessor",
+        "VibeVoiceStreamingForConditionalGenerationInference",
+    }
+    if (
+        type(processor).__name__ in _streaming_class_names
+        or type(model).__name__ in _streaming_class_names
+    ):
+        raise ValueError(
+            "A streaming (realtime) VibeVoice model was passed to generate_audio(). "
+            "Streaming models require the 'VibeVoice Realtime TTS' node "
+            "(generate_streaming_audio). Please use that node for this model."
+        )
+
     # Parse script using our parser (supports both "[N] text" and "Speaker N: text" formats)
     parsed_lines_0_based, speaker_ids_1_based = parse_script_1_based(text)
     if not parsed_lines_0_based:

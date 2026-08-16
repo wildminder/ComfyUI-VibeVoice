@@ -14,7 +14,6 @@ from comfy_api.latest import io, ui
 from ..modules.model_info import (
     AVAILABLE_VIBEVOICE_MODELS,
     get_tts_models,
-    get_streaming_tts_models,
     is_model_type,
     MODEL_CONFIGS,
 )
@@ -41,9 +40,12 @@ class VibeVoiceTTSNode(io.ComfyNode):
 
     @classmethod
     def define_schema(cls) -> io.Schema:
-        # Only expose TTS + streaming TTS models. ASR models are handled by the
-        # dedicated ASR node and would fail deep in the loader if selected here.
-        model_names = list(get_tts_models().keys()) + list(get_streaming_tts_models().keys())
+        # Only expose non-streaming TTS models. ASR models are handled by the
+        # dedicated ASR node, and streaming (realtime) models by the dedicated
+        # VibeVoice Realtime TTS node — the streaming processor/model require
+        # the prefill + windowed generation path (generate_streaming_audio),
+        # which this node does not use.
+        model_names = list(get_tts_models().keys())
         if not model_names:
             model_names.append("No models found in models/tts/VibeVoice")
 
@@ -199,8 +201,17 @@ class VibeVoiceTTSNode(io.ComfyNode):
             if model_name not in AVAILABLE_VIBEVOICE_MODELS:
                 available = list(AVAILABLE_VIBEVOICE_MODELS.keys())
                 return f"Model '{model_name}' not found. Available models: {available}"
+            # Reject streaming (realtime) models: they require the streaming
+            # generation path (generate_streaming_audio) used by the dedicated
+            # VibeVoice Realtime TTS node. Routing them through this node hits
+            # VibeVoiceStreamingProcessor.__call__ with unsupported kwargs.
+            if is_model_type(model_name, "streaming_tts"):
+                return (
+                    f"Model '{model_name}' is a streaming (realtime) model; "
+                    f"use the 'VibeVoice Realtime TTS' node for streaming models."
+                )
             # Reject ASR / other non-TTS types before they reach the loader.
-            if not is_model_type(model_name, "tts", "streaming_tts"):
+            if not is_model_type(model_name, "tts"):
                 cfg_type = MODEL_CONFIGS.get(model_name, {}).get("model_type")
                 return (
                     f"Model '{model_name}' is type '{cfg_type}'; "

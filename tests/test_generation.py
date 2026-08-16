@@ -614,3 +614,88 @@ class TestGenerateAudioProgressReporting:
             # The final absolute update must still have been sent.
             final_call = mock_pbar.update_absolute.call_args_list[-1]
             assert final_call.args == (10,)
+
+
+class TestGenerateAudioStreamingGuard:
+    """Regression (2026-08-16): generate_audio() must reject streaming
+    (realtime) models/processors with a clear, actionable error instead of
+    failing deep inside the processor with
+    ``VibeVoiceStreamingProcessor.__call__() got an unexpected keyword
+    argument 'text'``."""
+
+    @staticmethod
+    def _make_streaming_processor():
+        class VibeVoiceStreamingProcessor:  # noqa: N801 - name is the contract
+            pass
+
+        return VibeVoiceStreamingProcessor()
+
+    @staticmethod
+    def _make_streaming_model():
+        class VibeVoiceStreamingForConditionalGenerationInference:  # noqa: N801
+            pass
+
+        return VibeVoiceStreamingForConditionalGenerationInference()
+
+    def test_rejects_streaming_processor(self):
+        with pytest.raises(ValueError, match="Realtime"):
+            generate_audio(
+                model=MagicMock(),
+                processor=self._make_streaming_processor(),
+                text="[1] Hello world",
+                voice_samples=[_mock_voice_sample()],
+                speaker_ids=[1],
+            )
+
+    def test_rejects_streaming_model(self):
+        with pytest.raises(ValueError, match="Realtime"):
+            generate_audio(
+                model=self._make_streaming_model(),
+                processor=MagicMock(),
+                text="[1] Hello world",
+                voice_samples=[_mock_voice_sample()],
+                speaker_ids=[1],
+            )
+
+    def test_guard_fires_before_script_parsing(self):
+        """The guard must run before any other work (empty text still raises
+        the streaming error, not the empty-script error)."""
+        with pytest.raises(ValueError, match="Realtime"):
+            generate_audio(
+                model=self._make_streaming_model(),
+                processor=self._make_streaming_processor(),
+                text="",
+                voice_samples=[],
+                speaker_ids=[],
+            )
+
+    def test_non_streaming_inputs_not_rejected_by_guard(self):
+        """Plain MagicMock model/processor must pass the guard (it then fails
+        later for unrelated mock reasons, proving the guard did not fire)."""
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = [torch.randn(24000)]
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            mock_pbar = MagicMock()
+            mock_pbar.total = 10
+            mock_pbar_cls.return_value = mock_pbar
+
+            waveform, sr = generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Hello world",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+                inference_steps=10,
+            )
+        assert sr == 24000
+        assert waveform.ndim == 3
