@@ -26,6 +26,68 @@ from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 logger = logging.getLogger(__name__)
 
 
+def list_external_model_files() -> list:
+    """Build the selectable weight-file list, including ``.gguf`` files.
+
+    ComfyUI's ``get_filename_list("diffusion_models")`` filters by
+    ``supported_pt_extensions``, which excludes ``.gguf``. This helper merges
+    that list with ``.gguf`` files found in the same folders, plus the
+    ``unet_gguf`` folder if it is registered (e.g. by ComfyUI-GGUF).
+
+    Returns:
+        Sorted, de-duplicated list of weight-file names (relative paths).
+    """
+    files = set()
+
+    # Standard diffusion_models list (safetensors / bin / pt / ...).
+    try:
+        files.update(folder_paths.get_filename_list("diffusion_models"))
+    except Exception:
+        pass
+
+    # .gguf files are excluded from supported_pt_extensions, so scan the
+    # diffusion_models folders directly for them.
+    try:
+        for folder in folder_paths.get_folder_paths("diffusion_models"):
+            found, _ = folder_paths.recursive_search(folder)
+            for name in found:
+                if name.lower().endswith(".gguf"):
+                    files.add(name)
+    except Exception:
+        pass
+
+    # ComfyUI-GGUF registers a dedicated "unet_gguf" folder; include it if present.
+    try:
+        files.update(folder_paths.get_filename_list("unet_gguf"))
+    except Exception:
+        pass
+
+    return sorted(files)
+
+
+def resolve_weight_path(model_file: str) -> str:
+    """Resolve a selected weight-file name to an absolute path.
+
+    Tries the ``diffusion_models`` folder first, then the ``unet_gguf`` folder
+    (registered by ComfyUI-GGUF). Raises ``FileNotFoundError`` if the file is
+    not found in either.
+
+    Args:
+        model_file: Relative weight-file name from the dropdown.
+
+    Returns:
+        Absolute path to the weight file.
+    """
+    for folder_name in ("diffusion_models", "unet_gguf"):
+        try:
+            return folder_paths.get_full_path_or_raise(folder_name, model_file)
+        except Exception:
+            continue
+    raise FileNotFoundError(
+        f"Weight file '{model_file}' not found in diffusion_models or unet_gguf folders."
+    )
+
+
 class VibeVoiceExternalLoaderNode(io.ComfyNode):
     """Load a VibeVoice model from an external weight file.
 
@@ -39,7 +101,7 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
 
     @classmethod
     def define_schema(cls) -> io.Schema:
-        model_files = folder_paths.get_filename_list("diffusion_models")
+        model_files = list_external_model_files()
         if not model_files:
             model_files = ["No model files found in diffusion_models"]
 
@@ -110,7 +172,7 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         quantize_llm_4bit: bool,
         dtype: str,
     ) -> io.NodeOutput:
-        weight_path = folder_paths.get_full_path_or_raise("diffusion_models", model_file)
+        weight_path = resolve_weight_path(model_file)
 
         model_bundle = load_external_vibevoice_model(
             weight_path=weight_path,

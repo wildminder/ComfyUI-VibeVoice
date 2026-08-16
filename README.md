@@ -156,6 +156,7 @@ By default the nodes download / load official VibeVoice checkpoints from the `mo
 *   The model is built entirely on **CPU**; the single host-to-device transfer is owned by ComfyUI's VRAM arbitration (same contract as the standard loader path).
 *   Type guards prevent mis-wiring: a streaming model on the TTS node, a TTS model on the ASR node, etc. raise a clear error pointing to the correct node.
 *   4-bit LLM quantization (`quantize_llm_4bit`) applies to TTS / Realtime models only; ASR models are always loaded at full precision.
+*   **GGUF support:** `.gguf` files are listed in the `model_file` dropdown and dequantized via the `gguf` Python package (`pip install gguf`). ComfyUI's stock `Load Diffusion Model` cannot parse GGUF, so this node handles it directly. Files in both `models/diffusion_models/` and the ComfyUI-GGUF `unet_gguf` folder are discovered.
 
 <!-- PERFORMANCE SECTION -->
 ## ⚙️ Performance & Advanced Features
@@ -180,6 +181,32 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.2.1 - GGUF Support in Load VibeVoice Model</strong></summary>
+
+### 🐛 Fixes
+*   **`.gguf` files now appear in the `Load VibeVoice Model` dropdown.** ComfyUI's
+    `get_filename_list("diffusion_models")` filters by `supported_pt_extensions`, which
+    excludes `.gguf`. The node now merges that list with `.gguf` files scanned from the
+    `diffusion_models` folders and the ComfyUI-GGUF `unet_gguf` folder (when registered).
+*   **`.gguf` weights now load correctly.** ComfyUI's `load_torch_file` routes `.gguf` to
+    `torch.load` (which fails). The external loader now parses GGUF containers directly via
+    the `gguf` Python package (`GGUFReader` + `dequantize`), producing a dequantized CPU
+    state dict for both the TTS/streaming and ASR branches.
+
+### 🔧 Changes
+*   `modules/external_loader.py`: new `_load_gguf_state_dict()` + `_load_weight_state_dict()`
+    dispatcher; both `load_external_vibevoice_model()` and `load_external_vibevoice_asr_model()`
+    route through it.
+*   `nodes/external_loader_node.py`: new `list_external_model_files()` (dropdown) and
+    `resolve_weight_path()` (diffusion_models → unet_gguf fallback).
+
+### 🧪 Tests
+*   New `tests/test_gguf_loading.py` (19 tests): real GGUF round-trip via the `gguf` package,
+    dispatch routing, dropdown listing, and path-resolution fallback ordering.
+
+</details>
+
+<details>
 <summary><strong>v2.2.0 - External Model Input (Load Your Own Weights)</strong></summary>
 
 ### ✨ Highlights
