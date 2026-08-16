@@ -326,6 +326,72 @@ def _instantiate_asr_model(
 
 
 # ====================================================================
+# Weight file state-dict loading (safetensors / bin / gguf dispatch)
+# ====================================================================
+
+def _load_gguf_state_dict(weight_path: str, device=None) -> dict:
+    """Load a state dict from a ``.gguf`` file via the ``gguf`` package.
+
+    ComfyUI's :func:`comfy.utils.load_torch_file` does not understand the GGUF
+    container (it would route ``.gguf`` to ``torch.load`` and fail), so GGUF
+    weights are parsed here with :class:`gguf.GGUFReader` and dequantized
+    tensor-by-tensor.
+
+    Args:
+        weight_path: Absolute path to the ``.gguf`` file.
+        device: Target torch device for the tensors (defaults to CPU). The
+            patcher owns the single host-to-device transfer, so CPU is the
+            normal choice.
+
+    Returns:
+        dict mapping tensor name -> torch.Tensor (dequantized, on ``device``).
+
+    Raises:
+        RuntimeError: If the ``gguf`` package is not installed.
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    try:
+        import gguf
+    except ImportError as e:
+        raise RuntimeError(
+            "Loading .gguf weights requires the 'gguf' Python package. "
+            "Install it with: pip install gguf"
+        ) from e
+
+    logger.info(f"Loading GGUF state dict from: {weight_path}")
+    reader = gguf.GGUFReader(weight_path)
+
+    state_dict = {}
+    for tensor in reader.tensors:
+        # gguf.dequantize returns a correctly-shaped numpy array for all
+        # quantization types (F32/F16 pass through unchanged). The array may be
+        # read-only (mmap-backed), so copy it to make it writable for torch.
+        dequantized = gguf.dequantize(tensor.data, tensor.tensor_type)
+        state_dict[tensor.name] = torch.from_numpy(dequantized.copy()).to(device)
+
+    logger.info(f"Loaded {len(state_dict)} tensors from GGUF file")
+    return state_dict
+
+
+def _load_weight_state_dict(weight_path: str, device) -> dict:
+    """Load a state dict from a weight file, dispatching GGUF to the gguf parser.
+
+    Args:
+        weight_path: Absolute path to the weight file
+            (``.safetensors`` / ``.bin`` / ``.pt`` / ``.gguf``).
+        device: Target torch device for the tensors.
+
+    Returns:
+        dict mapping tensor name -> torch.Tensor.
+    """
+    if weight_path.lower().endswith(".gguf"):
+        return _load_gguf_state_dict(weight_path, device=device)
+    return comfy.utils.load_torch_file(weight_path, device=device)
+
+
+# ====================================================================
 # In-memory state dict loading
 # ====================================================================
 
@@ -426,11 +492,12 @@ def load_external_vibevoice_model(
     # Resolve attention mode with fallback logic (same as standard loader)
     attention_mode = resolve_attention_mode(attention_mode, use_llm_4bit)
 
-    # Step 1: Load the state dict onto CPU via ComfyUI's loader.
-    # Always CPU — the patcher owns the single H2D transfer.
+    # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
+    # loader, .gguf via the gguf package). Always CPU — the patcher owns the
+    # single H2D transfer.
     cpu_device = torch.device("cpu")
     logger.info(f"Loading external VibeVoice weights from: {weight_path}")
-    state_dict = comfy.utils.load_torch_file(weight_path, device=cpu_device)
+    state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
     # Step 2: Resolve and load the architecture config.
     config_path = resolve_sidecar_config(weight_path, config_name)
@@ -601,11 +668,12 @@ def load_external_vibevoice_asr_model(
     # Resolve attention mode with fallback logic (no 4-bit for ASR).
     attention_mode = resolve_attention_mode(attention_mode, quantize_4bit=False)
 
-    # Step 1: Load the state dict onto CPU via ComfyUI's loader.
-    # Always CPU — the patcher owns the single H2D transfer.
+    # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
+    # loader, .gguf via the gguf package). Always CPU — the patcher owns the
+    # single H2D transfer.
     cpu_device = torch.device("cpu")
     logger.info(f"Loading external VibeVoice ASR weights from: {weight_path}")
-    state_dict = comfy.utils.load_torch_file(weight_path, device=cpu_device)
+    state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
     # Step 2: Resolve and load the ASR architecture config.
     config_path = resolve_sidecar_config(weight_path, config_name)
