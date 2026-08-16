@@ -17,7 +17,13 @@ from ..modules.model_info import (
     is_model_type,
     MODEL_CONFIGS,
 )
-from ..modules.asr_generation import load_asr_model_patched, transcribe_audio, force_offload_asr_model
+from ..modules.asr_generation import (
+    load_asr_model_patched,
+    load_asr_from_external,
+    transcribe_audio,
+    force_offload_asr_model,
+)
+from ..modules.custom_types import VibeVoiceModel
 from ..modules.device_utils import get_available_devices
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 from ..modules.attention_utils import get_available_attention_modes
@@ -133,6 +139,16 @@ class VibeVoiceASRNode(io.ComfyNode):
                     default="sdpa",
                     tooltip="Attention implementation: Eager (safest), SDPA (balanced), Flash Attention 2 (fastest).",
                 ),
+                # Optional external model input
+                VibeVoiceModel.Input(
+                    "external_model",
+                    optional=True,
+                    tooltip=(
+                        "Optional externally-loaded VibeVoice ASR model (from the "
+                        "'Load VibeVoice Model' node). When connected, this "
+                        "overrides the model_name dropdown."
+                    ),
+                ),
                 io.Boolean.Input(
                     "force_offload",
                     default=False,
@@ -150,6 +166,10 @@ class VibeVoiceASRNode(io.ComfyNode):
     @classmethod
     def validate_inputs(cls, **kwargs) -> bool | str:
         """Validate inputs, allowing dynamically-discovered custom ASR models."""
+        # An externally-loaded model bypasses the model_name dropdown entirely.
+        if kwargs.get("external_model") is not None:
+            return True
+
         model_name = kwargs.get("model_name")
         if model_name is not None and model_name != "No ASR models found":
             if model_name not in AVAILABLE_VIBEVOICE_MODELS:
@@ -179,16 +199,44 @@ class VibeVoiceASRNode(io.ComfyNode):
         dtype: str,
         attention_mode: str,
         force_offload: bool,
+        external_model: Optional[dict] = None,
     ) -> io.NodeOutput:
         """Execute VibeVoice ASR transcription."""
 
-        # Load ASR model via the patcher/VRAM system (CRIT-001 fix).
-        patcher, model, processor = load_asr_model_patched(
-            model_name=model_name,
-            device=device,
-            dtype=dtype,
-            attention_mode=attention_mode,
-        )
+        # Load ASR model — external bundle overrides the model_name dropdown.
+        if external_model is not None:
+            # Guard: streaming (realtime) models cannot transcribe audio.
+            if external_model.get("is_streaming"):
+                raise ValueError(
+                    "The provided external model is a streaming (realtime) model. "
+                    "Use the 'VibeVoice Realtime TTS' node for streaming models; "
+                    "the ASR node requires a VibeVoice ASR model."
+                )
+            # Guard: TTS models cannot transcribe audio. Bundles explicitly
+            # marked is_asr=False are rejected; bundles without the flag are
+            # accepted for backward compatibility.
+            if external_model.get("is_asr") is False:
+                raise ValueError(
+                    "The provided external model is a TTS (text-to-speech) model. "
+                    "Use the 'VibeVoice TTS' node for TTS models; "
+                    "the ASR node requires a VibeVoice ASR model."
+                )
+            patcher, model, processor = load_asr_from_external(
+                external_model,
+                device=device,
+                dtype=dtype,
+                attention_mode=attention_mode,
+            )
+            # Use the bundle's model name for offload cache keying.
+            model_name = external_model.get("model_name", model_name)
+        else:
+            # Load ASR model via the patcher/VRAM system (CRIT-001 fix).
+            patcher, model, processor = load_asr_model_patched(
+                model_name=model_name,
+                device=device,
+                dtype=dtype,
+                attention_mode=attention_mode,
+            )
 
         try:
             # Transcribe audio

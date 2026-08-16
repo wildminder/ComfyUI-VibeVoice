@@ -7,9 +7,11 @@ Each node is in a separate file for easier maintenance.
 from .tts_node import VibeVoiceTTSNode
 from .asr_node import VibeVoiceASRNode
 from .realtime_node import VibeVoiceRealtimeNode
+from .external_loader_node import VibeVoiceExternalLoaderNode
 
 __all__ = [
     "VibeVoiceTTSNode",
     "VibeVoiceASRNode",
     "VibeVoiceRealtimeNode",
+    "VibeVoiceExternalLoaderNode",
 ]

@@ -13,9 +13,19 @@ from typing import List
 from comfy_api.latest import ComfyExtension, io
 
 try:
-    from .nodes import VibeVoiceTTSNode, VibeVoiceASRNode, VibeVoiceRealtimeNode
+    from .nodes import (
+        VibeVoiceTTSNode,
+        VibeVoiceASRNode,
+        VibeVoiceRealtimeNode,
+        VibeVoiceExternalLoaderNode,
+    )
 except ImportError:
-    from nodes import VibeVoiceTTSNode, VibeVoiceASRNode, VibeVoiceRealtimeNode
+    from nodes import (
+        VibeVoiceTTSNode,
+        VibeVoiceASRNode,
+        VibeVoiceRealtimeNode,
+        VibeVoiceExternalLoaderNode,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +38,7 @@ class VibeVoiceExtension(ComfyExtension):
             VibeVoiceTTSNode,
             VibeVoiceASRNode,
             VibeVoiceRealtimeNode,
+            VibeVoiceExternalLoaderNode,
         ]
 
 

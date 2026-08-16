@@ -153,3 +153,40 @@ class TestWarmOffload:
             tiny_patcher.patch_model()  # warm re-attach -> load_model NOT called again
         assert calls["n"] == 1
         assert tiny_patcher.is_loaded is True
+
+
+class TestPatchSkipsLoadWhenModelPreloaded:
+    """Phase 2.4: an externally-loaded model (handler.model already set) must
+    skip the lazy-load branch in patch_model and go straight to the H2D move."""
+
+    def test_patch_model_skips_load_when_model_already_loaded(self, tiny_handler):
+        # Pre-load the handler's model (simulates ExternalVibeVoiceModelHandler).
+        tiny_handler.model = torch.nn.Linear(8, 8)
+
+        calls = {"n": 0}
+
+        def counting_load(device, attn="sdpa"):
+            calls["n"] += 1
+
+        tiny_handler.load_model = counting_load
+
+        with patch("comfy.model_patcher.ModelPatcher.__init__"):
+            patcher = VibeVoicePatcher(
+                tiny_handler,
+                attention_mode="sdpa",
+                load_device=torch.device("cpu"),
+                offload_device=torch.device("cpu"),
+                size=1024,
+            )
+        patcher.load_device = torch.device("cpu")
+        patcher.offload_device = torch.device("cpu")
+        patcher.model = tiny_handler
+
+        with _super_patch():
+            patcher.patch_model()
+
+        # load_model must NOT be called (model already loaded).
+        assert calls["n"] == 0
+        # But the model must still be moved to the target device.
+        assert next(tiny_handler.model.parameters()).device.type == "cpu"
+        assert patcher.is_loaded is True

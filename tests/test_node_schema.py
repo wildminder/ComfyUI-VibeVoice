@@ -64,6 +64,22 @@ class TestVibeVoiceTTSNodeSchema:
         assert "speaker_3_voice" in input_ids
         assert "speaker_4_voice" in input_ids
 
+    def test_schema_has_external_model_input(self):
+        """'external_model' is in the input ids."""
+        assert "external_model" in self._get_input_ids()
+
+    def test_external_model_input_is_optional(self):
+        """The external_model input is marked optional."""
+        schema = self._get_schema()
+        ext_input = next(inp for inp in schema.inputs if inp.id == "external_model")
+        assert ext_input.optional is True
+
+    def test_external_model_input_type(self):
+        """The external_model input has the VIBEVOICE_MODEL type."""
+        schema = self._get_schema()
+        ext_input = next(inp for inp in schema.inputs if inp.id == "external_model")
+        assert ext_input.get_io_type() == "VIBEVOICE_MODEL"
+
     def test_schema_output_is_audio(self):
         schema = self._get_schema()
         assert len(schema.outputs) >= 1
@@ -161,6 +177,216 @@ class TestVibeVoiceTTSNodeValidateTypeGuard:
             )
         assert isinstance(result, str)
         assert "Realtime" in result
+
+
+class TestVibeVoiceTTSNodeValidateExternalModel:
+    """External model input bypasses model_name dropdown validation."""
+
+    def test_validate_skips_model_name_when_external_model_provided(self):
+        """external_model present → validation passes even with unknown model_name."""
+        bundle = {"model": object(), "processor": object(), "model_name": "ext"}
+        result = VibeVoiceTTSNode.validate_inputs(
+            external_model=bundle, model_name="nonexistent_model"
+        )
+        assert result is True
+
+    def test_validate_still_validates_model_name_when_no_external(self):
+        """Without external_model, an unknown model_name still fails validation."""
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
+            {"VibeVoice-1.5B": {}},
+        ):
+            result = VibeVoiceTTSNode.validate_inputs(model_name="nonexistent_model")
+        assert isinstance(result, str)
+        assert "nonexistent_model" in result
+
+
+class TestVibeVoiceTTSNodeExecuteExternalModel:
+    """TTS node execute() must branch on external_model presence."""
+
+    def _make_bundle(self, is_streaming=False, is_asr=False):
+        return {
+            "model": object(),
+            "processor": object(),
+            "model_name": "ExtModel",
+            "source_path": "/fake/model.safetensors",
+            "is_streaming": is_streaming,
+            "is_asr": is_asr,
+        }
+
+    def test_execute_with_external_model_calls_load_from_external(self):
+        """external_model present → load_vibevoice_from_external is called."""
+        from unittest.mock import MagicMock
+
+        bundle = self._make_bundle(is_streaming=False)
+        mock_patcher = MagicMock()
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_from_external",
+            return_value=(mock_patcher, mock_model, mock_processor),
+        ) as mock_ext, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_model"
+        ) as mock_std, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_audio",
+            return_value=(MagicMock(), 24000),
+        ), patch(
+            "ComfyUI_VibeVoice.modules.audio_utils.parse_script_1_based",
+            return_value=([], [1]),
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
+        ):
+            VibeVoiceTTSNode.execute(
+                model_name="IgnoredModel",
+                text="[1] Hello",
+                quantize_llm_4bit=False,
+                attention_mode="sdpa",
+                cfg_scale=1.3,
+                inference_steps=10,
+                seed=42,
+                do_sample=True,
+                temperature=0.95,
+                top_p=0.95,
+                top_k=0,
+                force_offload=False,
+                device="cpu",
+                dtype="fp32",
+                external_model=bundle,
+            )
+
+        mock_ext.assert_called_once()
+        mock_std.assert_not_called()
+
+    def test_execute_without_external_model_calls_load_vibevoice_model(self):
+        """external_model=None → the standard dropdown loader is called."""
+        from unittest.mock import MagicMock
+
+        mock_patcher = MagicMock()
+        mock_model = MagicMock()
+        mock_processor = MagicMock()
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_model",
+            return_value=(mock_patcher, mock_model, mock_processor),
+        ) as mock_std, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_from_external"
+        ) as mock_ext, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_audio",
+            return_value=(MagicMock(), 24000),
+        ), patch(
+            "ComfyUI_VibeVoice.modules.audio_utils.parse_script_1_based",
+            return_value=([], [1]),
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
+        ):
+            VibeVoiceTTSNode.execute(
+                model_name="VibeVoice-1.5B",
+                text="[1] Hello",
+                quantize_llm_4bit=False,
+                attention_mode="sdpa",
+                cfg_scale=1.3,
+                inference_steps=10,
+                seed=42,
+                do_sample=True,
+                temperature=0.95,
+                top_p=0.95,
+                top_k=0,
+                force_offload=False,
+                device="cpu",
+                dtype="fp32",
+                external_model=None,
+            )
+
+        mock_std.assert_called_once()
+        mock_ext.assert_not_called()
+
+    def test_execute_external_model_skips_dropdown(self):
+        """When external_model is provided, model_name is ignored."""
+        from unittest.mock import MagicMock
+
+        bundle = self._make_bundle(is_streaming=False)
+        mock_patcher = MagicMock()
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_from_external",
+            return_value=(mock_patcher, MagicMock(), MagicMock()),
+        ) as mock_ext, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_audio",
+            return_value=(MagicMock(), 24000),
+        ), patch(
+            "ComfyUI_VibeVoice.modules.audio_utils.parse_script_1_based",
+            return_value=([], [1]),
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
+        ):
+            VibeVoiceTTSNode.execute(
+                model_name="SomeDropdownModel",
+                text="[1] Hello",
+                quantize_llm_4bit=False,
+                attention_mode="sdpa",
+                cfg_scale=1.3,
+                inference_steps=10,
+                seed=42,
+                do_sample=True,
+                temperature=0.95,
+                top_p=0.95,
+                top_k=0,
+                force_offload=False,
+                device="cpu",
+                dtype="fp32",
+                external_model=bundle,
+            )
+
+        # The external loader receives the bundle, not the dropdown name.
+        call_args = mock_ext.call_args
+        assert call_args[0][0] is bundle
+
+    def test_execute_rejects_streaming_external_model(self):
+        """A streaming external model on the TTS node raises ValueError."""
+        bundle = self._make_bundle(is_streaming=True)
+
+        with pytest.raises(ValueError, match="Realtime"):
+            VibeVoiceTTSNode.execute(
+                model_name="VibeVoice-1.5B",
+                text="[1] Hello",
+                quantize_llm_4bit=False,
+                attention_mode="sdpa",
+                cfg_scale=1.3,
+                inference_steps=10,
+                seed=42,
+                do_sample=True,
+                temperature=0.95,
+                top_p=0.95,
+                top_k=0,
+                force_offload=False,
+                device="cpu",
+                dtype="fp32",
+                external_model=bundle,
+            )
+
+    def test_execute_rejects_asr_external_model(self):
+        """An ASR external model on the TTS node raises ValueError."""
+        bundle = self._make_bundle(is_streaming=False, is_asr=True)
+
+        with pytest.raises(ValueError, match="ASR"):
+            VibeVoiceTTSNode.execute(
+                model_name="VibeVoice-1.5B",
+                text="[1] Hello",
+                quantize_llm_4bit=False,
+                attention_mode="sdpa",
+                cfg_scale=1.3,
+                inference_steps=10,
+                seed=42,
+                do_sample=True,
+                temperature=0.95,
+                top_p=0.95,
+                top_k=0,
+                force_offload=False,
+                device="cpu",
+                dtype="fp32",
+                external_model=bundle,
+            )
 
 
 class TestVibeVoiceASRNodeValidateTypeGuard:
