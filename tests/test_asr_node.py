@@ -99,6 +99,19 @@ class TestVibeVoiceASRNodeValidate:
         )
         assert result is True
 
+    def test_validate_bypasses_when_external_model_linked_but_none(self):
+        """REGRESSION: a *connected* external_model resolves to None during prompt
+        validation (ComfyUI has no execution cache yet). The bypass must trigger on
+        the input's *presence* in kwargs, not on a non-None value."""
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.is_model_type",
+            return_value=False,  # model_name would be flagged as non-ASR
+        ):
+            result = VibeVoiceASRNode.validate_inputs(
+                model_name="VibeVoice-1.5B", external_model=None
+            )
+        assert result is True
+
 
 class TestVibeVoiceASRNodeExecute:
     """CRIT-001 S4: execute must route through the patcher-based load path."""

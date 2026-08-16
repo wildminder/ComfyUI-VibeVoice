@@ -207,7 +207,13 @@ class VibeVoiceRealtimeNode(io.ComfyNode):
     def validate_inputs(cls, **kwargs) -> bool | str:
         """Validate inputs; only ``streaming_tts`` models are accepted here."""
         # An externally-loaded model bypasses the model_name dropdown entirely.
-        if kwargs.get("external_model") is not None:
+        # NOTE: During prompt validation ComfyUI resolves *linked* inputs to
+        # None (no execution cache exists yet — see execution.get_input_data /
+        # mark_missing), so the value cannot be inspected here. We therefore
+        # detect that the external_model input is *connected* by its presence
+        # in kwargs: a linked input is always present (resolved to None), while
+        # an unconnected optional input is absent from the prompt entirely.
+        if "external_model" in kwargs:
             return True
 
         model_name = kwargs.get("model_name")

@@ -181,6 +181,30 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.2.2 - Fix external_model Validation Bypass</strong></summary>
+
+### 🐛 Fixes
+*   **Connecting a `Load VibeVoice Model` node to the `external_model` input no longer
+    fails prompt validation.** During prompt validation ComfyUI resolves *linked* inputs
+    to `None` (no execution cache exists yet — see `execution.get_input_data` /
+    `mark_missing`), so the previous `kwargs.get("external_model") is not None` check
+    never triggered. The node then fell through and rejected the stale `model_name`
+    widget value (e.g. a streaming model left in the TTS node dropdown). All three nodes
+    (TTS, Realtime TTS, ASR) now detect a *connected* external model by its presence in
+    `kwargs` (`"external_model" in kwargs`), which is always true for a linked input.
+
+### 🔧 Changes
+*   `nodes/tts_node.py`, `nodes/realtime_node.py`, `nodes/asr_node.py`:
+    `validate_inputs()` bypass now keys on input presence instead of a non-`None` value.
+
+### 🧪 Tests
+*   Regression tests in `tests/test_node_schema.py`, `tests/test_realtime_node.py`, and
+    `tests/test_asr_node.py` simulate the linked-input scenario (`external_model=None`)
+    and confirm validation passes while the unconnected path still rejects wrong types.
+
+</details>
+
+<details>
 <summary><strong>v2.2.1 - GGUF Support in Load VibeVoice Model</strong></summary>
 
 ### 🐛 Fixes
