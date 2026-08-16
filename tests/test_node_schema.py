@@ -89,7 +89,14 @@ class TestVibeVoiceTTSNodeValidate:
 
 
 class TestVibeVoiceTTSNodeSchemaModelFiltering:
-    """CRIT-002: TTS dropdown must only expose TTS + streaming models."""
+    """CRIT-002: TTS dropdown must only expose non-streaming TTS models.
+
+    Streaming (realtime) models are excluded: they require the streaming
+    generation path (generate_streaming_audio) exposed by the dedicated
+    VibeVoice Realtime TTS node. Routing them through this node raised
+    ``VibeVoiceStreamingProcessor.__call__() got an unexpected keyword
+    argument 'text'``.
+    """
 
     def _get_model_options(self):
         schema = VibeVoiceTTSNode.define_schema()
@@ -108,7 +115,7 @@ class TestVibeVoiceTTSNodeSchemaModelFiltering:
         assert "VibeVoice-ASR" not in options
         assert "VibeVoice-1.5B" in options
 
-    def test_tts_options_include_streaming(self):
+    def test_tts_options_exclude_streaming(self):
         with patch(
             "ComfyUI_VibeVoice.modules.model_info.AVAILABLE_VIBEVOICE_MODELS",
             {
@@ -118,8 +125,9 @@ class TestVibeVoiceTTSNodeSchemaModelFiltering:
             },
         ):
             options = self._get_model_options()
-        assert "VibeVoice-Realtime-0.5B" in options
+        assert "VibeVoice-Realtime-0.5B" not in options
         assert "VibeVoice-ASR" not in options
+        assert "VibeVoice-1.5B" in options
 
 
 class TestVibeVoiceTTSNodeValidateTypeGuard:
@@ -141,6 +149,18 @@ class TestVibeVoiceTTSNodeValidateTypeGuard:
             result = VibeVoiceTTSNode.validate_inputs(model_name="VibeVoice-ASR")
         assert isinstance(result, str)
         assert "ASR" in result
+
+    def test_validate_rejects_streaming_model(self):
+        """Streaming models must be rejected with a pointer to the Realtime node."""
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
+            {"VibeVoice-Realtime-0.5B": {}},
+        ):
+            result = VibeVoiceTTSNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B"
+            )
+        assert isinstance(result, str)
+        assert "Realtime" in result
 
 
 class TestVibeVoiceASRNodeValidateTypeGuard:
