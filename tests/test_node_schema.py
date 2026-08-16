@@ -200,6 +200,34 @@ class TestVibeVoiceTTSNodeValidateExternalModel:
         assert isinstance(result, str)
         assert "nonexistent_model" in result
 
+    def test_validate_bypasses_when_external_model_linked_but_none(self):
+        """REGRESSION: a *connected* external_model resolves to None during prompt
+        validation (ComfyUI has no execution cache yet — see execution.get_input_data
+        / mark_missing). The bypass must therefore trigger on the input's *presence*
+        in kwargs, not on a non-None value. Previously this fell through and rejected
+        the stale model_name widget (e.g. a streaming model on the TTS node)."""
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.is_model_type",
+            return_value=True,  # model_name would be flagged as streaming
+        ):
+            result = VibeVoiceTTSNode.validate_inputs(
+                external_model=None, model_name="VibeVoice-Realtime-0.5B"
+            )
+        assert result is True
+
+    def test_validate_rejects_streaming_model_when_external_absent(self):
+        """Without a connected external_model, a streaming model_name is still rejected."""
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
+            {"VibeVoice-Realtime-0.5B": {}},
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.is_model_type",
+            side_effect=lambda name, typ: typ == "streaming_tts",
+        ):
+            result = VibeVoiceTTSNode.validate_inputs(model_name="VibeVoice-Realtime-0.5B")
+        assert isinstance(result, str)
+        assert "streaming" in result
+
 
 class TestVibeVoiceTTSNodeExecuteExternalModel:
     """TTS node execute() must branch on external_model presence."""

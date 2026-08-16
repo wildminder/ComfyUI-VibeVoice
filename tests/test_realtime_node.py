@@ -352,3 +352,16 @@ class TestRealtimeNodeExternalModel:
             external_model=bundle, model_name="nonexistent_model"
         )
         assert result is True
+
+    def test_realtime_validate_bypasses_when_external_model_linked_but_none(self):
+        """REGRESSION: a *connected* external_model resolves to None during prompt
+        validation (ComfyUI has no execution cache yet). The bypass must trigger on
+        the input's *presence* in kwargs, not on a non-None value."""
+        with patch(
+            "ComfyUI_VibeVoice.nodes.realtime_node.is_model_type",
+            return_value=False,  # model_name would be flagged as non-streaming
+        ):
+            result = VibeVoiceRealtimeNode.validate_inputs(
+                external_model=None, model_name="VibeVoice-1.5B"
+            )
+        assert result is True
