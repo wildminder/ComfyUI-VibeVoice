@@ -479,3 +479,154 @@ class TestLoadExternalASRModel:
         """source_path in the ASR bundle matches the weight path."""
         result, _ = self._run(weight_file)
         assert result["source_path"] == weight_file
+
+
+# ====================================================================
+# Fix B: low-bit / naive quantization detection
+# ====================================================================
+
+import json
+import struct
+import logging
+
+from ComfyUI_VibeVoice.modules.external_loader import (
+    _inspect_safetensors_quantization,
+    _inspect_gguf_quantization,
+    warn_if_lowbit_quantization,
+)
+
+
+def _write_safetensors_header(path, tensor_specs):
+    """Write a minimal safetensors file containing ONLY the header (no tensor data).
+
+    ``_inspect_safetensors_quantization`` reads only the header, so no data bytes
+    are needed. ``tensor_specs`` is a list of (name, dtype, shape) tuples.
+    """
+    header = {}
+    offset = 0
+    for name, dtype, shape in tensor_specs:
+        header[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset]}
+    header_bytes = json.dumps(header).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+    return str(path)
+
+
+class TestInspectSafetensorsQuantization:
+    """Test _inspect_safetensors_quantization header parsing."""
+
+    def test_naive_int8_cast_detected(self, tmp_path):
+        """Many I8 tensors with no scale metadata -> naive cast detected."""
+        specs = [(f"model.layers.{i}.weight", "I8", [16, 16]) for i in range(10)]
+        specs += [(f"model.layers.{i}.norm", "BF16", [16]) for i in range(2)]
+        path = _write_safetensors_header(tmp_path / "naive.safetensors", specs)
+
+        info = _inspect_safetensors_quantization(path)
+        assert info is not None
+        assert info["total"] == 12
+        assert info["int_count"] == 10
+        assert info["has_scale_meta"] is False
+
+    def test_proper_quant_with_scales_not_flagged(self, tmp_path):
+        """I8 tensors WITH scale tensors -> has_scale_meta True (proper quant)."""
+        specs = [(f"model.layers.{i}.weight", "I8", [16, 16]) for i in range(10)]
+        specs += [(f"model.layers.{i}.weight_scale", "BF16", [16]) for i in range(10)]
+        path = _write_safetensors_header(tmp_path / "proper.safetensors", specs)
+
+        info = _inspect_safetensors_quantization(path)
+        assert info["int_count"] == 10
+        assert info["has_scale_meta"] is True
+
+    def test_full_precision_no_int(self, tmp_path):
+        """All BF16/F32 -> int_count 0."""
+        specs = [(f"model.layers.{i}.weight", "BF16", [16, 16]) for i in range(10)]
+        path = _write_safetensors_header(tmp_path / "fp.safetensors", specs)
+
+        info = _inspect_safetensors_quantization(path)
+        assert info["int_count"] == 0
+        assert info["has_scale_meta"] is False
+
+    def test_unparseable_file_returns_none(self, tmp_path):
+        """A non-safetensors / corrupt file returns None (no crash)."""
+        path = tmp_path / "corrupt.safetensors"
+        path.write_bytes(b"not a safetensors file")
+        assert _inspect_safetensors_quantization(str(path)) is None
+
+
+class TestWarnIfLowbitQuantization:
+    """Test warn_if_lowbit_quantization end-to-end warning behavior."""
+
+    def test_naive_int8_warns(self, tmp_path, caplog):
+        """Naive int8 cast (no scales) must emit a warning."""
+        specs = [(f"model.layers.{i}.weight", "I8", [16, 16]) for i in range(10)]
+        path = _write_safetensors_header(tmp_path / "naive.safetensors", specs)
+
+        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+            warn_if_lowbit_quantization(path)
+
+        assert any("naive int cast" in r.message for r in caplog.records)
+
+    def test_proper_quant_no_warning(self, tmp_path, caplog):
+        """Proper quant with scales must NOT warn."""
+        specs = [(f"model.layers.{i}.weight", "I8", [16, 16]) for i in range(10)]
+        specs += [(f"model.layers.{i}.weight_scale", "BF16", [16]) for i in range(10)]
+        path = _write_safetensors_header(tmp_path / "proper.safetensors", specs)
+
+        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+            warn_if_lowbit_quantization(path)
+
+        assert not any("naive int cast" in r.message for r in caplog.records)
+
+    def test_full_precision_no_warning(self, tmp_path, caplog):
+        """Full-precision file must NOT warn."""
+        specs = [(f"model.layers.{i}.weight", "BF16", [16, 16]) for i in range(10)]
+        path = _write_safetensors_header(tmp_path / "fp.safetensors", specs)
+
+        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+            warn_if_lowbit_quantization(path)
+
+        assert not any("naive int cast" in r.message for r in caplog.records)
+
+    def test_gguf_lowbit_warns(self, tmp_path, caplog):
+        """GGUF with many sub-4-bit I-quant tensors must warn."""
+        # Build a fake GGUFReader with a tensor table of IQ3_XXS tensors.
+        from gguf.constants import GGMLQuantizationType
+
+        fake_tensors = [MagicMock() for _ in range(10)]
+        for t in fake_tensors:
+            t.tensor_type = GGMLQuantizationType.IQ3_XXS
+        fake_reader = MagicMock()
+        fake_reader.tensors = fake_tensors
+
+        gguf_path = str(tmp_path / "lowbit.gguf")
+        with patch("gguf.GGUFReader", return_value=fake_reader), \
+             caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+            warn_if_lowbit_quantization(gguf_path)
+
+        assert any("sub-4-bit" in r.message for r in caplog.records)
+
+    def test_gguf_highbit_no_warning(self, tmp_path, caplog):
+        """GGUF with Q8_0 tensors must NOT warn."""
+        from gguf.constants import GGMLQuantizationType
+
+        fake_tensors = [MagicMock() for _ in range(10)]
+        for t in fake_tensors:
+            t.tensor_type = GGMLQuantizationType.Q8_0
+        fake_reader = MagicMock()
+        fake_reader.tensors = fake_tensors
+
+        gguf_path = str(tmp_path / "highbit.gguf")
+        with patch("gguf.GGUFReader", return_value=fake_reader), \
+             caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+            warn_if_lowbit_quantization(gguf_path)
+
+        assert not any("sub-4-bit" in r.message for r in caplog.records)
+
+    def test_non_weight_extension_no_crash(self, tmp_path, caplog):
+        """An unrecognized extension must be a no-op (no crash, no warning)."""
+        path = tmp_path / "model.bin"
+        path.write_bytes(b"")
+        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+            warn_if_lowbit_quantization(str(path))
+        assert not any("naive int cast" in r.message for r in caplog.records)
