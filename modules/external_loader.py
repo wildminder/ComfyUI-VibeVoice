@@ -392,6 +392,151 @@ def _load_weight_state_dict(weight_path: str, device) -> dict:
 
 
 # ====================================================================
+# Low-bit / naive quantization detection (defensive warning)
+# ====================================================================
+
+# safetensors dtypes that indicate integer (quantized) storage.
+_SAFETENSORS_INT_DTYPES = {
+    "I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64", "I4", "U4",
+}
+
+# Tensor-name substrings that indicate proper dequantization metadata is present
+# (a real quantized checkpoint stores per-channel scales / zero-points).
+_QUANT_SCALE_NAME_HINTS = ("scale", "zero_point", "qzero", "absmax")
+
+# Fraction of integer/low-bit tensors above which we consider the file
+# "mostly quantized" (as opposed to a couple of incidental index tensors).
+_LOWBIT_FRACTION_THRESHOLD = 0.10
+
+
+def _inspect_safetensors_quantization(weight_path: str):
+    """Parse only the safetensors header (no tensor data) to detect naive int casts.
+
+    A *proper* quantized checkpoint stores dequantization metadata (per-channel
+    scale / zero-point tensors). A *naive* ``int8`` cast stores raw integer values
+    with no scales, which is unusable (loads as garbage weights).
+
+    Args:
+        weight_path: Absolute path to a ``.safetensors`` file.
+
+    Returns:
+        dict ``{"total", "int_count", "has_scale_meta"}`` or ``None`` if the
+        header could not be parsed.
+    """
+    import struct
+
+    try:
+        with open(weight_path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(header_len))
+    except Exception:
+        return None
+
+    header.pop("__metadata__", None)
+    total = len(header)
+    int_count = 0
+    has_scale_meta = False
+    for name, info in header.items():
+        if info.get("dtype", "") in _SAFETENSORS_INT_DTYPES:
+            int_count += 1
+        low = name.lower()
+        if any(hint in low for hint in _QUANT_SCALE_NAME_HINTS):
+            has_scale_meta = True
+
+    return {"total": total, "int_count": int_count, "has_scale_meta": has_scale_meta}
+
+
+def _inspect_gguf_quantization(weight_path: str):
+    """Inspect the GGUF tensor table (no dequantization) to count sub-4-bit I-quants.
+
+    Args:
+        weight_path: Absolute path to a ``.gguf`` file.
+
+    Returns:
+        dict ``{"total", "low_bit_count"}`` or ``None`` if the file could not be
+        read or the ``gguf`` package is unavailable.
+    """
+    try:
+        import gguf
+        from gguf.constants import GGMLQuantizationType
+    except ImportError:
+        return None
+
+    try:
+        reader = gguf.GGUFReader(weight_path)
+    except Exception:
+        return None
+
+    # Aggressive sub-4-bit importance-matrix quants. These are faithful but very
+    # lossy; on a small (~1.5B) TTS LM they commonly degrade below the threshold
+    # needed for text-conditioned generation.
+    low_bit_types = {
+        GGMLQuantizationType.IQ1_S,
+        GGMLQuantizationType.IQ1_M,
+        GGMLQuantizationType.IQ2_XXS,
+        GGMLQuantizationType.IQ2_XS,
+        GGMLQuantizationType.IQ2_S,
+        GGMLQuantizationType.IQ3_XXS,
+        GGMLQuantizationType.IQ3_S,
+    }
+    total = len(reader.tensors)
+    low_bit_count = sum(1 for t in reader.tensors if t.tensor_type in low_bit_types)
+    return {"total": total, "low_bit_count": low_bit_count}
+
+
+def warn_if_lowbit_quantization(weight_path: str) -> None:
+    """Log a warning if ``weight_path`` looks over-quantized or naively cast.
+
+    This is a defensive, load-time heuristic. It does not block loading; it only
+    surfaces a clear, actionable warning so the user knows a garbled / silent
+    result is likely caused by the checkpoint rather than the node.
+
+    Two failure modes are detected:
+      * safetensors with many raw integer tensors but NO scale/zero-point metadata
+        -> naive int cast (unusable).
+      * GGUF with many sub-4-bit I-quant tensors -> aggressive quant that may
+        degrade TTS quality (garbled output / reference echo).
+
+    Args:
+        weight_path: Absolute path to the external weight file.
+    """
+    lower = weight_path.lower()
+
+    if lower.endswith(".safetensors"):
+        info = _inspect_safetensors_quantization(weight_path)
+        if info is None or info["total"] == 0:
+            return
+        frac = info["int_count"] / info["total"]
+        if frac >= _LOWBIT_FRACTION_THRESHOLD and not info["has_scale_meta"]:
+            logger.warning(
+                f"[low-bit check] '{os.path.basename(weight_path)}' stores "
+                f"{info['int_count']}/{info['total']} tensors as raw integers with "
+                f"NO dequantization scale/zero-point metadata. This looks like a "
+                f"naive int cast, which loads as garbage weights and will produce "
+                f"silent or broken audio. Use a proper quantized or full-precision "
+                f"(BF16/FP16) checkpoint instead."
+            )
+        return
+
+    if lower.endswith(".gguf"):
+        info = _inspect_gguf_quantization(weight_path)
+        if info is None or info["total"] == 0:
+            return
+        frac = info["low_bit_count"] / info["total"]
+        if frac >= _LOWBIT_FRACTION_THRESHOLD:
+            logger.warning(
+                f"[low-bit check] '{os.path.basename(weight_path)}' contains "
+                f"{info['low_bit_count']}/{info['total']} tensors at sub-4-bit "
+                f"I-quant precision. This is very aggressive for a small TTS LM and "
+                f"may degrade below the threshold for text-conditioned generation "
+                f"(symptoms: garbled syllables, reference-audio echo, never "
+                f"terminating). Consider a higher-quality quant (Q4_K_M / Q5_K_M / "
+                f"Q8_0 / BF16)."
+            )
+        return
+
+
+# ====================================================================
 # In-memory state dict loading
 # ====================================================================
 
@@ -477,6 +622,9 @@ def load_external_vibevoice_model(
     """
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
+
+    # Defensive: warn early if the checkpoint looks over-quantized / naively cast.
+    warn_if_lowbit_quantization(weight_path)
 
     # ASR models use a distinct loading branch (different config / tokenizer /
     # processor / model classes, and no 4-bit quantization).
@@ -664,6 +812,9 @@ def load_external_vibevoice_asr_model(
     """
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
+
+    # Defensive: warn early if the checkpoint looks over-quantized / naively cast.
+    warn_if_lowbit_quantization(weight_path)
 
     # Resolve attention mode with fallback logic (no 4-bit for ASR).
     attention_mode = resolve_attention_mode(attention_mode, quantize_4bit=False)

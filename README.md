@@ -181,6 +181,37 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.2.3 - Guard Empty Generation + Low-Bit Quant Warnings</strong></summary>
+
+### 🐛 Fixes
+*   **`generate_audio()` no longer crashes with `AttributeError: 'NoneType' object has no
+    attribute 'ndim'`** when the model produces no speech outputs. Corrupt or
+    over-quantized weights (e.g. a naive int8 cast without dequantization scales) make the
+    autoregressive loop emit no `speech_diffusion_id` token, so `speech_outputs[0]` is
+    `None`. The non-streaming path now raises a clear, actionable `RuntimeError` pointing
+    at the checkpoint quality (the streaming path already had this guard).
+
+### 🔧 Changes
+*   `modules/generation.py`: `generate_audio()` guards `None`/empty `speech_outputs` and
+    raises a descriptive `RuntimeError` recommending a higher-quality checkpoint.
+*   `modules/external_loader.py`: new defensive load-time check
+    `warn_if_lowbit_quantization()` wired into both `load_external_vibevoice_model()` and
+    `load_external_vibevoice_asr_model()`. It parses only the safetensors header (no tensor
+    data) to flag raw-integer tensors with no scale/zero-point metadata (naive int cast),
+    and inspects the GGUF tensor table to flag sub-4-bit I-quant checkpoints that commonly
+    degrade TTS quality (garbled syllables / reference-audio echo).
+
+### 🧪 Tests
+*   `tests/test_generation.py`: `TestGenerateAudioNoneSpeechOutputs` (5 tests) — `None`,
+    empty, and `[None]` speech outputs raise a clear `RuntimeError`; valid tensors still
+    pass through.
+*   `tests/test_external_loader.py`: `TestInspectSafetensorsQuantization` +
+    `TestWarnIfLowbitQuantization` (10 tests) — naive int8 cast detected, proper quant with
+    scales not flagged, GGUF sub-4-bit warned, high-bit/full-precision silent.
+
+</details>
+
+<details>
 <summary><strong>v2.2.2 - Fix external_model Validation Bypass</strong></summary>
 
 ### 🐛 Fixes

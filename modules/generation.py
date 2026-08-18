@@ -434,8 +434,22 @@ def generate_audio(
             # early (EOS before max_steps) or generation raised.
             pbar.update_absolute(pbar.total)
 
-    # Post-process output
-    output_waveform = outputs.speech_outputs[0]
+    # Post-process output.
+    # Guard: the vendored AR loop appends None for any sample that never emitted
+    # a speech_diffusion_id token (e.g. corrupt / over-quantized weights, or an
+    # empty generation). Without this guard, `outputs.speech_outputs[0].ndim`
+    # raises an opaque AttributeError on None.
+    speech_outputs = outputs.speech_outputs
+    if not speech_outputs or speech_outputs[0] is None:
+        raise RuntimeError(
+            "VibeVoice generation produced no audio. The model emitted no speech "
+            "tokens during the autoregressive loop. This usually means the loaded "
+            "weights are corrupt or over-quantized (e.g. a naive int8 cast without "
+            "dequantization scales, or an extremely low-bit GGUF quant). Try a "
+            "higher-quality checkpoint (BF16 / FP16 / Q8_0 / Q4_K_M)."
+        )
+
+    output_waveform = speech_outputs[0]
     if output_waveform.ndim == 1:
         output_waveform = output_waveform.unsqueeze(0)
     if output_waveform.ndim == 2:

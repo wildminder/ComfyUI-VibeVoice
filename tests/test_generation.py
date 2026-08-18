@@ -893,3 +893,64 @@ class TestGenerateAudioStreamingGuard:
             )
         assert sr == 24000
         assert waveform.ndim == 3
+
+
+class TestGenerateAudioNoneSpeechOutputs:
+    """Fix A: generate_audio must raise a clear RuntimeError (not AttributeError)
+    when the model produces no speech outputs (None / empty).
+
+    Regression for the int8-convrot crash: corrupt/over-quantized weights make
+    the AR loop emit no speech_diffusion_id token, so speech_outputs[0] is None
+    and the old code crashed with `AttributeError: 'NoneType' object has no
+    attribute 'ndim'`.
+    """
+
+    def _run_with_speech_outputs(self, speech_outputs):
+        mock_model = MagicMock()
+        mock_model.device = torch.device("cpu")
+        mock_output = MagicMock()
+        mock_output.speech_outputs = speech_outputs
+        mock_model.generate.return_value = mock_output
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
+        mock_processor.tokenizer = MagicMock()
+
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
+            return generate_audio(
+                model=mock_model,
+                processor=mock_processor,
+                text="[1] Hello world",
+                voice_samples=[{"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000}],
+                speaker_ids=[1],
+                inference_steps=10,
+            )
+
+    def test_none_first_output_raises_runtime_error(self):
+        """speech_outputs=[None] must raise RuntimeError, not AttributeError."""
+        with pytest.raises(RuntimeError, match="produced no audio"):
+            self._run_with_speech_outputs([None])
+
+    def test_empty_speech_outputs_raises_runtime_error(self):
+        """speech_outputs=[] must raise RuntimeError, not IndexError."""
+        with pytest.raises(RuntimeError, match="produced no audio"):
+            self._run_with_speech_outputs([])
+
+    def test_none_speech_outputs_raises_runtime_error(self):
+        """speech_outputs=None must raise RuntimeError, not TypeError."""
+        with pytest.raises(RuntimeError, match="produced no audio"):
+            self._run_with_speech_outputs(None)
+
+    def test_error_message_mentions_quantization_guidance(self):
+        """The error message should guide the user toward a better checkpoint."""
+        with pytest.raises(RuntimeError, match="over-quantized"):
+            self._run_with_speech_outputs([None])
+
+    def test_valid_output_still_returns_waveform(self):
+        """A valid tensor output must still pass through unchanged (guard is
+        only for None/empty, not a false positive)."""
+        waveform, sr = self._run_with_speech_outputs([torch.randn(24000)])
+        assert sr == 24000
+        assert waveform.ndim == 3
