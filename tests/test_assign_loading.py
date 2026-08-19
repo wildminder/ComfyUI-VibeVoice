@@ -121,3 +121,40 @@ class TestApplyStateDict:
         assert not any(p.is_meta for p in model.parameters())
         assert torch.equal(model.embed.weight, torch.full((4, 4), 7.0))
         assert torch.equal(model.lm_head.weight, torch.full((4, 4), 9.0))
+
+    def test_meta_buffers_materialized_after_assign(self):
+        """Meta buffers (not in checkpoint) must be materialized to CPU.
+
+        Without this, ComfyUI's unpatch_model → model.to(device) raises
+        NotImplementedError on meta buffers.
+        """
+        class _ModelWithBuffer(_UntiedTinyModel):
+            def __init__(self, vocab=4, dim=4):
+                super().__init__(vocab, dim)
+                self.register_buffer("position_ids", torch.arange(vocab))
+
+        with torch.device("meta"):
+            model = _ModelWithBuffer()
+        # Buffer is on meta.
+        assert model.position_ids.is_meta
+        # Checkpoint has no buffer key.
+        sd = {"embed.weight": torch.ones(4, 4)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        # Buffer is now on CPU (materialized).
+        assert not model.position_ids.is_meta
+        assert model.position_ids.device.type == "cpu"
+
+    def test_no_meta_tensors_remain_after_assign(self):
+        """After _apply_state_dict, NO tensor (param or buffer) is on meta."""
+        class _ModelWithBuffer(_UntiedTinyModel):
+            def __init__(self, vocab=4, dim=4):
+                super().__init__(vocab, dim)
+                self.register_buffer("mask", torch.ones(vocab))
+
+        with torch.device("meta"):
+            model = _ModelWithBuffer()
+        sd = {"embed.weight": torch.ones(4, 4), "lm_head.weight": torch.ones(4, 4)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        # All parameters AND buffers must be off meta.
+        assert not any(p.is_meta for p in model.parameters())
+        assert not any(b.is_meta for b in model.buffers())
