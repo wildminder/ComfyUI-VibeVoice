@@ -300,22 +300,33 @@ class TestP1LoaderReturnsCpuModel:
         assert ledger_model.device == CPU
 
     def test_loader_applies_dtype_on_cpu(self, ledger, ledger_model):
+        """Plan 2026-08-18 D4/RC-3: final dtype applied via the conditional
+        cast helper (not an unconditional ``.to()``), and never on CUDA."""
+        cast_calls = []
+
+        def fake_cast(model, dtype):
+            cast_calls.append(dtype)
+            model._dtype = dtype  # simulate the in-place cast on the double
+
         with _patched_loader(ledger_model), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
+             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf, \
+             patch("ComfyUI_VibeVoice.modules.loader.cast_model_to_dtype_if_needed",
+                   side_effect=fake_cast):
             mock_ltf.return_value = {"w": torch.zeros(1)}
             VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa", dtype_str="fp16"
             )
 
-        dtype_casts = [e for e in ledger if e[0] == "to" and e[2] is not None]
-        assert dtype_casts, "loader must apply the final dtype"
-        assert all(e[2] == torch.float16 for e in dtype_casts)
+        assert cast_calls == [torch.float16], (
+            "loader must apply the final dtype via the conditional cast helper")
         # The dtype cast must not be combined with a CUDA device move.
-        assert all(
-            e[1] is None or e[1].type == "cpu" for e in dtype_casts
-        ), f"dtype cast must happen on CPU, got {dtype_casts}"
+        cuda_moves = [
+            e for e in ledger
+            if e[0] == "to" and e[1] is not None and e[1].type == "cuda"
+        ]
+        assert cuda_moves == [], f"dtype cast must happen on CPU, got {ledger}"
         assert ledger_model.dtype == torch.float16
 
     def test_4bit_quantization_runs_on_cpu(self, ledger, ledger_model):
@@ -422,7 +433,12 @@ def _make_ledger_patcher(handler, target_dtype=None):
 
 
 class TestP1PatcherSingleH2D:
-    """Contract: exactly one H2D transfer, owned by patch_model."""
+    """Contract (plan 2026-08-18, D6/RC-5): the patcher performs NO device
+    move of its own. The single host-to-device transfer is owned by
+    ``super().patch_model()`` → ``ModelPatcher.load()``. Because super is
+    mocked in these tests, the ledger must record ZERO cuda moves from the
+    patcher's own code; the transfer is asserted via the super() call args.
+    """
 
     def test_patcher_single_h2d_transfer_cold_load(self, ledger, ledger_model):
         handler = _LedgerHandler(ledger, model=ledger_model)
@@ -436,13 +452,15 @@ class TestP1PatcherSingleH2D:
         assert len(handler.load_model_calls) == 1
         kinds = [e[0] for e in ledger]
         assert "load_state_dict" in kinds
-        # Exactly ONE CUDA move, and it happens AFTER load_state_dict.
+        # D6: the patcher itself performs NO cuda move — the H2D is owned by
+        # super().patch_model() → load() (mocked here).
         cuda_moves = [
-            i for i, e in enumerate(ledger)
+            e for e in ledger
             if e[0] == "to" and e[1] is not None and e[1].type == "cuda"
         ]
-        assert len(cuda_moves) == 1, f"expected exactly one H2D, ledger={ledger}"
-        assert cuda_moves[0] > kinds.index("load_state_dict")
+        assert len(cuda_moves) == 0, f"patcher must not bulk-move, ledger={ledger}"
+        # The transfer target is delegated to super with the right device.
+        assert mock_super.call_args.kwargs["device_to"] == CUDA
 
     def test_patcher_warm_reattach_single_h2d(self, ledger, ledger_model):
         handler = _LedgerHandler(ledger, model=None, simulate_loader=False)
@@ -450,25 +468,27 @@ class TestP1PatcherSingleH2D:
         patcher = _make_ledger_patcher(handler)
         patcher._warm_offloaded = True  # warm-offloaded state
 
-        with patch("comfy.model_patcher.ModelPatcher.patch_model"):
+        with patch("comfy.model_patcher.ModelPatcher.patch_model") as mock_super:
             patcher.patch_model(device_to=CUDA)
 
         # No re-load from disk.
         assert handler.load_model_calls == []
-        # Exactly one H2D transfer for the re-attach.
+        # D6: no cuda move from the patcher's own code (delegated to super).
         cuda_moves = [
             e for e in ledger
             if e[0] == "to" and e[1] is not None and e[1].type == "cuda"
         ]
-        assert len(cuda_moves) == 1, f"ledger={ledger}"
+        assert len(cuda_moves) == 0, f"ledger={ledger}"
         assert patcher._warm_offloaded is False
+        assert mock_super.call_args.kwargs["device_to"] == CUDA
 
     def test_no_gpu_cpu_gpu_round_trip(self, ledger, ledger_model):
         """Full cycle: cold load -> warm offload -> re-attach.
 
-        The ledger must never contain the pattern
-        ``to(cuda) ... to(cpu) ... to(cuda)`` within ONE load cycle. The
-        warm-offload CPU move belongs to the offload cycle, not the load.
+        D6: within the load cycle the patcher records NO device move at all
+        (the H2D is delegated to super). The warm-offload CPU move belongs to
+        the offload cycle, not the load, so no GPU->CPU->GPU round-trip can
+        appear in the load cycle.
         """
         handler = _LedgerHandler(ledger, model=ledger_model)
         patcher = _make_ledger_patcher(handler)
@@ -485,10 +505,9 @@ class TestP1PatcherSingleH2D:
             e[1].type for e in load_cycle_1
             if e[0] == "to" and e[1] is not None
         ]
-        # Within the load cycle: no cpu move after a cuda move.
-        assert "cuda" in devices
-        assert "cpu" not in devices[devices.index("cuda"):], (
-            f"GPU->CPU->GPU round-trip detected in load cycle: {load_cycle_1}"
+        # D6: the load cycle contains NO patcher-owned device move.
+        assert "cuda" not in devices, (
+            f"patcher must not bulk-move during load: {load_cycle_1}"
         )
         # The warm offload itself moved the model off-GPU exactly once.
         offload_moves = [
@@ -505,11 +524,13 @@ class TestP1PatcherSingleH2D:
         with patch("comfy.model_patcher.ModelPatcher.patch_model") as mock_super:
             patcher.patch_model(device_to=None)
 
+        # D6: no cuda move from the patcher's own code.
         cuda_moves = [
             e for e in ledger
             if e[0] == "to" and e[1] is not None and e[1].type == "cuda"
         ]
-        assert len(cuda_moves) == 1
+        assert len(cuda_moves) == 0
+        # device_to=None falls back to load_device and is delegated to super.
         assert mock_super.call_args.kwargs["device_to"] == CUDA
 
 
@@ -637,20 +658,18 @@ class _TiedTinyModel(torch.nn.Module):
         return self.embed.weight.dtype
 
 
-class TestP3AssignDecision:
-    """DF-005 decision lock: assign=True is DEFERRED.
+class TestP3AssignWithRetie:
+    """DF-005 un-deferred (plan 2026-08-18, D2): assign=True + re-tie.
 
-    Rationale: with ``tie_word_embeddings=true`` the checkpoint omits
-    ``lm_head.weight``. Copy semantics preserves the tie (data is copied
-    into the shared parameter); ``assign=True`` replaces the embedding's
-    parameter object and silently breaks the tie unless ``tie_weights()``
-    is re-invoked after loading. Since the RAM-peak saving is an
-    optimization (not a correctness fix) and the re-tie path is untested
-    for the vendored models, assign=True stays deferred.
+    With ``tie_word_embeddings=true`` the checkpoint omits ``lm_head.weight``.
+    ``assign=True`` replaces the embedding's parameter object and breaks the
+    tie — so the loader re-invokes ``tie_weights()`` after loading (the same
+    mitigation transformers' ``from_pretrained`` applies). This eliminates the
+    copy pass and halves peak host RAM (RC-2).
     """
 
     def test_copy_semantics_preserves_tying(self):
-        """Current loader behavior: tying survives load_state_dict."""
+        """Documentation: copy semantics keeps tying (old behavior)."""
         model = _TiedTinyModel()
         sd = {"embed.weight": torch.ones(4, 4)}
         model.load_state_dict(sd, strict=False)  # copy semantics
@@ -658,7 +677,7 @@ class TestP3AssignDecision:
         assert torch.equal(model.lm_head.weight, torch.ones(4, 4))
 
     def test_assign_breaks_tying_without_retie(self):
-        """The risk that justifies deferring assign=True."""
+        """Documentation: the risk that assign=True alone would cause."""
         model = _TiedTinyModel()
         sd = {"embed.weight": torch.ones(4, 4)}
         model.load_state_dict(sd, strict=False, assign=True)
@@ -667,8 +686,8 @@ class TestP3AssignDecision:
         assert model.lm_head.weight.data_ptr() != model.embed.weight.data_ptr()
         assert not torch.equal(model.lm_head.weight, torch.ones(4, 4))
 
-    def test_loader_uses_copy_semantics(self, ledger):
-        """The production loader must NOT pass assign=True (deferred)."""
+    def test_loader_uses_assign_semantics(self, ledger):
+        """The production loader MUST pass assign=True (D2)."""
         with _patched_loader(_LedgerModel(ledger)), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
@@ -681,9 +700,32 @@ class TestP3AssignDecision:
         lsd_calls = [e for e in ledger if e[0] == "load_state_dict"]
         assert lsd_calls, "load_state_dict must be called"
         # entry format: ("load_state_dict", strict, assign)
-        assert all(e[2] is False for e in lsd_calls), (
-            "assign=True is deferred (DF-005) — tied weights would break"
+        assert all(e[2] is True for e in lsd_calls), (
+            "assign=True is required (D2) — eliminates the copy pass (RC-2)"
         )
+
+    def test_loader_reties_after_assign(self, ledger):
+        """The loader must re-invoke tie_weights() after assign load (D2)."""
+        ledger_model = _LedgerModel(ledger)
+        ledger_model.tie_weights = MagicMock()
+        # Config gate: tied
+        ledger_model.config = MagicMock()
+        ledger_model.config.decoder_config.tie_word_embeddings = True
+        ledger_model.config.tie_word_embeddings = False
+
+        with _patched_loader(ledger_model), \
+             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
+                   return_value=("fake.safetensors", False)), \
+             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
+            mock_ltf.return_value = {"w": torch.zeros(1)}
+            VibeVoiceLoader.load_model(
+                "TestModel", CUDA, attention_mode="sdpa", dtype_str="bf16"
+            )
+
+        ledger_model.tie_weights.assert_called_once()
+        # tie_weights must be called AFTER load_state_dict
+        lsd_idx = next(i for i, e in enumerate(ledger) if e[0] == "load_state_dict")
+        assert lsd_idx >= 0
 
 
 # ====================================================================

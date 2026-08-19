@@ -223,4 +223,5 @@ def tiny_patcher(tiny_handler):
     patcher.load_device = torch.device("cpu")
     patcher.offload_device = torch.device("cpu")
     patcher.model = tiny_handler
+    patcher.pinned = set()  # ModelPatcher.__del__ → unpin_all_weights() needs this
     return patcher

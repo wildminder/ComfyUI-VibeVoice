@@ -66,6 +66,51 @@ class TestVibeVoiceModelHandler:
         assert isinstance(handler, torch.nn.Module)
 
 
+class TestHandlerSizeRefinement:
+    """Plan 2026-08-18, Phase 6 (D7/RC-7): handler.size is refined from the
+    real parameters after load, replacing the config-based size_gb estimate."""
+
+    def test_handler_size_refined_after_load(self):
+        """After load_model, handler.size equals the real parameter byte total."""
+        handler = VibeVoiceModelHandler("VibeVoice-1.5B")
+        # Config-based estimate before load.
+        assert handler.size == int(3.0 * (1024**3))
+
+        # A tiny model with a known parameter byte total.
+        tiny = torch.nn.Linear(16, 16, bias=False)  # 16*16 = 256 floats
+        expected_bytes = 256 * tiny.weight.element_size()
+
+        with patch.object(VibeVoiceLoader, "load_model", return_value=(tiny, MagicMock())):
+            handler.load_model(torch.device("cpu"), attention_mode="sdpa")
+
+        assert handler.size == expected_bytes
+
+    def test_handler_size_kept_when_params_empty(self):
+        """If the model has no parameters, the config estimate is kept."""
+        handler = VibeVoiceModelHandler("VibeVoice-1.5B")
+        original_size = handler.size
+
+        empty = torch.nn.Module()  # no parameters
+
+        with patch.object(VibeVoiceLoader, "load_model", return_value=(empty, MagicMock())):
+            handler.load_model(torch.device("cpu"), attention_mode="sdpa")
+
+        assert handler.size == original_size
+
+    def test_handler_size_kept_on_exception(self):
+        """If parameter iteration raises, the config estimate is kept."""
+        handler = VibeVoiceModelHandler("VibeVoice-1.5B")
+        original_size = handler.size
+
+        broken = MagicMock()
+        broken.parameters.side_effect = RuntimeError("boom")
+
+        with patch.object(VibeVoiceLoader, "load_model", return_value=(broken, MagicMock())):
+            handler.load_model(torch.device("cpu"), attention_mode="sdpa")
+
+        assert handler.size == original_size
+
+
 class TestVibeVoiceLoaderResolvePaths:
     """Test VibeVoiceLoader._resolve_model_paths."""
 
@@ -371,7 +416,10 @@ class TestVibeVoiceLoaderLoadStateDict:
             mock_load.assert_called_once_with(
                 str(model_dir / "model.safetensors"), device=torch.device("cpu")
             )
-            model.load_state_dict.assert_called_once_with({"key": "value"}, strict=False)
+            # Plan 2026-08-18 D2: assign semantics via _apply_state_dict
+            model.load_state_dict.assert_called_once_with(
+                {"key": "value"}, strict=False, assign=True
+            )
             assert result == model
 
     def test_load_state_dict_standalone(self, tmp_path):
@@ -464,7 +512,59 @@ class TestVibeVoiceLoaderLoadStateDict:
                 device=torch.device("cpu"),
             )
 
-            model.load_state_dict.assert_called_once_with(mock_state_dict, strict=False)
+            # Plan 2026-08-18 D2: assign semantics via _apply_state_dict
+            model.load_state_dict.assert_called_once_with(
+                mock_state_dict, strict=False, assign=True
+            )
+
+    def test_state_dict_released_after_load(self, tmp_path):
+        """Plan 2026-08-18 D7/RC-4: the state dict container is freed after load.
+
+        With assign semantics the model owns the checkpoint tensors; the dict
+        that held them is dead weight and must be collectable once
+        ``_load_state_dict_into_model`` returns (no lingering reference).
+        """
+        import gc
+        import weakref
+
+        model_dir = tmp_path / "TestModel"
+        model_dir.mkdir()
+        (model_dir / "model.safetensors").write_text("dummy")
+
+        # A real module so assign=True genuinely takes ownership of the tensor.
+        class _OneParam(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.empty(2, 2))
+
+        # Plain dict cannot be weakref'd; a subclass with __weakref__ can.
+        class _WeakDict(dict):
+            __slots__ = ("__weakref__",)
+
+        model = _OneParam()
+        loaded_tensor = torch.ones(2, 2)
+        state_dict = _WeakDict({"w": loaded_tensor})
+        ref = weakref.ref(state_dict)
+
+        with patch(
+            "ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file",
+            return_value=state_dict,
+        ):
+            VibeVoiceLoader._load_state_dict_into_model(
+                model=model,
+                model_path=str(model_dir),
+                model_type="official",
+                model_info={},
+                device=torch.device("cpu"),
+            )
+
+        # Drop the test's own handle and collect.
+        del state_dict
+        gc.collect()
+
+        assert ref() is None, "state dict container must be freed after load"
+        # The model now owns the checkpoint tensor (assign semantics).
+        assert torch.equal(model.w.data, loaded_tensor)
 
 
 class TestCleanupOldModels:
@@ -666,10 +766,12 @@ class TestLoadModelOrchestration:
                  patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_processor",
                        side_effect=lambda tok, pp, is_streaming=False: (
                            ledger.append("processor"), fake_processor)[1]), \
-                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._instantiate_model",
-                       side_effect=lambda **kw: (ledger.append("instantiate"), fake_model)[1]), \
-                 patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_state_dict_into_model",
-                       side_effect=lambda **kw: (ledger.append("state_dict"), fake_model)[1]):
+                  patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._instantiate_model",
+                        side_effect=lambda **kw: (ledger.append("instantiate"), fake_model)[1]), \
+                  patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._load_state_dict_into_model",
+                        side_effect=lambda **kw: (ledger.append("state_dict"), fake_model)[1]), \
+                  patch("ComfyUI_VibeVoice.modules.loader.cast_model_to_dtype_if_needed",
+                        side_effect=lambda m, d: ledger.append("cast")):
                 model, processor = VibeVoiceLoader.load_model(
                     "TestModel", torch.device("cpu"), attention_mode="sdpa"
                 )
@@ -677,9 +779,9 @@ class TestLoadModelOrchestration:
             assert model is fake_model
             assert processor is fake_processor
             assert ledger == ["paths", "config", "tokenizer", "processor",
-                              "instantiate", "state_dict"]
-            # model moved to device+dtype, eval'd, cached
-            fake_model.to.assert_called()
+                              "instantiate", "state_dict", "cast"]
+            # Plan 2026-08-18 D4/RC-3: dtype applied via conditional cast
+            # helper (not an unconditional .to()), eval'd, cached
             fake_model.eval.assert_called_once()
             assert LOADED_MODELS_CACHE["TestModel_attn_sdpa_q4_0"] == (fake_model, fake_processor)
         finally:

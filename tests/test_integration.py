@@ -107,14 +107,20 @@ class TestFullPipelineMocked:
         LOADED_MODELS_CACHE.clear()
 
     def test_force_offload(self):
-        """Test that force_offload calls unpatch_model."""
+        """Test that force_offload calls unpatch_model.
+
+        Plan 2026-08-18 D5: the cold (user-requested) force-offload path is
+        destructive, so it must pass destroy=True.
+        """
         mock_patcher = MagicMock()
         mock_patcher.is_loaded = True
 
         with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
             force_offload_model(mock_patcher, "TestModel")
 
-            mock_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True)
+            mock_patcher.unpatch_model.assert_called_once_with(
+                unpatch_weights=True, destroy=True
+            )
 
     def test_multi_speaker(self):
         """Test multi-speaker generation with reference audio."""

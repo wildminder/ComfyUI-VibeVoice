@@ -638,13 +638,16 @@ class TestForceOffloadModel:
     """Test force_offload_model function."""
 
     def test_force_offload_calls_unpatch(self):
+        """Plan 2026-08-18 D5: the user-requested cold offload passes destroy=True."""
         mock_patcher = MagicMock()
         mock_patcher.is_loaded = True
 
         with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
             force_offload_model(mock_patcher, "TestModel")
 
-            mock_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True)
+            mock_patcher.unpatch_model.assert_called_once_with(
+                unpatch_weights=True, destroy=True
+            )
 
     def test_force_offload_skips_when_not_loaded(self):
         mock_patcher = MagicMock()

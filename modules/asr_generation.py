@@ -480,7 +480,10 @@ def force_offload_asr_model(model_name: str, patcher=None) -> None:
     logger.info(f"Force offloading VibeVoice ASR model '{model_name}' from VRAM...")
     if patcher is not None:
         if patcher.is_loaded:
-            patcher.unpatch_model(unpatch_weights=True)
+            # Plan 2026-08-18 D5: user-requested force offload keeps its
+            # destructive semantics via the explicit flag (the default
+            # unpatch_model is now non-destructive, RC-6).
+            patcher.unpatch_model(unpatch_weights=True, destroy=True)
         model_management.unload_all_models()
     else:
         # Legacy path (no patcher): clear the direct ASR cache.

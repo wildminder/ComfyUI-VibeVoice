@@ -28,6 +28,48 @@ class _FakeStreamingCfg:
 
 
 # ====================================================================
+# Phase 3 (plan 2026-08-18, D1): external instantiation is meta by default
+# ====================================================================
+class _TinyCtorModel(torch.nn.Module):
+    """Minimal config-ctor stand-in for the vendored model classes."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.lin = torch.nn.Linear(4, 4)
+
+
+class TestExternalInstantiationIsMeta:
+    """Contract: external instantiation builds under a meta context by default."""
+
+    def test_asr_instantiation_defaults_to_meta(self):
+        with patch.object(
+            external_loader, "VibeVoiceASRForConditionalGeneration", _TinyCtorModel
+        ):
+            model = external_loader._instantiate_asr_model(
+                config=MagicMock(),
+                attn_implementation="eager",
+                final_load_dtype=torch.bfloat16,
+            )
+        params = list(model.parameters())
+        assert params
+        assert all(p.is_meta for p in params), "ASR construction must be meta by default"
+
+    def test_asr_instantiation_use_meta_false_eager(self):
+        with patch.object(
+            external_loader, "VibeVoiceASRForConditionalGeneration", _TinyCtorModel
+        ):
+            model = external_loader._instantiate_asr_model(
+                config=MagicMock(),
+                attn_implementation="eager",
+                final_load_dtype=torch.bfloat16,
+                use_meta=False,
+            )
+        params = list(model.parameters())
+        assert params
+        assert all(not p.is_meta for p in params), "use_meta=False must be eager"
+
+
+# ====================================================================
 # Path resolution helpers
 # ====================================================================
 
@@ -202,8 +244,14 @@ class TestLoadExternalModel:
         result, _ = self._run(weight_file)
 
         assert isinstance(result, dict)
-        for key in ("state_dict", "config", "processor", "model", "model_name", "source_path", "is_streaming"):
+        for key in ("config", "processor", "model", "model_name", "source_path", "is_streaming"):
             assert key in result, f"Missing key: {key}"
+
+    def test_bundle_does_not_retain_state_dict(self, weight_file):
+        """Plan 2026-08-18 D7/RC-4: the bundle must NOT retain the state dict."""
+        result, _ = self._run(weight_file)
+        assert "state_dict" not in result, (
+            "bundle must not retain the state dict (dead RAM, RC-4)")
 
     def test_load_external_model_calls_load_torch_file_with_cpu(self, weight_file):
         """load_torch_file is called with device=cpu."""
@@ -227,14 +275,29 @@ class TestLoadExternalModel:
         assert args[0] is mocks["state_dict"]
         assert kwargs.get("strict") is False
 
-    def test_load_external_model_applies_dtype(self, weight_file):
-        """model.to(dtype=final_dtype) is called."""
-        _, mocks = self._run(weight_file, dtype_str="fp32")
+    def test_external_load_uses_assign_and_reties(self, weight_file):
+        """Plan 2026-08-18 D2: external path delegates to _apply_state_dict."""
+        with patch.object(
+            external_loader.VibeVoiceLoader, "_apply_state_dict",
+            return_value=([], []),
+        ) as m_apply:
+            self._run(weight_file)
 
-        fake_model = mocks["model"]
-        fake_model.to.assert_called()
-        dtype_calls = [c for c in fake_model.to.call_args_list if "dtype" in c[1]]
-        assert len(dtype_calls) > 0
+        m_apply.assert_called_once()
+        # The in-memory state dict is passed to the shared helper.
+        args, _ = m_apply.call_args
+        assert args[1] is not None  # state_dict argument present
+
+    def test_load_external_model_applies_dtype(self, weight_file):
+        """Plan 2026-08-18 D4/RC-3: conditional cast helper is invoked with the final dtype."""
+        with patch.object(
+            external_loader, "cast_model_to_dtype_if_needed"
+        ) as m_cast:
+            self._run(weight_file, dtype_str="fp32")
+
+        m_cast.assert_called_once()
+        args, _ = m_cast.call_args
+        assert args[1] == torch.float32
 
     def test_load_external_model_eval_mode(self, weight_file):
         """model.eval() is called."""
@@ -394,11 +457,15 @@ class TestLoadExternalASRModel:
         return result, mocks
 
     def test_asr_bundle_has_required_keys(self, weight_file):
-        """ASR bundle has all required keys plus is_asr=True."""
+        """ASR bundle has all required keys plus is_asr=True.
+
+        Plan 2026-08-18 D7/RC-4: the bundle no longer retains ``state_dict``.
+        """
         result, _ = self._run(weight_file)
         assert isinstance(result, dict)
-        for key in ("state_dict", "config", "processor", "model", "model_name", "source_path", "is_streaming", "is_asr"):
+        for key in ("config", "processor", "model", "model_name", "source_path", "is_streaming", "is_asr"):
             assert key in result, f"Missing key: {key}"
+        assert "state_dict" not in result, "bundle must not retain the state dict (RC-4)"
         assert result["is_asr"] is True
         assert result["is_streaming"] is False
 
@@ -431,11 +498,15 @@ class TestLoadExternalASRModel:
         assert kwargs.get("strict") is False
 
     def test_asr_applies_dtype(self, weight_file):
-        """ASR model.to(dtype=...) is called."""
-        _, mocks = self._run(weight_file, dtype_str="fp32")
-        fake_model = mocks["model"]
-        dtype_calls = [c for c in fake_model.to.call_args_list if "dtype" in c[1]]
-        assert len(dtype_calls) > 0
+        """Plan 2026-08-18 D4/RC-3: ASR branch uses the conditional cast helper."""
+        with patch.object(
+            external_loader, "cast_model_to_dtype_if_needed"
+        ) as m_cast:
+            self._run(weight_file, dtype_str="fp32")
+
+        m_cast.assert_called_once()
+        args, _ = m_cast.call_args
+        assert args[1] == torch.float32
 
     def test_asr_eval_mode(self, weight_file):
         """ASR model.eval() is called."""

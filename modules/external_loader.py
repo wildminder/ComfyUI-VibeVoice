@@ -20,6 +20,7 @@ Sidecar file convention (place next to the weight file):
 import os
 import json
 import logging
+import contextlib
 
 import torch
 
@@ -42,7 +43,7 @@ from .attention_utils import (
     get_attn_implementation_for_load,
     check_sage_attention_compatible,
 )
-from .dtype_utils import resolve_dtype
+from .dtype_utils import resolve_dtype, cast_model_to_dtype_if_needed
 
 if SAGE_ATTENTION_AVAILABLE:
     from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
@@ -298,20 +299,24 @@ def _instantiate_asr_model(
     config,
     attn_implementation: str,
     final_load_dtype: torch.dtype,
+    use_meta: bool = True,
 ):
     """Instantiate a :class:`VibeVoiceASRForConditionalGeneration` directly.
 
     ASR counterpart of :meth:`VibeVoiceLoader._instantiate_model`. Instantiates
-    the model class directly (no ``from_pretrained`` meta-device context) so the
-    state dict can be loaded in-memory afterwards.
+    the model class directly (bypassing ``from_pretrained``) so the state dict
+    can be loaded in-memory afterwards. By default construction runs under a
+    ``torch.device("meta")`` context (plan 2026-08-18, D1) — zero RAM, zero
+    random init; weights are bound afterwards by ``_apply_state_dict``.
 
     Args:
         config: VibeVoiceASRConfig instance.
         attn_implementation: Attention implementation string.
         final_load_dtype: torch.dtype for the model.
+        use_meta: Construct under a meta device context (default True).
 
     Returns:
-        Model instance (not yet loaded with weights).
+        Model instance (weights not yet loaded).
     """
     # Set attention implementation on the decoder config
     if hasattr(config, "decoder_config"):
@@ -322,7 +327,9 @@ def _instantiate_asr_model(
     if hasattr(config, "decoder_config"):
         config.decoder_config.torch_dtype = final_load_dtype
 
-    return VibeVoiceASRForConditionalGeneration(config)
+    ctx = torch.device("meta") if use_meta else contextlib.nullcontext()
+    with ctx:
+        return VibeVoiceASRForConditionalGeneration(config)
 
 
 # ====================================================================
@@ -547,6 +554,10 @@ def _load_state_dict_into_model_from_memory(model, state_dict: dict):
     state dict that is already in memory (loaded via
     ``comfy.utils.load_torch_file``) instead of resolving a checkpoint path.
 
+    Delegates to :meth:`VibeVoiceLoader._apply_state_dict` (plan 2026-08-18,
+    D2/D3): assign semantics (no copy pass), tied-weight re-tie, and
+    zero-materialization of meta stragglers.
+
     Args:
         model: Instantiated model (weights not yet loaded).
         state_dict: State dict mapping (on CPU).
@@ -554,22 +565,7 @@ def _load_state_dict_into_model_from_memory(model, state_dict: dict):
     Returns:
         The model with the state dict loaded (still on CPU).
     """
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-
-    if missing_keys:
-        logger.warning(f"Missing keys when loading external state dict: {len(missing_keys)} keys")
-        if len(missing_keys) < 20:
-            logger.warning(f"Missing keys: {missing_keys}")
-        else:
-            logger.warning(f"First 10 missing keys: {missing_keys[:10]}")
-
-    if unexpected_keys:
-        logger.warning(f"Unexpected keys when loading external state dict: {len(unexpected_keys)} keys")
-        if len(unexpected_keys) < 20:
-            logger.warning(f"Unexpected keys: {unexpected_keys}")
-        else:
-            logger.warning(f"First 10 unexpected keys: {unexpected_keys[:10]}")
-
+    VibeVoiceLoader._apply_state_dict(model, state_dict)
     return model
 
 
@@ -706,8 +702,13 @@ def load_external_vibevoice_model(
         # Step 8: Load the in-memory state dict into the model.
         model = _load_state_dict_into_model_from_memory(model, state_dict)
 
-        # Step 9: Apply the final dtype ON CPU (single H2D owned by patcher).
-        model = model.to(dtype=final_load_dtype)
+        # Free the state dict immediately — the model now owns the tensors
+        # (assign semantics), so the dict is dead weight (plan D7/RC-4).
+        del state_dict
+
+        # Step 9: Apply the final dtype ON CPU (single H2D owned by patcher) —
+        # only where needed (plan 2026-08-18, D4/RC-3).
+        cast_model_to_dtype_if_needed(model, final_load_dtype)
 
         # Step 10: Apply 4-bit quantization if requested (post-load).
         if quant_config is not None:
@@ -738,8 +739,10 @@ def load_external_vibevoice_model(
         )
 
         # Step 13: Assemble the bundle.
+        # NOTE (plan 2026-08-18, D7/RC-4): the state dict is intentionally NOT
+        # included — the model owns the tensors after assign-loading, and
+        # retaining a second ~model-size copy in the node output is dead RAM.
         return {
-            "state_dict": state_dict,
             "config": config,
             "processor": processor,
             "model": model,
@@ -863,8 +866,13 @@ def load_external_vibevoice_asr_model(
         # Step 7: Load the in-memory state dict into the model.
         model = _load_state_dict_into_model_from_memory(model, state_dict)
 
-        # Step 8: Apply the final dtype ON CPU (single H2D owned by patcher).
-        model = model.to(dtype=model_dtype)
+        # Free the state dict immediately — the model now owns the tensors
+        # (assign semantics), so the dict is dead weight (plan D7/RC-4).
+        del state_dict
+
+        # Step 8: Apply the final dtype ON CPU (single H2D owned by patcher) —
+        # only where needed (plan 2026-08-18, D4/RC-3).
+        cast_model_to_dtype_if_needed(model, model_dtype)
 
         # Step 9: Apply SageAttention post-load if requested.
         if attention_mode == "sage":
@@ -882,8 +890,10 @@ def load_external_vibevoice_asr_model(
         )
 
         # Step 11: Assemble the bundle.
+        # NOTE (plan 2026-08-18, D7/RC-4): the state dict is intentionally NOT
+        # included — the model owns the tensors after assign-loading, and
+        # retaining a second ~model-size copy in the node output is dead RAM.
         return {
-            "state_dict": state_dict,
             "config": config,
             "processor": processor,
             "model": model,

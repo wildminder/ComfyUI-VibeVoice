@@ -21,6 +21,8 @@ def _create_patcher(handler, attention_mode="sdpa", dtype=None):
     # Set attributes that ModelPatcher.__init__ would normally set
     patcher.load_device = torch.device("cpu")
     patcher.offload_device = torch.device("cpu")
+    patcher.pinned = set()
+    patcher.is_injected = False
     return patcher
 
 
@@ -103,7 +105,9 @@ class TestVibeVoicePatcherPatchModel:
             patcher.patch_model()
 
             handler.load_model.assert_called_once()
-            mock_inner_model.to.assert_called()
+            # Plan 2026-08-18 D6/RC-5: no bulk pre-move; the H2D transfer is
+            # owned by super().patch_model() -> ModelPatcher.load().
+            mock_inner_model.to.assert_not_called()
             # Verify super().patch_model() is called with load_weights=True (default)
             # so ComfyUI can properly track model_loaded_weight_memory
             call_kwargs = mock_super_patch.call_args.kwargs
@@ -124,10 +128,11 @@ class TestVibeVoicePatcherPatchModel:
             patcher.patch_model()
 
             handler.load_model.assert_not_called()
-            mock_inner_model.to.assert_called()
+            # Plan 2026-08-18 D6/RC-5: no bulk pre-move.
+            mock_inner_model.to.assert_not_called()
 
     def test_patch_model_with_device_to(self):
-        """When device_to is specified, model is moved to that device."""
+        """device_to is forwarded to super; no bulk pre-move happens here."""
         handler = MagicMock()
         handler.cache_key = "test_key"
         handler.model_pack_name = "TestModel"
@@ -143,7 +148,9 @@ class TestVibeVoicePatcherPatchModel:
             patcher.patch_model(device_to=target_device)
 
             handler.load_model.assert_not_called()
-            mock_inner_model.to.assert_called_with(target_device)
+            # Plan 2026-08-18 D6/RC-5: the move is delegated to super, not
+            # done as a bulk .to() here.
+            mock_inner_model.to.assert_not_called()
             mock_super_patch.assert_called_once()
             # Verify device_to is passed through to super
             call_kwargs = mock_super_patch.call_args.kwargs
@@ -187,7 +194,34 @@ class TestVibeVoicePatcherPatchModel:
 class TestVibeVoicePatcherUnpatchModel:
     """Test VibeVoicePatcher.unpatch_model."""
 
-    def test_unpatch_clears_model(self):
+    def test_unpatch_default_keeps_model(self):
+        """Plan 2026-08-18 D5/RC-6: the default offload is NON-destructive."""
+        from ComfyUI_VibeVoice.modules.loader import LOADED_MODELS_CACHE
+        LOADED_MODELS_CACHE.clear()
+        LOADED_MODELS_CACHE["test_key"] = ("model", "processor")
+
+        class FakeHandler:
+            def __init__(self):
+                self.cache_key = "test_key"
+                self.model_pack_name = "TestModel"
+                self.model = MagicMock()
+                self.model.model = MagicMock()
+                self.model.processor = MagicMock()
+
+        handler = FakeHandler()
+
+        patcher = _create_patcher(handler)
+        patcher.model = handler
+
+        with patch("comfy.model_patcher.ModelPatcher.unpatch_model"):
+            patcher.unpatch_model(unpatch_weights=True)
+
+            # Default offload keeps the model in RAM and the cache intact.
+            assert handler.model is not None
+            assert "test_key" in LOADED_MODELS_CACHE
+
+    def test_unpatch_destroy_clears_model(self):
+        """Plan 2026-08-18 D5: destroy=True keeps the old destructive path."""
         from ComfyUI_VibeVoice.modules.loader import LOADED_MODELS_CACHE
         LOADED_MODELS_CACHE.clear()
         LOADED_MODELS_CACHE["test_key"] = ("model", "processor")
@@ -207,9 +241,9 @@ class TestVibeVoicePatcherUnpatchModel:
         patcher.model = handler
 
         with patch("comfy.model_patcher.ModelPatcher.unpatch_model"):
-            patcher.unpatch_model(unpatch_weights=True)
+            patcher.unpatch_model(unpatch_weights=True, destroy=True)
 
-            # unpatch_model sets self.model.model = None and self.model.processor = None
+            # destroy=True sets self.model.model = None and self.model.processor = None
             # self.model is the handler, so handler.model (inner model) is set to None
             assert handler.model is None
             assert "test_key" not in LOADED_MODELS_CACHE
@@ -275,7 +309,9 @@ class TestVibeVoiceASRPatcher:
         patcher = self._build_asr_patcher(handler)
 
         with patch("comfy.model_patcher.ModelPatcher.unpatch_model"):
-            patcher.unpatch_model(unpatch_weights=True)
+            # Plan 2026-08-18 D5: cache eviction happens on the explicit
+            # destroy path (the default offload is non-destructive).
+            patcher.unpatch_model(unpatch_weights=True, destroy=True)
 
         assert "tiny" not in LOADED_ASR_MODELS_CACHE
         # TTS cache must remain untouched.

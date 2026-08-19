@@ -181,6 +181,46 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.3.0 - Fast Loading & ComfyUI-Conformant Model Management</strong></summary>
+
+### ⚡ Performance
+*   **Model loading no longer fills RAM before moving to VRAM.** Models are now
+    instantiated on the `meta` device (zero RAM) and weights are assigned directly from
+    the checkpoint (`load_state_dict(assign=True)`), eliminating the old
+    "allocate empty model on CPU → copy weights → cast dtype → bulk move to GPU" chain.
+    Loading a merged safetensors checkpoint now goes straight from disk to the target
+    device with a single managed transfer.
+*   **Redundant CPU passes removed.** The unconditional `model.to(dtype=...)` full-model
+    cast is replaced by a conditional per-parameter cast that skips entirely when the
+    model is already in the target dtype. The checkpoint `state_dict` is released
+    immediately after assignment instead of lingering in RAM.
+
+### 🔧 Changes
+*   `modules/loader.py`: meta-context instantiation (`_instantiate_model`, `use_meta`
+    escape hatch), assign-based weight loading (`_apply_state_dict` with `tie_weights()`
+    re-tie + meta-straggler materialization), conditional dtype cast, `del state_dict`,
+    and post-load size refinement (`_refine_size`).
+*   `modules/patcher.py`: **non-destructive offload contract** — the default
+    `unpatch_model` (ComfyUI-initiated) now keeps the model in CPU RAM so the next
+    `patch_model` is a pure host-to-device transfer instead of a disk reload;
+    `destroy=True` keeps the explicit full-free path and `warm=True` keeps the warm
+    re-attach path. The bulk `handler.model.to()` pre-move was removed from
+    `patch_model`; the single H2D transfer is owned by ComfyUI's `ModelPatcher.load()`.
+    `is_loaded` is now device-aware (a CPU-offloaded model is not "loaded for inference").
+*   `modules/external_loader.py` / `modules/asr_loader.py`: same meta-init, conditional
+    cast, state-dict release, and size refinement applied to the external and ASR paths.
+*   `modules/generation.py` / `modules/asr_generation.py`: user-requested force offload
+    routes through `destroy=True` (cold) while retaining the warm path.
+
+### 🧪 Tests
+*   `tests/test_meta_init_feasibility.py`, `tests/test_assign_loading.py`,
+    `tests/test_offload_contract.py`: new suites covering meta-init for all three model
+    classes, assign-based loading + re-tying, and the routine/destroy/warm offload
+    contract. Full suite: 770 passed / 5 pre-existing failures / 4 skipped.
+
+</details>
+
+<details>
 <summary><strong>v2.2.3 - Guard Empty Generation + Low-Bit Quant Warnings</strong></summary>
 
 ### 🐛 Fixes

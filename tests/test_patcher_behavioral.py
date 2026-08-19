@@ -55,9 +55,10 @@ class TestPatchMovesToLoadDevice:
 
 
 class TestUnpatchNullsAndClearsCache:
-    """unpatch_model must null the model and clear its cache entry."""
+    """Plan 2026-08-18 D5/RC-6: the default offload is non-destructive;
+    destroy=True keeps the old null-and-clear behavior."""
 
-    def test_unpatch_nulls_and_clears_cache(self, tiny_patcher):
+    def test_unpatch_default_keeps_model_and_cache(self, tiny_patcher):
         from ComfyUI_VibeVoice.modules.loader import LOADED_MODELS_CACHE
 
         LOADED_MODELS_CACHE.clear()
@@ -69,6 +70,24 @@ class TestUnpatchNullsAndClearsCache:
 
         with _super_unpatch():
             tiny_patcher.unpatch_model(unpatch_weights=True)
+
+        # Non-destructive default: model stays in RAM, cache entry preserved.
+        assert tiny_patcher.model.model is not None
+        assert "tiny" in LOADED_MODELS_CACHE
+        LOADED_MODELS_CACHE.clear()
+
+    def test_unpatch_destroy_nulls_and_clears_cache(self, tiny_patcher):
+        from ComfyUI_VibeVoice.modules.loader import LOADED_MODELS_CACHE
+
+        LOADED_MODELS_CACHE.clear()
+        LOADED_MODELS_CACHE["tiny"] = ("model", "processor")
+
+        with _super_patch():
+            tiny_patcher.patch_model()
+        assert tiny_patcher.is_loaded is True
+
+        with _super_unpatch():
+            tiny_patcher.unpatch_model(unpatch_weights=True, destroy=True)
 
         assert tiny_patcher.is_loaded is False
         assert "tiny" not in LOADED_MODELS_CACHE

@@ -14,6 +14,7 @@ import json
 import gc
 import shutil
 import logging
+import contextlib
 import torch
 
 import comfy.utils
@@ -40,7 +41,7 @@ from .attention_utils import (
     get_attn_implementation_for_load,
     check_sage_attention_compatible,
 )
-from .dtype_utils import resolve_dtype, get_dtype_str
+from .dtype_utils import resolve_dtype, get_dtype_str, cast_model_to_dtype_if_needed
 
 if SAGE_ATTENTION_AVAILABLE:
     from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
@@ -72,8 +73,10 @@ def cleanup_old_models(keep_cache_key: str = None) -> None:
             try:
                 patcher = VIBEVOICE_PATCHER_CACHE[key]
                 if hasattr(patcher, 'model') and patcher.model:
-                    patcher.model.model = None
-                    patcher.model.processor = None
+                    # Plan 2026-08-18 D5: eviction is an explicit destructive
+                    # free — route it through the patcher's destroy path instead
+                    # of poking handler attributes by hand.
+                    patcher.unpatch_model(unpatch_weights=True, destroy=True)
                 del VIBEVOICE_PATCHER_CACHE[key]
             except Exception as e:
                 logger.warning(f"Error cleaning up patcher {key}: {e}")
@@ -137,6 +140,27 @@ class VibeVoiceModelHandler(torch.nn.Module):
             use_llm_4bit=self.use_llm_4bit,
             dtype_str=self.dtype_str,
         )
+        # Plan 2026-08-18, Phase 6 (D7/RC-7): refine the size estimate from
+        # the real parameters now that the model is loaded. The __init__
+        # estimate is config-based (size_gb) and can be inaccurate for
+        # quantized / merged / GGUF checkpoints.
+        self._refine_size()
+
+    def _refine_size(self) -> None:
+        """Refine ``self.size`` from the real parameters after a load.
+
+        Only overwrites when a positive byte total can be computed; otherwise
+        the config-based estimate from ``__init__`` is kept.
+        """
+        try:
+            total = sum(
+                p.numel() * p.element_size() for p in self.model.parameters()
+            )
+            if total > 0:
+                self.size = total
+        except Exception:
+            # Keep the config-based estimate if the size cannot be computed.
+            pass
 
 
 class VibeVoiceLoader(BaseVibeVoiceLoader):
@@ -339,22 +363,31 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         is_streaming: bool,
         attn_implementation: str,
         final_load_dtype: torch.dtype,
+        use_meta: bool = True,
     ):
-        """Instantiate model class directly, bypassing from_pretrained() meta device init.
+        """Instantiate the model class directly, bypassing from_pretrained().
 
-        Transformers 5.x from_pretrained() unconditionally uses torch.device("meta")
-        as an init context, which causes DPMSolverMultistepScheduler and other
-        non-parameter tensor operations in __init__ to fail. By instantiating
-        the model class directly, we avoid the meta device context entirely.
+        Fast-load contract (plan 2026-08-18, D1 — RC-1 elimination): by
+        default the construction runs inside a ``torch.device("meta")``
+        context, so every parameter/buffer allocation is virtual — zero RAM
+        and zero random-init CPU work. The vendored models are meta-safe:
+        the DPM scheduler computes its tables with numpy, and the
+        ``.to(dtype)`` calls in ``__init__`` are guarded by ``is_meta``
+        checks (verified by tests/test_meta_init_feasibility.py). Weights
+        are bound afterwards by ``_apply_state_dict`` (assign semantics).
+
+        ``use_meta=False`` is the escape hatch that restores the previous
+        eager (random-init) construction.
 
         Args:
             config: VibeVoiceConfig or VibeVoiceStreamingConfig instance.
             is_streaming: If True, use streaming model class.
             attn_implementation: Attention implementation string.
             final_load_dtype: torch.dtype for the model.
+            use_meta: Construct under a meta device context (default True).
 
         Returns:
-            Model instance (not yet loaded with weights).
+            Model instance (weights not yet loaded).
         """
         # Set attention implementation on the decoder config
         if hasattr(config, 'decoder_config'):
@@ -365,11 +398,13 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         if hasattr(config, 'decoder_config'):
             config.decoder_config.torch_dtype = final_load_dtype
 
-        # Instantiate directly — no meta device context
-        if is_streaming:
-            model = VibeVoiceStreamingForConditionalGenerationInference(config)
-        else:
-            model = VibeVoiceForConditionalGeneration(config)
+        # Instantiate directly — meta context by default (zero alloc, zero RNG)
+        ctx = torch.device("meta") if use_meta else contextlib.nullcontext()
+        with ctx:
+            if is_streaming:
+                model = VibeVoiceStreamingForConditionalGenerationInference(config)
+            else:
+                model = VibeVoiceForConditionalGeneration(config)
 
         return model
 
@@ -459,6 +494,67 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         return BaseVibeVoiceLoader.load_state_dict_sharded(model_dir, device)
 
     @staticmethod
+    def _apply_state_dict(model, state_dict):
+        """Load a state dict into the model with assign semantics.
+
+        Fast-load contract (plan 2026-08-18, D2/D3 — un-defers DF-005):
+
+        1. ``load_state_dict(..., strict=False, assign=True)`` — checkpoint
+           tensors REPLACE the (meta or random) parameter objects directly;
+           no copy pass, no extra host RAM.
+        2. Re-tie weights. ``assign=True`` breaks tied pairs (the checkpoint
+           omits ``lm_head.weight``), so ``tie_weights()`` is re-invoked —
+           the same mitigation transformers' ``from_pretrained`` applies.
+        3. Materialize any parameter still on meta (checkpoint omitted the
+           key) with zeros, mirroring ComfyUI's ``_zero_init_parameter``.
+
+        Args:
+            model: Instantiated model (meta- or eager-initialized).
+            state_dict: Checkpoint state dict (CPU tensors).
+
+        Returns:
+            Tuple of (missing_keys, unexpected_keys).
+        """
+        missing_keys, unexpected_keys = model.load_state_dict(
+            state_dict, strict=False, assign=True
+        )
+
+        # Re-tie weights broken by assign=True (e.g. lm_head.weight <->
+        # embed_tokens.weight). Standard/ASR models gate on
+        # decoder_config.tie_word_embeddings; streaming gates on the
+        # top-level config flag — check both, and let each model's own
+        # tie_weights() apply its internal guard.
+        config = getattr(model, "config", None)
+        if config is not None and hasattr(model, "tie_weights"):
+            decoder_config = getattr(config, "decoder_config", None)
+            tied = bool(getattr(decoder_config, "tie_word_embeddings", False)) or \
+                bool(getattr(config, "tie_word_embeddings", False))
+            if tied:
+                model.tie_weights()
+
+        # Materialize meta parameters the checkpoint did not cover (D3).
+        for name, param in list(model.named_parameters()):
+            if param.is_meta:
+                param_new = torch.zeros(param.shape, dtype=param.dtype, device="cpu")
+                comfy.utils.set_attr_param(model, name, param_new)
+
+        if missing_keys:
+            logger.warning(f"Missing keys when loading state dict: {len(missing_keys)} keys")
+            if len(missing_keys) < 20:
+                logger.warning(f"Missing keys: {missing_keys}")
+            else:
+                logger.warning(f"First 10 missing keys: {missing_keys[:10]}")
+
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
+            if len(unexpected_keys) < 20:
+                logger.warning(f"Unexpected keys: {unexpected_keys}")
+            else:
+                logger.warning(f"First 10 unexpected keys: {unexpected_keys[:10]}")
+
+        return missing_keys, unexpected_keys
+
+    @staticmethod
     def _load_state_dict_into_model(
         model,
         model_path: str,
@@ -508,23 +604,15 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             logger.info(f"Loading state dict from: {ckpt_path}")
             state_dict = comfy.utils.load_torch_file(ckpt_path, device=cpu_device)
 
-        # Load state dict with strict=False to handle any missing/unexpected keys
-        # (e.g., tied weights, quantized layers)
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        # Assign-based load (D2/D3): checkpoint tensors replace the meta/random
+        # parameter objects directly (no copy pass), tied weights are re-tied,
+        # and any meta stragglers are zero-materialized. strict=False handles
+        # missing/unexpected keys (e.g., tied weights, quantized layers).
+        VibeVoiceLoader._apply_state_dict(model, state_dict)
 
-        if missing_keys:
-            logger.warning(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-            if len(missing_keys) < 20:
-                logger.warning(f"Missing keys: {missing_keys}")
-            else:
-                logger.warning(f"First 10 missing keys: {missing_keys[:10]}")
-
-        if unexpected_keys:
-            logger.warning(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-            if len(unexpected_keys) < 20:
-                logger.warning(f"Unexpected keys: {unexpected_keys}")
-            else:
-                logger.warning(f"First 10 unexpected keys: {unexpected_keys[:10]}")
+        # Free the state dict immediately — the model now owns the tensors
+        # (assign semantics), so the dict is dead weight (plan D7/RC-4).
+        del state_dict
 
         return model
 
@@ -637,12 +725,13 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 device=load_device,
             )
 
-            # Step 3: Apply the final dtype ON CPU (DF-002/DF-003 fix).
-            # The model leaves the loader on CPU; the single host-to-device
-            # transfer is owned by VibeVoicePatcher.patch_model after
-            # ComfyUI's VRAM arbitration. Casting here (on CPU) avoids a
-            # redundant GPU-side cast later.
-            model = model.to(dtype=final_load_dtype)
+            # Step 3: Apply the final dtype ON CPU (DF-002/DF-003 fix) — but
+            # only where needed (plan 2026-08-18, D4/RC-3). The model leaves
+            # the loader on CPU; the single host-to-device transfer is owned
+            # by VibeVoicePatcher.patch_model after ComfyUI's VRAM
+            # arbitration. The conditional helper skips the pass entirely
+            # when the checkpoint dtype already matches the target.
+            cast_model_to_dtype_if_needed(model, final_load_dtype)
 
             # Step 4: Apply 4-bit quantization if requested (post-load)
             if quant_config is not None:

@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-VibeVoice"
 description = "VibeVoice TTS. Expressive, long-form, multi-speaker conversational audio"
-version = "2.2.3"
+version = "2.3.0"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = ["torch", "torchaudio", "numpy", "huggingface_hub", "einops", "tokenizers", "soundfile", "s3tokenizer", "tqdm", "conformer", "safetensors", "transformers>=4.51.3", "diffusers", "bitsandbytes"]
