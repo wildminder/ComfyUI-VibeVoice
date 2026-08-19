@@ -50,6 +50,25 @@ from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
+# Sentinel buffer values that must be restored to their intended initial state
+# after meta-init materialization (regression fix, v2.3.1). The VibeVoice model
+# registers ``speech_scaling_factor`` / ``speech_bias_factor`` as
+# ``torch.tensor(float('nan'))`` and computes them at inference time
+# (modeling_vibevoice.py:324-338). The diffusion-inversion gate at
+# modeling_vibevoice.py:623 is ``if not torch.isnan(sf) and not torch.isnan(bf)``
+# — zeroing these buffers makes the gate TRUE and applies ``speech / 0 - 0``,
+# producing silent/garbage output. ``fix_std`` (persistent=False) is likewise
+# restored to its config value (default 0.5 for the acoustic tokenizer).
+#
+# Keys are matched by the buffer's FINAL dotted component (e.g.
+# ``speech_scaling_factor`` matches ``model.speech_scaling_factor``), so the
+# lookup is robust to submodule nesting.
+_SENTINEL_BUFFER_VALUES = {
+    "speech_scaling_factor": float("nan"),
+    "speech_bias_factor": float("nan"),
+    "fix_std": 0.5,
+}
+
 # Cache for loaded (model, processor) tuples, keyed by cache_key
 LOADED_MODELS_CACHE = {}
 
@@ -542,9 +561,26 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # were created on meta during instantiation but are not in the
         # checkpoint state dict. Without this, ComfyUI's unpatch_model →
         # model.to(device_to) raises NotImplementedError on meta buffers.
+        #
+        # Regression fix (v2.3.1): some buffers are SENTINELS that must NOT be
+        # zero. speech_scaling_factor / speech_bias_factor are registered as
+        # float('nan') and computed at inference time; the diffusion-inversion
+        # gate (modeling_vibevoice.py:623) is ``if not torch.isnan(sf) and not
+        # torch.isnan(bf)`` — zeroing them makes the gate TRUE and applies
+        # ``speech / 0 - 0`` → silent output. fix_std (persistent=False) is
+        # restored to its config value. See _SENTINEL_BUFFER_VALUES.
         for name, buf in list(model.named_buffers()):
             if buf.is_meta:
-                buf_new = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+                # Match by the buffer's final dotted component (robust to
+                # submodule nesting, e.g. "model.speech_scaling_factor").
+                leaf = name.split(".")[-1]
+                if leaf in _SENTINEL_BUFFER_VALUES:
+                    val = _SENTINEL_BUFFER_VALUES[leaf]
+                    buf_new = torch.tensor(
+                        val, dtype=buf.dtype, device="cpu"
+                    ).reshape(buf.shape)
+                else:
+                    buf_new = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
                 comfy.utils.set_attr(model, name, buf_new)
 
         if missing_keys:

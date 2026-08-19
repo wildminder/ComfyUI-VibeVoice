@@ -181,6 +181,24 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.3.1 - Fix Silent Output (Sentinel Buffer Regression)</strong></summary>
+
+### 🐛 Bug Fixes
+*   **Silent / empty audio output after the v2.3.0 fast-loading change.** The v2.3.0 hotfix
+    (commit `6b99be9`) materialized *all* meta buffers with zeros after `assign` loading. This
+    incorrectly zeroed the `speech_scaling_factor` / `speech_bias_factor` sentinel buffers, which
+    the model registers as `float('nan')` and computes at inference time. The diffusion-inversion
+    gate (`modeling_vibevoice.py:623`, `if not torch.isnan(sf) and not torch.isnan(bf)`) then
+    evaluated `True` and applied `speech / 0 - 0`, producing a silent 2-second file. Both default
+    and GGUF models were affected.
+*   **Fix:** `_apply_state_dict` now restores known sentinel buffers to their intended initial
+    values (`speech_scaling_factor` / `speech_bias_factor` → `nan`, `fix_std` → config value)
+    instead of zeroing them. Ordinary meta buffers (e.g. `position_ids`) are still zeroed.
+    Covered by `tests/test_assign_loading.py::TestSentinelBufferRegression`.
+
+</details>
+
+<details open>
 <summary><strong>v2.3.0 - Fast Loading & ComfyUI-Conformant Model Management</strong></summary>
 
 ### ⚡ Performance

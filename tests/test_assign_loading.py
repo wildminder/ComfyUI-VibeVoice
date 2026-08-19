@@ -158,3 +158,65 @@ class TestApplyStateDict:
         # All parameters AND buffers must be off meta.
         assert not any(p.is_meta for p in model.parameters())
         assert not any(b.is_meta for b in model.buffers())
+
+
+class TestSentinelBufferRegression:
+    """v2.3.1: meta-init must not zero sentinel buffers (silent-output bug).
+
+    The VibeVoice model registers ``speech_scaling_factor`` /
+    ``speech_bias_factor`` as ``float('nan')`` and computes them at inference
+    time. The diffusion-inversion gate (modeling_vibevoice.py:623) is
+    ``if not torch.isnan(sf) and not torch.isnan(bf)``. Zeroing these buffers
+    makes the gate TRUE and applies ``speech / 0 - 0`` → silent output. The
+    hotfix in 6b99be9 zero-materialized ALL meta buffers, which regressed this.
+    """
+
+    def test_sentinel_buffers_restored_to_nan(self):
+        """speech_scaling_factor / speech_bias_factor stay nan after meta load."""
+        class _SentinelModel(_UntiedTinyModel):
+            def __init__(self, vocab=4, dim=4):
+                super().__init__(vocab, dim)
+                self.register_buffer("speech_scaling_factor", torch.tensor(float("nan")))
+                self.register_buffer("speech_bias_factor", torch.tensor(float("nan")))
+
+        with torch.device("meta"):
+            model = _SentinelModel()
+        # Buffers are on meta after meta-init.
+        assert model.speech_scaling_factor.is_meta
+        assert model.speech_bias_factor.is_meta
+        sd = {"embed.weight": torch.ones(4, 4), "lm_head.weight": torch.ones(4, 4)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        # They must be restored to nan (NOT zero) so the isnan gate works.
+        assert not model.speech_scaling_factor.is_meta
+        assert not model.speech_bias_factor.is_meta
+        assert torch.isnan(model.speech_scaling_factor).item()
+        assert torch.isnan(model.speech_bias_factor).item()
+
+    def test_fix_std_sentinel_restored_to_config_value(self):
+        """fix_std (persistent=False) is restored to its config value (0.5)."""
+        class _FixStdModel(_UntiedTinyModel):
+            def __init__(self, vocab=4, dim=4):
+                super().__init__(vocab, dim)
+                self.register_buffer("fix_std", torch.tensor(0.5), persistent=False)
+
+        with torch.device("meta"):
+            model = _FixStdModel()
+        assert model.fix_std.is_meta
+        sd = {"embed.weight": torch.ones(4, 4), "lm_head.weight": torch.ones(4, 4)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        assert not model.fix_std.is_meta
+        assert model.fix_std.item() == 0.5
+
+    def test_non_sentinel_buffer_still_zeroed(self):
+        """Ordinary meta buffers (e.g. position_ids) are still zeroed."""
+        class _PlainBufferModel(_UntiedTinyModel):
+            def __init__(self, vocab=4, dim=4):
+                super().__init__(vocab, dim)
+                self.register_buffer("position_ids", torch.arange(vocab))
+
+        with torch.device("meta"):
+            model = _PlainBufferModel()
+        sd = {"embed.weight": torch.ones(4, 4), "lm_head.weight": torch.ones(4, 4)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        assert not model.position_ids.is_meta
+        assert torch.equal(model.position_ids, torch.zeros(4))
