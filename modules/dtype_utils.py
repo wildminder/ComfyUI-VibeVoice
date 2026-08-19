@@ -100,3 +100,41 @@ def cast_model_to_dtype(model, dtype: torch.dtype) -> None:
         return
     model.to(dtype=dtype)
     logger.debug(f"Model cast to dtype: {dtype}")
+
+
+def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
+    """Cast a model to ``dtype`` only when some parameter mismatches (D4).
+
+    Replaces the unconditional full-model ``.to(dtype)`` (RC-3). Walks the
+    parameters once; if every parameter already has the target dtype the
+    function returns without touching the model. Otherwise it casts ONLY the
+    mismatched parameters in place, then re-ties weights if the config marks
+    them as tied (casting one member of a tied pair un-shares it).
+
+    Args:
+        model: A torch.nn.Module to cast.
+        dtype: Target torch.dtype. ``None`` is a no-op.
+    """
+    if dtype is None:
+        return
+
+    # Fast path: nothing to cast.
+    if all(p.dtype == dtype for p in model.parameters()):
+        return
+
+    # Cast only mismatched parameters in place.
+    for _, param in model.named_parameters():
+        if param.dtype != dtype:
+            param.data = param.data.to(dtype)
+
+    # Re-tie if the config marks weights as tied (a cast of one member of a
+    # tied pair replaces its storage and breaks the sharing).
+    config = getattr(model, "config", None)
+    if config is not None and hasattr(model, "tie_weights"):
+        decoder_config = getattr(config, "decoder_config", None)
+        tied = bool(getattr(decoder_config, "tie_word_embeddings", False)) or \
+            bool(getattr(config, "tie_word_embeddings", False))
+        if tied:
+            model.tie_weights()
+
+    logger.debug(f"Model cast to dtype (mismatched params only): {dtype}")

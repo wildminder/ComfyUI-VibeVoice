@@ -47,14 +47,31 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
 
     @property
     def is_loaded(self) -> bool:
-        """Check if the model's core components are loaded."""
-        return (
+        """Check if the model's core components are loaded AND on the load device.
+
+        Plan 2026-08-18, Step 5.3: a CPU-offloaded model is "loaded in RAM"
+        but not "loaded for inference". The device check ensures is_loaded
+        reflects actual inference-readiness.
+        """
+        if not (
             hasattr(self, 'model')
             and self.model is not None
             and hasattr(self.model, 'model')
             and self.model.model is not None
-            and not getattr(self, '_warm_offloaded', False)
-        )
+        ):
+            return False
+        if getattr(self, '_warm_offloaded', False):
+            return False
+        # Device awareness: the heavy model must be on the load device.
+        try:
+            model_device = next(self.model.model.parameters()).device
+            if not isinstance(model_device, torch.device):
+                # Can't determine device (e.g., MagicMock in tests) —
+                # fall back to pre-5.3 behavior (loaded if refs exist).
+                return True
+            return model_device == self.load_device
+        except (StopIteration, AttributeError, TypeError):
+            return True
 
     def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True, force_patch_weights=False, *args, **kwargs):
         """Called by ComfyUI's model manager to load the model onto the GPU.
@@ -89,9 +106,13 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
             logger.info(f"Attention Mode: {mode_names.get(self.attention_mode, self.attention_mode)}")
             self.model.load_model(target_device, self.attention_mode)
 
-        # Move model to target device before super().patch_model() so that
-        # ComfyUI's load() can properly track model_loaded_weight_memory
-        self.model.model.to(target_device)
+        # Plan 2026-08-18, D6/RC-5: NO bulk pre-move here. The single
+        # host-to-device transfer is owned by super().patch_model() →
+        # ModelPatcher.load(), which moves modules per-module (size-sorted,
+        # with pinning/streams) and correctly tracks
+        # model_loaded_weight_memory + supports lowvram partial loading.
+        # A bulk self.model.model.to(target_device) duplicated that transfer
+        # as one blocking, unpinned copy and defeated partial loading.
 
         # Apply dtype casting ONLY if the model's dtype differs from the
         # target (DF-004 fix). The loader now applies the final dtype on CPU
@@ -121,16 +142,19 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
             *args, **kwargs
         )
 
-    def unpatch_model(self, device_to=None, unpatch_weights=True, warm: bool = False, *args, **kwargs):
+    def unpatch_model(self, device_to=None, unpatch_weights=True, warm: bool = False,
+                      destroy: bool = False, *args, **kwargs):
         """Called by ComfyUI's model manager to offload the model.
 
-        Clears the model reference and cache to allow garbage collection.
+        Plan 2026-08-18, D5/RC-6 — the offload contract is now NON-DESTRUCTIVE
+        by default, matching ComfyUI's own ``ModelPatcher.unpatch_model`` which
+        *moves* weights to the offload device and never destroys them:
 
-        When ``warm`` is True, the model/processor tensors are *retained* on the
-        intermediate device instead of being nulled and the cache dropped. A
-        subsequent ``patch_model`` then re-attaches them without re-instantiating
-        or reloading weights from disk — the NTH-004 "warm re-attach" optimization
-        that makes repeated force-offload + re-run cycles fast.
+        | warm  | destroy | behavior |
+        |-------|---------|----------|
+        | False | False   | **Default (ComfyUI-initiated):** keep ``handler.model`` + caches; ``super().unpatch_model(device_to, unpatch_weights=True)`` moves the whole handler tree to ``device_to`` (CPU). A later ``patch_model`` is a pure H2D transfer — no disk reload. |
+        | True  | False   | Warm path (NTH-004): move to the intermediate device, keep refs, ``super(..., unpatch_weights=False)``. |
+        | False | True    | Destructive path: ``handler.model=None``, ``processor=None``, evict cache, ``gc.collect()``, ``soft_empty_cache()``. Only for explicit user-requested full free. |
         """
         if unpatch_weights:
             if warm and self.model is not None and self.model.model is not None:
@@ -149,21 +173,34 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                 # release the GPU slot without freeing the retained weights.
                 return super().unpatch_model(device_to, unpatch_weights=False, *args, **kwargs)
 
-            # Cold offload (default): null references and clear cache.
+            if destroy:
+                # Destructive offload (explicit): null references and clear cache.
+                logger.info(
+                    f"Destroying VibeVoice models for '{self.model.model_pack_name}' "
+                    f"({self.attention_mode}) (weights freed)..."
+                )
+                self.model.model = None
+                self.model.processor = None
+
+                cache = self._model_cache
+                if self.cache_key in cache:
+                    del cache[self.cache_key]
+                    logger.info(f"Cleared model cache for: {self.cache_key}")
+
+                gc.collect()
+                model_management.soft_empty_cache()
+                return super().unpatch_model(device_to, unpatch_weights, *args, **kwargs)
+
+            # Routine offload (default, RC-6 fix): keep the model in CPU RAM.
+            # super().unpatch_model(device_to, unpatch_weights=True) moves the
+            # whole handler tree (including the heavy model submodule) to
+            # device_to and resets model_loaded_weight_memory. The next
+            # patch_model() is then a pure host-to-device transfer.
+            self._warm_offloaded = False
             logger.info(
                 f"Offloading VibeVoice models for '{self.model.model_pack_name}' "
-                f"({self.attention_mode}) to {device_to}..."
+                f"({self.attention_mode}) to {device_to} (weights kept in RAM)..."
             )
-            self.model.model = None
-            self.model.processor = None
-
-            cache = self._model_cache
-            if self.cache_key in cache:
-                del cache[self.cache_key]
-                logger.info(f"Cleared model cache for: {self.cache_key}")
-
-            gc.collect()
-            model_management.soft_empty_cache()
 
         return super().unpatch_model(device_to, unpatch_weights, *args, **kwargs)
 

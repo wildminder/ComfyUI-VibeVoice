@@ -672,7 +672,10 @@ def force_offload_model(patcher: VibeVoicePatcher, model_name: str, warm: bool =
         if warm:
             patcher.unpatch_model(unpatch_weights=True, warm=True)
         else:
-            patcher.unpatch_model(unpatch_weights=True)
+            # Plan 2026-08-18 D5: the user-requested cold offload keeps its
+            # destructive semantics via the explicit flag (the default
+            # unpatch_model is now non-destructive, RC-6).
+            patcher.unpatch_model(unpatch_weights=True, destroy=True)
     model_management.unload_all_models()
     gc.collect()
     model_management.soft_empty_cache()

@@ -13,6 +13,7 @@ from ComfyUI_VibeVoice.modules.dtype_utils import (
     resolve_dtype,
     get_dtype_str,
     cast_model_to_dtype,
+    cast_model_to_dtype_if_needed,
 )
 
 
@@ -120,3 +121,86 @@ class TestCastModelToDtype:
         model = MagicMock()
         cast_model_to_dtype(model, None)
         model.to.assert_not_called()
+
+
+# ====================================================================
+# Plan 2026-08-18, D4/RC-3: conditional cast (skip when already matching)
+# ====================================================================
+class _TinyModel(torch.nn.Module):
+    """Minimal real module for cast tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(4, 4)
+        self.b = torch.nn.Linear(4, 4)
+
+
+class _TiedModel(torch.nn.Module):
+    """Module with tied input/output embeddings and a tie_weights() hook."""
+
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(8, 4)
+        self.lm_head = torch.nn.Linear(4, 8, bias=False)
+        self.config = MagicMock()
+        self.config.tie_word_embeddings = True
+        self.config.decoder_config = None
+        self.tie_weights()
+
+    def tie_weights(self):
+        self.lm_head.weight = self.embed.weight
+
+
+class TestCastModelToDtypeIfNeeded:
+    """Test cast_model_to_dtype_if_needed (plan 2026-08-18, D4/RC-3)."""
+
+    def test_cast_skipped_when_all_match(self):
+        """All params already at target dtype → fast path, no tensor replaced.
+
+        The contract is storage stability: every parameter keeps its exact
+        data_ptr (no cast pass ran, no new tensors allocated — RC-3).
+        """
+        model = _TinyModel().to(torch.bfloat16)
+        ptrs_before = {n: p.data_ptr() for n, p in model.named_parameters()}
+
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        ptrs_after = {n: p.data_ptr() for n, p in model.named_parameters()}
+        assert ptrs_after == ptrs_before, "fast path must not replace any storage"
+        assert all(p.dtype == torch.bfloat16 for p in model.parameters())
+
+    def test_cast_only_mismatched_params(self):
+        """Mixed dtypes → only mismatched params are cast, others untouched."""
+        model = _TinyModel()
+        model.a = model.a.to(torch.bfloat16)  # a: bf16, b: fp32
+        ptr_b_before = model.b.weight.data_ptr()
+
+        ptr_a_before = model.a.weight.data_ptr()
+
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        assert model.a.weight.dtype == torch.bfloat16
+        assert model.b.weight.dtype == torch.bfloat16
+        # The already-matching param must keep its original storage.
+        assert model.a.weight.data_ptr() == ptr_a_before
+        # The mismatched param was replaced with a new cast tensor.
+        assert model.b.weight.data_ptr() != ptr_b_before
+
+    def test_cast_preserves_tying(self):
+        """Casting a tied model re-ties the pair (shared data_ptr after cast)."""
+        model = _TiedModel()  # fp32
+        assert model.lm_head.weight.data_ptr() == model.embed.weight.data_ptr()
+
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        assert model.embed.weight.dtype == torch.bfloat16
+        assert model.lm_head.weight.dtype == torch.bfloat16
+        assert model.lm_head.weight.data_ptr() == model.embed.weight.data_ptr(), (
+            "tied pair must share storage after the conditional cast")
+
+    def test_cast_none_dtype_noop(self):
+        model = _TinyModel()
+        ptr_before = model.a.weight.data_ptr()
+        cast_model_to_dtype_if_needed(model, None)
+        assert model.a.weight.data_ptr() == ptr_before
+        assert model.a.weight.dtype == torch.float32

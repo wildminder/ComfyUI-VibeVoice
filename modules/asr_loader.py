@@ -60,6 +60,21 @@ class VibeVoiceASRModelHandler(torch.nn.Module):
         )
         if hasattr(self.model, 'device') and self.model.device != device:
             self.model.to(device)
+        # Plan 2026-08-18, Phase 6 (D7/RC-7): refine the size estimate from
+        # the real parameters now that the model is loaded (config size_gb
+        # can be inaccurate for quantized / merged checkpoints).
+        self._refine_size()
+
+    def _refine_size(self) -> None:
+        """Refine ``self.size`` from the real parameters after a load."""
+        try:
+            total = sum(
+                p.numel() * p.element_size() for p in self.model.parameters()
+            )
+            if total > 0:
+                self.size = total
+        except Exception:
+            pass
 
 
 class VibeVoiceASRLoader(BaseVibeVoiceLoader):
