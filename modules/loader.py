@@ -538,6 +538,15 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 param_new = torch.zeros(param.shape, dtype=param.dtype, device="cpu")
                 comfy.utils.set_attr_param(model, name, param_new)
 
+        # Materialize meta buffers (e.g. position_ids, attention_mask) that
+        # were created on meta during instantiation but are not in the
+        # checkpoint state dict. Without this, ComfyUI's unpatch_model →
+        # model.to(device_to) raises NotImplementedError on meta buffers.
+        for name, buf in list(model.named_buffers()):
+            if buf.is_meta:
+                buf_new = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+                comfy.utils.set_attr(model, name, buf_new)
+
         if missing_keys:
             logger.warning(f"Missing keys when loading state dict: {len(missing_keys)} keys")
             if len(missing_keys) < 20:
