@@ -69,6 +69,71 @@ _SENTINEL_BUFFER_VALUES = {
     "fix_std": 0.5,
 }
 
+
+def _recompute_rope_buffers(model) -> int:
+    """Recompute RoPE ``inv_freq`` buffers destroyed by meta-init (v2.3.2 fix).
+
+    Rotary embeddings compute ``inv_freq`` / ``original_inv_freq`` from the
+    config inside ``__init__`` — they are **non-persistent buffers that never
+    appear in the checkpoint**. Under ``torch.device("meta")`` instantiation
+    they are created on the meta device, and the generic zero-materialization
+    in :meth:`VibeVoiceLoader._apply_state_dict` turns them into all-zeros.
+
+    With ``inv_freq == 0`` RoPE yields ``cos(0)=1`` / ``sin(0)=0``, i.e. **no
+    positional encoding**: the language model cannot order tokens, so it emits
+    gibberish syllables and hits the speech-end token almost immediately
+    (observed as a ~2 s garbled clip). A deterministic eager-vs-meta diff on the
+    real VibeVoice-1.5B checkpoint showed these two buffers were the ONLY
+    tensors that differed (all 1204 checkpoint params matched exactly).
+
+    This helper re-runs each rotary module's own config-based computation on
+    CPU (mirroring the eager ``__init__``) and re-registers the buffers.
+
+    Args:
+        model: The loaded model (post assign-load + buffer materialization).
+
+    Returns:
+        Number of rotary modules whose ``inv_freq`` was recomputed.
+    """
+    recomputed = 0
+    for module in model.modules():
+        buffers = dict(module.named_buffers(recurse=False))
+        if "inv_freq" not in buffers:
+            continue
+        config = getattr(module, "config", None)
+        if config is None:
+            continue
+        try:
+            rope_type = getattr(module, "rope_type", "default")
+            if rope_type == "default" and hasattr(module, "compute_default_rope_parameters"):
+                inv_freq, _ = module.compute_default_rope_parameters(config, device="cpu")
+            else:
+                # Non-default rope types resolve through the shared init table.
+                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+                rope_init_fn = ROPE_INIT_FUNCTIONS.get(rope_type)
+                if rope_init_fn is None:
+                    logger.warning(
+                        f"No rope init function for type '{rope_type}' on "
+                        f"{module.__class__.__name__}; leaving inv_freq as-is."
+                    )
+                    continue
+                inv_freq, _ = rope_init_fn(config, device="cpu")
+            inv_freq = inv_freq.to(device="cpu")
+            module.register_buffer("inv_freq", inv_freq, persistent=False)
+            if "original_inv_freq" in buffers:
+                module.register_buffer(
+                    "original_inv_freq", inv_freq.clone(), persistent=False
+                )
+            recomputed += 1
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                f"Could not recompute RoPE inv_freq for "
+                f"{module.__class__.__name__}: {e}"
+            )
+    if recomputed:
+        logger.info(f"Recomputed RoPE inv_freq for {recomputed} rotary module(s).")
+    return recomputed
+
 # Cache for loaded (model, processor) tuples, keyed by cache_key
 LOADED_MODELS_CACHE = {}
 
@@ -582,6 +647,13 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 else:
                     buf_new = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
                 comfy.utils.set_attr(model, name, buf_new)
+
+        # Recompute RoPE inv_freq buffers (v2.3.2 fix). These are computed
+        # from the config in the rotary module's __init__ and are NOT in the
+        # checkpoint, so the zero-materialization above destroyed them. With
+        # inv_freq == 0 the model loses positional encoding and emits
+        # gibberish. Re-run each rotary module's config-based computation.
+        _recompute_rope_buffers(model)
 
         if missing_keys:
             logger.warning(f"Missing keys when loading state dict: {len(missing_keys)} keys")

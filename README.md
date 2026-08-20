@@ -181,6 +181,28 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.3.2 - Fix Gibberish Output (RoPE inv_freq Regression)</strong></summary>
+
+### 🐛 Bug Fixes
+*   **Short (~2 s) gibberish audio after the v2.3.0 fast-loading change.** The v2.3.0 meta-init
+    path zero-materialized the RoPE `inv_freq` / `original_inv_freq` buffers. These buffers are
+    **computed from the config inside `Qwen2RotaryEmbedding.__init__`** and are non-persistent —
+    they never appear in the checkpoint. Under `torch.device("meta")` instantiation they became
+    meta tensors and the generic zero-materialization destroyed them. With `inv_freq == 0`, RoPE
+    yields `cos(0)=1` / `sin(0)=0`, i.e. **no positional encoding**: the language model cannot
+    order tokens, so it emits gibberish syllables and hits the speech-end token almost
+    immediately.
+*   **Diagnosis:** a deterministic eager-vs-meta diff on the real VibeVoice-1.5B checkpoint showed
+    these two rotary buffers were the **only** tensors that differed (all 1204 checkpoint params
+    matched exactly).
+*   **Fix:** `_apply_state_dict` now calls `_recompute_rope_buffers()`, which re-runs each rotary
+    module's own config-based computation on CPU (mirroring the eager `__init__`) and
+    re-registers `inv_freq` / `original_inv_freq`. Covered by
+    `tests/test_assign_loading.py::TestRopeRecomputeRegression`.
+
+</details>
+
+<details open>
 <summary><strong>v2.3.1 - Fix Silent Output (Sentinel Buffer Regression)</strong></summary>
 
 ### 🐛 Bug Fixes

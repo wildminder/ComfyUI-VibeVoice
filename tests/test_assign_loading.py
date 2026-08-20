@@ -220,3 +220,89 @@ class TestSentinelBufferRegression:
         VibeVoiceLoader._apply_state_dict(model, sd)
         assert not model.position_ids.is_meta
         assert torch.equal(model.position_ids, torch.zeros(4))
+
+
+class TestRopeRecomputeRegression:
+    """v2.3.2: meta-init must not leave RoPE inv_freq zeroed (gibberish bug).
+
+    Rotary embeddings compute ``inv_freq`` from the config in ``__init__``;
+    the buffer is non-persistent and never in the checkpoint. Meta-init makes
+    it a meta tensor and the generic zero-materialization destroys it. With
+    ``inv_freq == 0`` RoPE yields cos(0)=1 / sin(0)=0 → no positional
+    encoding → the LM emits gibberish and stops early (~2 s clip). A
+    deterministic eager-vs-meta diff on the real VibeVoice-1.5B checkpoint
+    showed these buffers were the ONLY tensors that differed.
+    """
+
+    def _make_rope_model(self):
+        """Build a tiny model with a real Qwen2RotaryEmbedding submodule."""
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+        from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+
+        class _RopeModel(_UntiedTinyModel):
+            def __init__(self, vocab=4, dim=4):
+                super().__init__(vocab, dim)
+                rope_cfg = Qwen2Config(
+                    hidden_size=16,
+                    num_attention_heads=2,
+                    max_position_embeddings=64,
+                    rope_theta=10000.0,
+                )
+                self.rotary_emb = Qwen2RotaryEmbedding(rope_cfg)
+
+        return _RopeModel
+
+    def test_rope_inv_freq_recomputed_after_meta_load(self):
+        """inv_freq must be recomputed (non-zero) after meta-init + assign."""
+        _RopeModel = self._make_rope_model()
+        with torch.device("meta"):
+            model = _RopeModel()
+        # Under meta-init the rotary buffers are on meta.
+        assert model.rotary_emb.inv_freq.is_meta
+        sd = {"embed.weight": torch.ones(4, 4), "lm_head.weight": torch.ones(4, 4)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        # After the fix: inv_freq is real, on CPU, and NON-zero.
+        assert not model.rotary_emb.inv_freq.is_meta
+        assert model.rotary_emb.inv_freq.device.type == "cpu"
+        assert (model.rotary_emb.inv_freq != 0).any()
+        assert not model.rotary_emb.original_inv_freq.is_meta
+        assert (model.rotary_emb.original_inv_freq != 0).any()
+
+    def test_rope_inv_freq_matches_eager_init(self):
+        """Recomputed inv_freq must equal the eager-init value exactly."""
+        _RopeModel = self._make_rope_model()
+        # Eager reference.
+        eager = _RopeModel()
+        expected = eager.rotary_emb.inv_freq.detach().clone()
+        # Meta path.
+        with torch.device("meta"):
+            model = _RopeModel()
+        sd = {"embed.weight": torch.ones(4, 4), "lm_head.weight": torch.ones(4, 4)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        assert torch.equal(model.rotary_emb.inv_freq, expected)
+        assert torch.equal(model.rotary_emb.original_inv_freq, expected)
+
+    def test_recompute_helper_returns_count(self):
+        """_recompute_rope_buffers returns the number of rotary modules fixed."""
+        from ComfyUI_VibeVoice.modules.loader import _recompute_rope_buffers
+        _RopeModel = self._make_rope_model()
+        with torch.device("meta"):
+            model = _RopeModel()
+        # Zero-materialize the meta buffers first (as _apply_state_dict does).
+        for name, buf in list(model.named_buffers()):
+            if buf.is_meta:
+                parts = name.split(".")
+                mod = model
+                for pt in parts[:-1]:
+                    mod = getattr(mod, pt)
+                setattr(mod, parts[-1], torch.zeros(buf.shape, dtype=buf.dtype))
+        n = _recompute_rope_buffers(model)
+        assert n == 1
+        assert (model.rotary_emb.inv_freq != 0).any()
+
+    def test_recompute_noop_without_rotary_modules(self):
+        """Models without rotary embeddings are unaffected."""
+        from ComfyUI_VibeVoice.modules.loader import _recompute_rope_buffers
+        model = _UntiedTinyModel()
+        n = _recompute_rope_buffers(model)
+        assert n == 0
