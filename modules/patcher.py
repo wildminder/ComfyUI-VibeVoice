@@ -136,13 +136,50 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         # the correct device; ComfyUI's load() will iterate over the handler's
         # parameters (which include the VibeVoice model's parameters) and
         # track the loaded weight memory.
-        return super().patch_model(
+        result = super().patch_model(
             device_to=target_device,
             lowvram_model_memory=lowvram_model_memory,
             load_weights=load_weights,
             force_patch_weights=force_patch_weights,
             *args, **kwargs
         )
+
+        if load_weights and self.model is not None and self.model.model is not None:
+            self._complete_partial_transfer(target_device)
+
+        return result
+
+    def _complete_partial_transfer(self, target_device) -> int:
+        """Finish a lowvram PARTIAL load left incomplete by ComfyUI.
+
+        When the model exceeds free VRAM, core ModelPatcher.load() keeps tail
+        modules on CPU and expects comfy.ops streaming hooks to move them
+        per-forward. A plain transformers tree has no such hooks, so the
+        first CPU-resident submodule crashes at forward ("Input type
+        CUDABFloat16Type and weight type CPUBFloat16Type should be the
+        same"). Detect stragglers and complete the H2D transfer; for fully
+        loaded models this scan finds nothing and `.to()` on an already-
+        placed tree is a no-op.
+
+        Returns:
+            Number of parameters found off-target before completion.
+        """
+        try:
+            strays = [
+                name for name, p in self.model.model.named_parameters()
+                if p.device != target_device
+            ]
+        except Exception:
+            return 0
+        if not strays:
+            return 0
+        logger.info(
+            f"Lowvram partial load left {len(strays)} parameter(s) off "
+            f"{target_device} (e.g. '{strays[0]}'); completing the transfer "
+            f"for the transformers tree..."
+        )
+        self.model.model.to(target_device)
+        return len(strays)
 
     def unpatch_model(self, device_to=None, unpatch_weights=True, warm: bool = False,
                       destroy: bool = False, *args, **kwargs):

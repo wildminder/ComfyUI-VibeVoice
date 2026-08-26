@@ -21,7 +21,7 @@ class TestModelConfigs:
         assert "VibeVoice-1.5B" in MODEL_CONFIGS
 
     def test_model_configs_has_large(self):
-        assert "VibeVoice-Large" in MODEL_CONFIGS
+        assert "VibeVoice-7B" in MODEL_CONFIGS
 
     def test_model_configs_has_repo_id(self):
         assert MODEL_CONFIGS["VibeVoice-1.5B"]["repo_id"] == "microsoft/VibeVoice-1.5B"

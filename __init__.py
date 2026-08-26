@@ -97,7 +97,9 @@ else:
             AVAILABLE_VIBEVOICE_MODELS[model_name] = {
                 "type": "official",
                 "repo_id": config["repo_id"],
-                "tokenizer_repo": "Qwen/Qwen2.5-7B" if "Large" in model_name else "Qwen/Qwen2.5-1.5B"
+                "tokenizer_repo": ("Qwen/Qwen2.5-7B" if ("Large" in model_name
+                                    or "7B" in model_name or "ASR" in model_name)
+                   else "Qwen/Qwen2.5-1.5B")
             }
 
         # Discover local models in tts/VibeVoice/ subdirectories
