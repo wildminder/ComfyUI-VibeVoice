@@ -15,6 +15,7 @@ from comfy.utils import ProgressBar
 
 from .loader import VibeVoiceModelHandler, VibeVoiceLoader, cleanup_old_models, LOADED_MODELS_CACHE
 from .patcher import VibeVoicePatcher
+from .model_registry import FAMILY_TTS, evict_if_changed, identity_for_external
 from .utils import VIBEVOICE_PATCHER_CACHE
 from .audio_utils import parse_script_1_based, preprocess_comfy_audio, set_seed, check_for_interrupt
 from .device_utils import get_torch_device, get_offload_device, DEVICE_CPU
@@ -123,7 +124,15 @@ def load_vibevoice_from_external(
 
     # Resolve attention mode with fallback logic (no quantization on the
     # external path — quantization is applied at load time by the loader node).
-    actual_attention_mode = resolve_attention_mode(attention_mode, False)
+    #
+    # Plan 2026-08-20 (P1): when the bundle records the attention mode the
+    # weights were actually BUILT with (loader-resolved), prefer it — the TTS
+    # node's own widget must not fork a second patcher for the same weights.
+    bundle_attention = model_bundle.get("attention_mode")
+    if isinstance(bundle_attention, str) and bundle_attention:
+        actual_attention_mode = bundle_attention
+    else:
+        actual_attention_mode = resolve_attention_mode(attention_mode, False)
 
     # Setup device
     if device == DEVICE_CPU:
@@ -137,7 +146,24 @@ def load_vibevoice_from_external(
     target_dtype = resolve_dtype(dtype, load_device)
 
     # Build cache key (namespaced so it never collides with dropdown loaders).
-    cache_key = f"external_{model_name}_attn_{actual_attention_mode}"
+    # Plan 2026-08-20 (RC-2/B2): the key carries full file identity — weight
+    # file name + mtime_ns + size, config selector, RESOLVED attention mode,
+    # 4-bit flag, and dtype — from the bundle's recorded build fields. Hand-
+    # built bundles without those fields fall back to stat'ing source_path /
+    # widget values, keeping a valid (if less specific) key.
+    bundle_use_llm_4bit = bool(model_bundle.get("use_llm_4bit", False))
+    bundle_dtype_str = model_bundle.get("dtype_str") or dtype
+    cache_key = identity_for_external(
+        source_path,
+        model_name,
+        actual_attention_mode,
+        use_llm_4bit=bundle_use_llm_4bit,
+        dtype_str=bundle_dtype_str,
+    )
+
+    # Unload-before-load gate (plan 2026-08-20, C2/RC-1): if a DIFFERENT model
+    # is active for this family, fully release it before touching the caches.
+    evict_if_changed(FAMILY_TTS, cache_key, (VIBEVOICE_PATCHER_CACHE,))
 
     if cache_key not in VIBEVOICE_PATCHER_CACHE:
         model_handler = ExternalVibeVoiceModelHandler(
@@ -147,6 +173,9 @@ def load_vibevoice_from_external(
             attention_mode=actual_attention_mode,
             source_path=source_path,
         )
+        # Keep the handler's key in sync with the patcher-cache key so the
+        # destroy path evicts the right entry (plan 2026-08-20, §4.2).
+        model_handler.cache_key = cache_key
 
         patcher = VibeVoicePatcher(
             model_handler,
@@ -216,6 +245,12 @@ def load_vibevoice_model(
 
     # Build cache key
     cache_key = f"{model_name}_attn_{actual_attention_mode}_q4_{int(quantize_4bit)}"
+
+    # Unload-before-load gate (plan 2026-08-20, C3/RC-1/RC-5): switching
+    # models (dropdown <-> dropdown or dropdown <-> external — both share the
+    # "tts" family) fully releases the previous model BEFORE the new weights
+    # are loaded. Same-key calls are a strict no-op.
+    evict_if_changed(FAMILY_TTS, cache_key, (VIBEVOICE_PATCHER_CACHE,))
 
     if cache_key not in VIBEVOICE_PATCHER_CACHE or force_reload:
         if force_reload:

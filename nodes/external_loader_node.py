@@ -19,9 +19,17 @@ from ..modules.custom_types import VibeVoiceModel
 from ..modules.external_loader import (
     load_external_vibevoice_model,
     EXTERNAL_CONFIG_OPTIONS,
+    is_asr_config_name,
 )
-from ..modules.attention_utils import get_available_attention_modes
+from ..modules.attention_utils import get_available_attention_modes, resolve_attention_mode
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
+from ..modules.model_registry import (
+    FAMILY_ASR,
+    FAMILY_TTS,
+    evict_if_changed,
+    identity_for_external,
+)
+from ..modules.utils import VIBEVOICE_ASR_PATCHER_CACHE, VIBEVOICE_PATCHER_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +181,33 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         dtype: str,
     ) -> io.NodeOutput:
         weight_path = resolve_weight_path(model_file)
+
+        # Unload-before-load gate (plan 2026-08-20, C1/RC-1/RC-5): compute the
+        # request identity EXACTLY as the external loader will record it on the
+        # bundle (same resolution rules), and fully release any different
+        # active model BEFORE the new one is built on CPU. This is what keeps
+        # peak RAM at ~1x model size during a model swap.
+        is_asr = is_asr_config_name(config_name)
+        family = FAMILY_ASR if is_asr else FAMILY_TTS
+        use_llm_4bit = False if is_asr else bool(quantize_llm_4bit)
+        resolved_attn = resolve_attention_mode(attention_mode, use_llm_4bit)
+        # The request key MUST live in the same namespace as the consumer's
+        # cache key ("asr_external" vs "external") — a prefix mismatch would
+        # make every identical re-run of an ASR model spuriously evict and
+        # rebuild the live patcher.
+        request_key = identity_for_external(
+            weight_path,
+            config_name,
+            resolved_attn,
+            use_llm_4bit=use_llm_4bit,
+            dtype_str=dtype,
+            prefix="asr_external" if is_asr else "external",
+        )
+        evict_if_changed(
+            family,
+            request_key,
+            (VIBEVOICE_ASR_PATCHER_CACHE if is_asr else VIBEVOICE_PATCHER_CACHE,),
+        )
 
         model_bundle = load_external_vibevoice_model(
             weight_path=weight_path,

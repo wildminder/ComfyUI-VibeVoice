@@ -14,7 +14,7 @@ import comfy.model_management as model_management
 
 from .loader import VibeVoiceLoader, LOADED_MODELS_CACHE
 from .asr_loader import LOADED_ASR_MODELS_CACHE
-from .dtype_utils import cast_model_to_dtype, get_dtype_str
+from .dtype_utils import cast_model_to_dtype, get_dtype_str, representative_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,9 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         # it still fires for models loaded by other paths (e.g. ASR) or when
         # the dtype cannot be determined up front.
         if self.target_dtype is not None:
-            current_dtype = getattr(self.model.model, "dtype", None)
+            # Representative dtype = first FLOATING param (quant residents
+            # hold raw uint8/int8 params that must not influence this check).
+            current_dtype = representative_dtype(self.model.model)
             if current_dtype != self.target_dtype:
                 logger.debug(
                     f"Casting model to dtype: {self.target_dtype} "
@@ -179,6 +181,17 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                     f"Destroying VibeVoice models for '{self.model.model_pack_name}' "
                     f"({self.attention_mode}) (weights freed)..."
                 )
+                # Plan 2026-08-20 (D1/RC-4): drop this patcher from ComfyUI's
+                # loaded-model registry FIRST so nothing downstream (free_memory,
+                # cleanup passes) later touches a destroyed model. Lazy import
+                # avoids an import cycle with model_registry.
+                try:
+                    from .model_registry import unregister_from_comfy
+
+                    unregister_from_comfy(self)
+                except Exception as e:
+                    logger.warning(f"Could not unregister patcher from ComfyUI: {e}")
+
                 self.model.model = None
                 self.model.processor = None
 

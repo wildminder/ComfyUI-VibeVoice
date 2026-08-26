@@ -44,6 +44,8 @@ from .attention_utils import (
     check_sage_attention_compatible,
 )
 from .dtype_utils import resolve_dtype, cast_model_to_dtype_if_needed
+from .convrot_quant import UnsupportedQuantFormat
+from .quant_common import validate_weight_plan
 
 if SAGE_ATTENTION_AVAILABLE:
     from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
@@ -399,6 +401,280 @@ def _load_weight_state_dict(weight_path: str, device) -> dict:
 
 
 # ====================================================================
+# Quant-resident loading (GGUF raw-block + ConvRot INT8)
+# ====================================================================
+
+def _open_gguf_reader(weight_path: str):
+    """Open a ``.gguf`` file with :class:`gguf.GGUFReader`.
+
+    Raises:
+        RuntimeError: If the ``gguf`` package is not installed.
+    """
+    try:
+        import gguf
+    except ImportError as e:
+        raise RuntimeError(
+            "Loading .gguf weights requires the 'gguf' Python package. "
+            "Install it with: pip install gguf"
+        ) from e
+    return gguf.GGUFReader(weight_path)
+
+
+def _gguf_kquant_present(reader) -> bool:
+    """True when any tensor uses a K-quant format (Q4_K/Q5_K/Q6_K)."""
+    from .gguf_quant import _T
+
+    kquants = {_T.Q4_K, _T.Q5_K, _T.Q6_K}
+    return any(t.tensor_type in kquants for t in reader.tensors)
+
+
+# Quant-storage dtypes that must NEVER reach the dense float loader.
+_QUANT_STORAGE_DTYPES = frozenset({
+    torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2,
+})
+
+
+def _prepare_quantized_safetensors_load(state_dict: dict, quant_map: dict):
+    """Split a scanned comfy_quant map into execution strategies (in place).
+
+    - ``convrot=True`` layers  -> module-replacement plan (int8 resident +
+      comfy-kitchen kernels); their int8/scale tensors stay in the state dict
+      for assign.
+    - ``convrot=False`` layers -> dequant-at-load: ``weight = q * per-row
+      scale`` materialized back to the declared orig dtype inside
+      ``state_dict``; scale + metadata keys removed.
+
+    Returns:
+        ``(layer_plan, n_rowwise)``.
+
+    Raises:
+        QuantTargetMismatch: On missing/malformed rowwise tensor pairs or an
+            undeclared orig dtype.
+    """
+    from .convrot_quant import (
+        QUANT_META_SUFFIX,
+        make_convrot_linear,
+        resolve_orig_dtype,
+    )
+    from .quant_common import QuantTargetMismatch
+
+    layer_plan = {}
+    n_rowwise = 0
+    for prefix, info in quant_map.items():
+        if info.convrot:
+            layer_plan[prefix] = make_convrot_linear(info)
+            continue
+
+        w_key = f"{prefix}.weight"
+        s_key = f"{prefix}.weight_scale"
+        w = state_dict.get(w_key)
+        s = state_dict.get(s_key)
+        if w is None or s is None:
+            raise QuantTargetMismatch(
+                f"Rowwise-quantized layer '{prefix}' is missing its "
+                f"'{w_key}' / '{s_key}' tensors in the checkpoint"
+            )
+        storage_dtype = info.rowwise_dtype or torch.int8
+        if w.dtype != storage_dtype and w.dtype != torch.uint8:
+            raise QuantTargetMismatch(
+                f"Rowwise layer '{prefix}': expected {storage_dtype} storage, "
+                f"checkpoint has {w.dtype}"
+            )
+        if w.dim() != 2 or w.shape[0] != info.out_features \
+                or (info.in_features and w.shape[1] != info.in_features):
+            raise QuantTargetMismatch(
+                f"Rowwise layer '{prefix}': weight shape {tuple(w.shape)} "
+                f"disagrees with metadata [out={info.out_features}, "
+                f"in={info.in_features}]"
+            )
+        orig_dtype = resolve_orig_dtype(info.orig_dtype)
+
+        if info.group_size:
+            # BLOCKWISE scales: shape [out / gs, in / gs], one scale per
+            # gs x gs block (int8-blockwise checkpoints).
+            gs = int(info.group_size)
+            if w.shape[0] % gs or w.shape[1] % gs:
+                raise QuantTargetMismatch(
+                    f"Blockwise layer '{prefix}': weight {tuple(w.shape)} "
+                    f"not divisible by group_size {gs} on both dims"
+                )
+            og, ig = w.shape[0] // gs, w.shape[1] // gs
+            if tuple(s.shape) != (og, ig):
+                raise QuantTargetMismatch(
+                    f"Blockwise layer '{prefix}': scale shape "
+                    f"{tuple(s.shape)} disagrees with weight "
+                    f"{tuple(w.shape)} at group_size {gs} (expected "
+                    f"({og}, {ig}))"
+                )
+            state_dict[w_key] = (
+                (
+                    w.to(torch.float32).view(og, gs, ig, gs)
+                    * s.to(torch.float32).view(og, 1, ig, 1)
+                ).reshape(w.shape).to(orig_dtype)
+            )
+        else:
+            # SCALAR (per-tensor, fp8) or PER-ROW [out, 1] scales; both
+            # broadcast.
+            if not (s.dim() == 0 or (s.dim() == 2 and s.shape[1] == 1
+                                     and s.shape[0] in (w.shape[0], 1))):
+                raise QuantTargetMismatch(
+                    f"Rowwise layer '{prefix}': scale shape {tuple(s.shape)} "
+                    f"is neither a scalar nor [out,1] (weight "
+                    f"{tuple(w.shape)})"
+                )
+            # fp32 intermediate: exact rescale before the final cast.
+            state_dict[w_key] = (
+                (w.to(torch.float32) * s.to(torch.float32)).to(orig_dtype)
+            )
+        state_dict.pop(s_key, None)
+        n_rowwise += 1
+
+    for prefix in quant_map:
+        state_dict.pop(f"{prefix}.{QUANT_META_SUFFIX}", None)
+    return layer_plan, n_rowwise
+
+
+def _assert_dense_loadable(state_dict: dict) -> None:
+    """Hard-fail when unplanned quantized weights reach the dense loader.
+
+    Assigning int8/uint8/fp8 storages into float parameters either crashes
+    cryptically or (fp8) silently misloads with scales ignored. Both are
+    worse than a clear error at load time.
+    """
+    bad = [
+        (k, str(v.dtype))
+        for k, v in state_dict.items()
+        if v.dtype in _QUANT_STORAGE_DTYPES
+    ]
+    if bad:
+        sample = ", ".join(f"{k} [{d}]" for k, d in bad[:5])
+        raise ValueError(
+            "Checkpoint contains quantized-weight tensors but carries no "
+            f"executable quantization metadata ({len(bad)} tensors, e.g. "
+            f"{sample}). Loading them as floats would corrupt the model. "
+            "Re-export it with *.comfy_quant metadata (comfy-model-tools) "
+            "or use the dense/BF16 checkpoint."
+        )
+
+
+def _install_gguf_weights(model, reader) -> dict:
+    """Install GGUF weights onto a meta-initialized model WITHOUT float
+    materialization (plan 2026-08-24, D1 — the RAM-spike kill).
+
+    Pipeline:
+    1. Map every reader tensor onto the model tree (HF pass-through or
+       llamacpp naming).
+    2. Quantized tensors whose target is an ``nn.Linear`` become RESIDENTS:
+       the Linear is swapped for :class:`~modules.gguf_quant.GGUFLinear` and
+       the RAW BLOCK BYTES are installed as its uint8 parameter (the one
+       unavoidable copy — it IS the residency).
+    3. Float tensors (F32/F16/BF16) take zero-copy views at their NATIVE
+       dtype into a filtered dense state dict applied through
+       :meth:`VibeVoiceLoader._apply_state_dict` (assign semantics, re-tie,
+       sentinel/RoPE fixes preserved).
+
+    Peak RAM ≈ raw file size instead of ~2x full-float size.
+
+    Returns:
+        Stats dict ``{"n_resident_layers", "raw_bytes", "weight_family"}``.
+    """
+    import numpy as np
+
+    from .gguf_quant import (
+        FLOAT_GGML_TYPES,
+        GGUFTensor,
+        SUPPORTED_GGML_TYPES,
+        UnsupportedGGMLType,
+        gguf_linear_factory,
+        map_keys,
+    )
+    from .quant_common import (
+        QuantTargetMismatch,
+        replace_linears_for_quant,
+        resolve_module,
+    )
+
+    tensors = list(reader.tensors)
+    mapping = map_keys([t.name for t in tensors])
+    modules_by_name = dict(model.named_modules())
+
+    resident_plan = {}
+    resident_tensors = {}
+    dense_state = {}
+    unsupported = []
+
+    for t in tensors:
+        target_key = mapping[t.name]
+        logical_shape = tuple(int(s) for s in reversed(t.shape))
+        tt = t.tensor_type
+
+        if tt in FLOAT_GGML_TYPES:
+            data = t.data
+            if data.dtype == np.float32:
+                tensor = torch.from_numpy(data)
+            elif data.dtype == np.float16:
+                tensor = torch.from_numpy(data)
+            else:  # BF16 arrives as raw uint8 bytes
+                tensor = torch.from_numpy(data).view(torch.bfloat16)
+            dense_state[target_key] = tensor.reshape(logical_shape)
+            continue
+
+        if tt not in SUPPORTED_GGML_TYPES:
+            unsupported.append((t.name, tt))
+            continue
+
+        if not target_key.endswith(".weight"):
+            raise QuantTargetMismatch(
+                f"Quantized GGUF tensor '{t.name}' maps to '{target_key}', "
+                f"which is not a Linear weight; this checkpoint cannot be "
+                f"executed with quant-resident linears."
+            )
+        module_path = target_key[: -len(".weight")]
+        target_module = modules_by_name.get(module_path)
+        if target_module is None or not isinstance(target_module, torch.nn.Linear):
+            kind = type(target_module).__name__ if target_module is not None else "missing"
+            raise QuantTargetMismatch(
+                f"GGUF-quantized tensor '{t.name}' maps to '{module_path}' "
+                f"({kind}), expected an nn.Linear. The sidecar config may not "
+                f"match this checkpoint."
+            )
+        expected_shape = tuple(target_module.weight.shape)
+        if logical_shape != expected_shape:
+            raise QuantTargetMismatch(
+                f"GGUF tensor '{t.name}' shape {logical_shape} disagrees with "
+                f"model {type(target_module).__name__} shape {expected_shape}"
+            )
+        # Copy the raw block bytes off the mmap now (this copy IS the final
+        # residency); float materialization never happens.
+        resident_tensors[module_path] = GGUFTensor.from_reader_tensor(t)
+        resident_plan[module_path] = gguf_linear_factory(tt)
+
+    if unsupported:
+        name, tt = unsupported[0]
+        raise UnsupportedGGMLType(tt, f"{name}" + (
+            f" (+{len(unsupported) - 1} more)" if len(unsupported) > 1 else ""
+        ))
+
+    replaced = replace_linears_for_quant(model, resident_plan)
+    total_raw = 0
+    for module_path in replaced:
+        module = resolve_module(model, module_path)
+        gtensor = resident_tensors[module_path]
+        module.set_raw_weight(gtensor.raw)
+        total_raw += gtensor.raw.numel()
+        resident_tensors[module_path] = None
+
+    known_missing = {f"{p}.weight" for p in replaced}
+    VibeVoiceLoader._apply_state_dict(model, dense_state, known_missing=known_missing)
+
+    return {
+        "n_resident_layers": len(replaced),
+        "raw_bytes": total_raw,
+        "weight_family": "gguf_block",
+    }
+
+
+# ====================================================================
 # Low-bit / naive quantization detection (defensive warning)
 # ====================================================================
 
@@ -619,6 +895,16 @@ def load_external_vibevoice_model(
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
 
+    # File-identity stamp for the cache key (plan 2026-08-20, B1): captured
+    # once at entry so the bundle records exactly which bytes were loaded.
+    try:
+        _stat = os.stat(weight_path)
+        source_mtime_ns = _stat.st_mtime_ns
+        source_size = _stat.st_size
+    except OSError:
+        source_mtime_ns = 0
+        source_size = 0
+
     # Defensive: warn early if the checkpoint looks over-quantized / naively cast.
     warn_if_lowbit_quantization(weight_path)
 
@@ -636,12 +922,47 @@ def load_external_vibevoice_model(
     # Resolve attention mode with fallback logic (same as standard loader)
     attention_mode = resolve_attention_mode(attention_mode, use_llm_4bit)
 
-    # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
-    # loader, .gguf via the gguf package). Always CPU — the patcher owns the
-    # single H2D transfer.
+    # Weight-plan validation + lazy source opening (plan 2026-08-24, D1/D2/D4).
+    # GGUF keeps an mmap READER (no float materialization); plain safetensors
+    # are scanned for ConvRot *.comfy_quant metadata BEFORE any load.
+    lower_path = weight_path.lower()
+    is_gguf_file = lower_path.endswith(".gguf")
+    gguf_reader = _open_gguf_reader(weight_path) if is_gguf_file else None
+    convrot_quant_map = {}
+    if gguf_reader is None and lower_path.endswith(".safetensors"):
+        # Scan-only pass. UNREADABLE headers degrade to "no quant metadata"
+        # (a genuinely corrupt file still fails at the actual load), but an
+        # UNSUPPORTED QUANT FORMAT must propagate: silently falling through
+        # to the dense loader misloads int8/fp8 weights as floats.
+        try:
+            from .convrot_quant import scan_checkpoint_quantization
+
+            convrot_quant_map = scan_checkpoint_quantization(weight_path)
+        except UnsupportedQuantFormat:
+            raise
+        except Exception as e:
+            logger.debug(f"ConvRot scan skipped for {weight_path}: {e}")
+            convrot_quant_map = {}
+    validate_weight_plan(
+        is_gguf_file=is_gguf_file,
+        convrot_quant_map=convrot_quant_map,
+        use_llm_4bit=use_llm_4bit,
+        attention_mode=attention_mode,
+        gguf_kquant_present=_gguf_kquant_present(gguf_reader) if gguf_reader else False,
+    )
+
     cpu_device = torch.device("cpu")
-    logger.info(f"Loading external VibeVoice weights from: {weight_path}")
-    state_dict = _load_weight_state_dict(weight_path, cpu_device)
+    state_dict = None
+    if gguf_reader is not None:
+        logger.info(
+            f"Opening external VibeVoice GGUF weights (raw-block residency): "
+            f"{weight_path}"
+        )
+    else:
+        logger.info(f"Loading external VibeVoice weights from: {weight_path}")
+        # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
+        # loader). Always CPU — the patcher owns the single H2D transfer.
+        state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
     # Step 2: Resolve and load the architecture config.
     config_path = resolve_sidecar_config(weight_path, config_name)
@@ -699,12 +1020,42 @@ def load_external_vibevoice_model(
             final_load_dtype=final_load_dtype,
         )
 
-        # Step 8: Load the in-memory state dict into the model.
-        model = _load_state_dict_into_model_from_memory(model, state_dict)
+        # Step 8: Bind the weights — dispatch by weight family:
+        # - gguf_block: raw-block residency install (no float materialization)
+        # - convrot_int8: linears already swapped; int8/scale assign directly
+        # - dense: legacy in-memory assign of the full float state dict
+        weight_family = "dense"
+        quant_stats = {}
+        if gguf_reader is not None:
+            quant_stats = _install_gguf_weights(model, gguf_reader)
+            weight_family = "gguf_block"
+            del gguf_reader
+            gguf_reader = None
+        elif convrot_quant_map:
+            from .quant_common import replace_linears_for_quant
 
-        # Free the state dict immediately — the model now owns the tensors
-        # (assign semantics), so the dict is dead weight (plan D7/RC-4).
-        del state_dict
+            layer_plan, n_rowwise = _prepare_quantized_safetensors_load(
+                state_dict, convrot_quant_map
+            )
+            replaced = replace_linears_for_quant(model, layer_plan)
+            model = _load_state_dict_into_model_from_memory(model, state_dict)
+            del state_dict
+            state_dict = None
+            weight_family = "convrot_int8"
+            quant_stats = {
+                "n_resident_layers": len(replaced),
+                "n_rowwise_layers": n_rowwise,
+            }
+        else:
+            # Defensive net: unplanned int8/uint8/fp8 weights must never
+            # reach the float loader (crash or silent corruption).
+            _assert_dense_loadable(state_dict)
+            model = _load_state_dict_into_model_from_memory(model, state_dict)
+
+            # Free the state dict immediately — the model now owns the tensors
+            # (assign semantics), so the dict is dead weight (plan D7/RC-4).
+            del state_dict
+            state_dict = None
 
         # Step 9: Apply the final dtype ON CPU (single H2D owned by patcher) —
         # only where needed (plan 2026-08-18, D4/RC-3).
@@ -742,14 +1093,26 @@ def load_external_vibevoice_model(
         # NOTE (plan 2026-08-18, D7/RC-4): the state dict is intentionally NOT
         # included — the model owns the tensors after assign-loading, and
         # retaining a second ~model-size copy in the node output is dead RAM.
+        #
+        # Plan 2026-08-20 (B1/P1): the bundle also records the full build
+        # identity — file stat, RESOLVED attention mode, 4-bit flag, and the
+        # requested dtype string — so consumers can derive a cache key that is
+        # byte-for-byte equal to the loader-node's pre-build request identity.
         return {
             "config": config,
             "processor": processor,
             "model": model,
             "model_name": config_name,
             "source_path": weight_path,
+            "source_mtime_ns": source_mtime_ns,
+            "source_size": source_size,
+            "attention_mode": attention_mode,
+            "use_llm_4bit": bool(use_llm_4bit),
+            "dtype_str": dtype_str,
             "is_streaming": is_streaming,
             "is_asr": False,
+            "weight_family": weight_family,
+            "quant_stats": quant_stats,
         }
 
     except Exception as e:
@@ -816,18 +1179,60 @@ def load_external_vibevoice_asr_model(
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
 
+    # File-identity stamp (plan 2026-08-20, B1) — mirrors the TTS branch.
+    try:
+        _stat = os.stat(weight_path)
+        source_mtime_ns = _stat.st_mtime_ns
+        source_size = _stat.st_size
+    except OSError:
+        source_mtime_ns = 0
+        source_size = 0
+
     # Defensive: warn early if the checkpoint looks over-quantized / naively cast.
     warn_if_lowbit_quantization(weight_path)
 
     # Resolve attention mode with fallback logic (no 4-bit for ASR).
     attention_mode = resolve_attention_mode(attention_mode, quantize_4bit=False)
 
+    # Weight-plan validation + lazy source opening (mirrors the TTS branch).
+    lower_path = weight_path.lower()
+    is_gguf_file = lower_path.endswith(".gguf")
+    gguf_reader = _open_gguf_reader(weight_path) if is_gguf_file else None
+    convrot_quant_map = {}
+    if gguf_reader is None and lower_path.endswith(".safetensors"):
+        # Scan-only pass. UNREADABLE headers degrade to "no quant metadata"
+        # (a genuinely corrupt file still fails at the actual load), but an
+        # UNSUPPORTED QUANT FORMAT must propagate: silently falling through
+        # to the dense loader misloads int8/fp8 weights as floats.
+        try:
+            from .convrot_quant import scan_checkpoint_quantization
+
+            convrot_quant_map = scan_checkpoint_quantization(weight_path)
+        except UnsupportedQuantFormat:
+            raise
+        except Exception as e:
+            logger.debug(f"ConvRot scan skipped for {weight_path}: {e}")
+            convrot_quant_map = {}
+    validate_weight_plan(
+        is_gguf_file=is_gguf_file,
+        convrot_quant_map=convrot_quant_map,
+        use_llm_4bit=False,
+        attention_mode=attention_mode,
+        gguf_kquant_present=_gguf_kquant_present(gguf_reader) if gguf_reader else False,
+    )
+
     # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
-    # loader, .gguf via the gguf package). Always CPU — the patcher owns the
-    # single H2D transfer.
+    # loader). GGUF keeps a lazy mmap READER instead (raw-block residency).
     cpu_device = torch.device("cpu")
-    logger.info(f"Loading external VibeVoice ASR weights from: {weight_path}")
-    state_dict = _load_weight_state_dict(weight_path, cpu_device)
+    state_dict = None
+    if gguf_reader is not None:
+        logger.info(
+            f"Opening external VibeVoice ASR GGUF weights (raw-block "
+            f"residency): {weight_path}"
+        )
+    else:
+        logger.info(f"Loading external VibeVoice ASR weights from: {weight_path}")
+        state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
     # Step 2: Resolve and load the ASR architecture config.
     config_path = resolve_sidecar_config(weight_path, config_name)
@@ -863,12 +1268,39 @@ def load_external_vibevoice_asr_model(
             final_load_dtype=model_dtype,
         )
 
-        # Step 7: Load the in-memory state dict into the model.
-        model = _load_state_dict_into_model_from_memory(model, state_dict)
+        # Step 7: Bind the weights (same dispatch as the TTS branch).
+        weight_family = "dense"
+        quant_stats = {}
+        if gguf_reader is not None:
+            quant_stats = _install_gguf_weights(model, gguf_reader)
+            weight_family = "gguf_block"
+            del gguf_reader
+            gguf_reader = None
+        elif convrot_quant_map:
+            from .quant_common import replace_linears_for_quant
 
-        # Free the state dict immediately — the model now owns the tensors
-        # (assign semantics), so the dict is dead weight (plan D7/RC-4).
-        del state_dict
+            layer_plan, n_rowwise = _prepare_quantized_safetensors_load(
+                state_dict, convrot_quant_map
+            )
+            replaced = replace_linears_for_quant(model, layer_plan)
+            model = _load_state_dict_into_model_from_memory(model, state_dict)
+            del state_dict
+            state_dict = None
+            weight_family = "convrot_int8"
+            quant_stats = {
+                "n_resident_layers": len(replaced),
+                "n_rowwise_layers": n_rowwise,
+            }
+        else:
+            # Defensive net: unplanned int8/uint8/fp8 weights must never
+            # reach the float loader (crash or silent corruption).
+            _assert_dense_loadable(state_dict)
+            model = _load_state_dict_into_model_from_memory(model, state_dict)
+
+            # Free the state dict immediately — the model now owns the tensors
+            # (assign semantics), so the dict is dead weight (plan D7/RC-4).
+            del state_dict
+            state_dict = None
 
         # Step 8: Apply the final dtype ON CPU (single H2D owned by patcher) —
         # only where needed (plan 2026-08-18, D4/RC-3).
@@ -889,7 +1321,8 @@ def load_external_vibevoice_asr_model(
             f"from {weight_path}"
         )
 
-        # Step 11: Assemble the bundle.
+        # Step 11: Assemble the bundle (identity fields mirror the TTS bundle,
+        # plan 2026-08-20 B1/P1).
         # NOTE (plan 2026-08-18, D7/RC-4): the state dict is intentionally NOT
         # included — the model owns the tensors after assign-loading, and
         # retaining a second ~model-size copy in the node output is dead RAM.
@@ -899,8 +1332,15 @@ def load_external_vibevoice_asr_model(
             "model": model,
             "model_name": config_name,
             "source_path": weight_path,
+            "source_mtime_ns": source_mtime_ns,
+            "source_size": source_size,
+            "attention_mode": attention_mode,
+            "use_llm_4bit": False,
+            "dtype_str": dtype_str,
             "is_streaming": False,
             "is_asr": True,
+            "weight_family": weight_family,
+            "quant_stats": quant_stats,
         }
 
     except Exception as e:

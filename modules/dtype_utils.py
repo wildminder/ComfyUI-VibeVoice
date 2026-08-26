@@ -89,41 +89,48 @@ def get_dtype_str(dtype: torch.dtype) -> str:
     raise ValueError(f"Unknown torch.dtype: {dtype}. Supported: {list(_DTYPE_STR_MAP.values())}")
 
 
-def cast_model_to_dtype(model, dtype: torch.dtype) -> None:
-    """Cast a model's parameters to the specified dtype.
+def _quant_protected_names(model) -> set:
+    """Parameter names excluded from bulk dtype casts (plan 2026-08-24, E1).
 
-    Args:
-        model: A torch.nn.Module to cast.
-        dtype: Target torch.dtype.
+    - Every parameter of modules marked ``_quant_resident`` (GGUFLinear /
+      ConvRotInt8Linear): their weights are RAW BYTE / INT8 storage and the
+      fp32 ``weight_scale`` must stay fp32.
+    - Defense-in-depth: any parameter whose leaf name is ``weight_scale``.
     """
-    if dtype is None:
-        return
-    model.to(dtype=dtype)
-    logger.debug(f"Model cast to dtype: {dtype}")
+    protected = set()
+    for name, mod in model.named_modules():
+        if getattr(mod, "_quant_resident", False):
+            prefix = f"{name}." if name else ""
+            protected.add(f"{prefix}weight")
+            protected.add(f"{prefix}weight_scale")
+    return protected
 
 
-def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
-    """Cast a model to ``dtype`` only when some parameter mismatches (D4).
+def representative_dtype(model):
+    """First FLOATING parameter dtype (None when the tree has none).
 
-    Replaces the unconditional full-model ``.to(dtype)`` (RC-3). Walks the
-    parameters once; if every parameter already has the target dtype the
-    function returns without touching the model. Otherwise it casts ONLY the
-    mismatched parameters in place, then re-ties weights if the config marks
-    them as tied (casting one member of a tied pair un-shares it).
-
-    Args:
-        model: A torch.nn.Module to cast.
-        dtype: Target torch.dtype. ``None`` is a no-op.
+    Unlike transformers' ``dtype`` property this never reports an integer
+    raw-storage param (uint8 GGUF blocks), so callers comparing dtypes don't
+    spuriously schedule casts. Falls back to the model's ``dtype`` attribute
+    when the parameter tree cannot be walked (e.g. test doubles).
     """
-    if dtype is None:
-        return
+    try:
+        for p in model.parameters():
+            if p.dtype.is_floating_point:
+                return p.dtype
+    except Exception:
+        pass
+    return getattr(model, "dtype", None)
 
-    # Fast path: nothing to cast.
-    if all(p.dtype == dtype for p in model.parameters()):
-        return
 
-    # Cast only mismatched parameters in place.
-    for _, param in model.named_parameters():
+def _cast_mismatched_params(model, dtype: torch.dtype) -> None:
+    """Cast only floating, unprotected, mismatched parameters, then re-tie."""
+    protected = _quant_protected_names(model)
+    for name, param in model.named_parameters():
+        if name in protected:
+            continue
+        if not param.dtype.is_floating_point:
+            continue  # raw int8/uint8 quant storage, index tensors, etc.
         if param.dtype != dtype:
             param.data = param.data.to(dtype)
 
@@ -137,4 +144,53 @@ def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
         if tied:
             model.tie_weights()
 
+
+def cast_model_to_dtype(model, dtype: torch.dtype) -> None:
+    """Cast a model's FLOATING parameters to the specified dtype.
+
+    Quant-resident storage (raw uint8 GGUF blocks, int8 ConvRot weights,
+    fp32 ``weight_scale``) is NEVER touched. Torch's own ``Module.to(dtype)``
+    happens to skip integer tensors, but it WOULD recast fp32 scales — hence
+    this filtered walk instead of a bulk ``.to()``.
+
+    Args:
+        model: A torch.nn.Module to cast.
+        dtype: Target torch.dtype.
+    """
+    if dtype is None:
+        return
+    _cast_mismatched_params(model, dtype)
+    logger.debug(f"Model cast to dtype (filtered): {dtype}")
+
+
+def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
+    """Cast a model to ``dtype`` only when some castable parameter mismatches.
+
+    Replaces the unconditional full-model ``.to(dtype)`` (RC-3). Walks the
+    parameters once; if every CASTABLE (floating, non-protected) parameter
+    already has the target dtype the function returns without touching the
+    model. Otherwise it casts ONLY the mismatched castable parameters in
+    place, then re-ties weights if the config marks them as tied.
+
+    Quant-resident parameters are excluded (see :func:`cast_model_to_dtype`).
+
+    Args:
+        model: A torch.nn.Module to cast.
+        dtype: Target torch.dtype. ``None`` is a no-op.
+    """
+    if dtype is None:
+        return
+
+    protected = _quant_protected_names(model)
+
+    # Fast path: nothing castable to do.
+    for name, param in model.named_parameters():
+        if name in protected or not param.dtype.is_floating_point:
+            continue
+        if param.dtype != dtype:
+            break
+    else:
+        return
+
+    _cast_mismatched_params(model, dtype)
     logger.debug(f"Model cast to dtype (mismatched params only): {dtype}")

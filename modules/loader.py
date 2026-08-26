@@ -141,10 +141,17 @@ LOADED_MODELS_CACHE = {}
 def cleanup_old_models(keep_cache_key: str = None) -> None:
     """Remove all cached models except the one matching keep_cache_key.
 
+    Plan 2026-08-20 (C5): the patcher loop routes through
+    ``model_registry.evict_patcher`` — a behavior superset of the previous
+    inline destroy (it also unregisters the patcher from ComfyUI's
+    ``model_management.current_loaded_models``). The ``LOADED_MODELS_CACHE``
+    loop and ``keep_cache_key`` semantics are unchanged.
+
     Args:
         keep_cache_key: Cache key to preserve. If None, all are cleared.
     """
     from .utils import VIBEVOICE_PATCHER_CACHE
+    from .model_registry import evict_patcher
 
     keys_to_remove = []
     for key in list(LOADED_MODELS_CACHE.keys()):
@@ -154,14 +161,12 @@ def cleanup_old_models(keep_cache_key: str = None) -> None:
 
     for key in list(VIBEVOICE_PATCHER_CACHE.keys()):
         if key != keep_cache_key:
+            patcher = VIBEVOICE_PATCHER_CACHE.get(key)
             try:
-                patcher = VIBEVOICE_PATCHER_CACHE[key]
-                if hasattr(patcher, 'model') and patcher.model:
-                    # Plan 2026-08-18 D5: eviction is an explicit destructive
-                    # free — route it through the patcher's destroy path instead
-                    # of poking handler attributes by hand.
-                    patcher.unpatch_model(unpatch_weights=True, destroy=True)
-                del VIBEVOICE_PATCHER_CACHE[key]
+                # Explicit destructive free via the registry primitive:
+                # unregister from ComfyUI -> destroy -> pop cache -> gc ->
+                # soft_empty_cache (each step individually guarded).
+                evict_patcher(patcher, VIBEVOICE_PATCHER_CACHE, key)
             except Exception as e:
                 logger.warning(f"Error cleaning up patcher {key}: {e}")
 
@@ -578,7 +583,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         return BaseVibeVoiceLoader.load_state_dict_sharded(model_dir, device)
 
     @staticmethod
-    def _apply_state_dict(model, state_dict):
+    def _apply_state_dict(model, state_dict, known_missing=None):
         """Load a state dict into the model with assign semantics.
 
         Fast-load contract (plan 2026-08-18, D2/D3 — un-defers DF-005):
@@ -595,10 +600,15 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         Args:
             model: Instantiated model (meta- or eager-initialized).
             state_dict: Checkpoint state dict (CPU tensors).
+            known_missing: Optional set of keys that are INTENTIONALLY absent
+                from ``state_dict`` (e.g. quant-resident linear weights
+                installed separately); excluded from missing-key warnings but
+                still returned in ``missing_keys``.
 
         Returns:
             Tuple of (missing_keys, unexpected_keys).
         """
+        known_missing = known_missing or set()
         missing_keys, unexpected_keys = model.load_state_dict(
             state_dict, strict=False, assign=True
         )
@@ -655,12 +665,13 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # gibberish. Re-run each rotary module's config-based computation.
         _recompute_rope_buffers(model)
 
-        if missing_keys:
-            logger.warning(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-            if len(missing_keys) < 20:
-                logger.warning(f"Missing keys: {missing_keys}")
+        reported_missing = [k for k in missing_keys if k not in known_missing]
+        if reported_missing:
+            logger.warning(f"Missing keys when loading state dict: {len(reported_missing)} keys")
+            if len(reported_missing) < 20:
+                logger.warning(f"Missing keys: {reported_missing}")
             else:
-                logger.warning(f"First 10 missing keys: {missing_keys[:10]}")
+                logger.warning(f"First 10 missing keys: {reported_missing[:10]}")
 
         if unexpected_keys:
             logger.warning(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")

@@ -61,6 +61,23 @@ def get_sage_attention_function_and_params():
 SAGE_ATTENTION_FUNCTION, QK_QUANT_GRAN, PV_ACCUM_DTYPE = get_sage_attention_function_and_params()
 
 
+def resolve_sage_target_dtype(q_proj, hidden_states: torch.Tensor) -> torch.dtype:
+    """Compute dtype the projections expect ``hidden_states`` in.
+
+    - bnb 4-bit linears carry uint8 weights + ``quant_state``; their compute
+      convention here is bfloat16.
+    - Quant-resident linears (GGUF raw blocks / ConvRot INT8) dequantize to the
+      ACTIVATION dtype per matmul — no cast needed, pass through unchanged.
+    - Plain float linears: match the stored weight dtype (legacy behavior).
+    """
+
+    if hasattr(q_proj, 'quant_state'):
+        return torch.bfloat16
+    if getattr(q_proj, '_quant_resident', False):
+        return hidden_states.dtype
+    return q_proj.weight.dtype
+
+
 def sage_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -75,12 +92,8 @@ def sage_attention_forward(
         raise RuntimeError("SageAttention was selected but no compatible kernel was found for this GPU.")
     
     original_dtype = hidden_states.dtype
-    
-    is_4bit = hasattr(self.q_proj, 'quant_state')
-    if is_4bit:
-        target_dtype = torch.bfloat16
-    else:
-        target_dtype = self.q_proj.weight.dtype
+
+    target_dtype = resolve_sage_target_dtype(self.q_proj, hidden_states)
 
     if hidden_states.dtype != target_dtype:
         hidden_states = hidden_states.to(target_dtype)

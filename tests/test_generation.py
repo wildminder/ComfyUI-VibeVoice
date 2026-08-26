@@ -194,8 +194,9 @@ class TestLoadFromExternal:
         VIBEVOICE_PATCHER_CACHE.clear()
 
     def test_load_from_external_caches_patcher(self):
-        """The patcher is stored in VIBEVOICE_PATCHER_CACHE."""
+        """The patcher is stored in VIBEVOICE_PATCHER_CACHE under its identity key."""
         from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.model_registry import identity_for_external
         VIBEVOICE_PATCHER_CACHE.clear()
 
         bundle = self._make_bundle()
@@ -205,7 +206,13 @@ class TestLoadFromExternal:
                 bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
             )
 
-        cache_key = "external_ExtModel_attn_sdpa"
+        # Hand-built bundle without identity fields: stat fallback on
+        # source_path (missing file -> mtime/size placeholders), attention
+        # resolved from the widget, dtype falls back to the widget value.
+        cache_key = identity_for_external(
+            "/fake/model.safetensors", "ExtModel", "sdpa",
+            use_llm_4bit=False, dtype_str="fp32",
+        )
         assert cache_key in VIBEVOICE_PATCHER_CACHE
         assert VIBEVOICE_PATCHER_CACHE[cache_key] is patcher
         VIBEVOICE_PATCHER_CACHE.clear()

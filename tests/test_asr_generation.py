@@ -382,6 +382,7 @@ class TestLoadASRFromExternal:
     def test_caches_patcher_under_external_key(self):
         from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
         from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.model_registry import identity_for_external
 
         LOADED_ASR_MODELS_CACHE.clear()
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
@@ -389,7 +390,12 @@ class TestLoadASRFromExternal:
         bundle = self._make_bundle(name="ext-asr")
         self._patched_load(bundle, attention_mode="sdpa")
 
-        assert "asr_external_ext-asr_attn_sdpa" in VIBEVOICE_ASR_PATCHER_CACHE
+        # Hand-built bundle: stat fallback (missing file), widget dtype.
+        key = identity_for_external(
+            "fake.safetensors", "ext-asr", "sdpa",
+            use_llm_4bit=False, dtype_str="fp32", prefix="asr_external",
+        )
+        assert key in VIBEVOICE_ASR_PATCHER_CACHE
 
         LOADED_ASR_MODELS_CACHE.clear()
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
@@ -397,6 +403,7 @@ class TestLoadASRFromExternal:
     def test_registers_loaded_asr_cache_entry(self):
         from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
         from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.model_registry import identity_for_external
 
         LOADED_ASR_MODELS_CACHE.clear()
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
@@ -404,7 +411,10 @@ class TestLoadASRFromExternal:
         bundle = self._make_bundle(name="ext-asr")
         patcher, model, processor = self._patched_load(bundle)
 
-        key = "asr_external_ext-asr_attn_sdpa"
+        key = identity_for_external(
+            "fake.safetensors", "ext-asr", "sdpa",
+            use_llm_4bit=False, dtype_str="fp32", prefix="asr_external",
+        )
         assert key in LOADED_ASR_MODELS_CACHE
         assert LOADED_ASR_MODELS_CACHE[key] == (model, processor)
 

@@ -181,6 +181,85 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.5.0 - Quant-Resident Runtime: GGUF Raw-Block Residency + ConvRot INT8</strong></summary>
+
+### 🚀 Performance / Memory
+*   **GGUF loading no longer spikes RAM (~2× full-float size eliminated).**
+    Quantized weights now stay **raw-block resident end-to-end**: the loader
+    copies exact on-disk block bytes into `uint8` parameters (zero float
+    materialization), transfers raw bytes to VRAM, and dequantizes each block
+    to the activation dtype only during the matrix multiply. A ~4 GB Q8_0
+    VibeVoice GGUF that previously spiked **~10 GB of RAM** and then occupied
+    full-float VRAM now peaks near its file size and resides in VRAM at roughly
+    the file's size.
+*   **Dense tensors load at their native dtype** (F32/F16/BF16 zero-copy views)
+    instead of a uniform fp32 expansion — the 456 MB BF16 embedding in the
+    common 1.5B GGUF no longer doubles during load.
+*   **Size accounting is truthful**: ComfyUI's VRAM arbitration and lowvram
+    partial loading now see actual residency bytes (raw blocks count as one
+    byte/weight).
+
+### ✨ New Features
+*   **ConvRot INT8 checkpoints are supported.** Safetensors models carrying
+    `*.comfy_quant` metadata (`int8_tensorwise`, `convrot=true`) execute through
+    comfy-kitchen's INT8 ConvRot kernels (cuda/triton when available, eager
+    otherwise); int8 weights + fp32 scales stay resident.
+*   **Supported GGML types:** Q8_0 / Q4_K / Q5_K / Q6_K become quant-resident
+    linears; F32 / F16 / BF16 pass through natively. Other types fail fast with
+    an actionable error naming the tensor and supported list.
+*   **Quantized safetensors checkpoints execute end-to-end.** Beyond rotated
+    ConvRot INT8 layers, plain rowwise INT8 layers (mixed checkpoints ship
+    both) and rowwise FP8 e4m3/e5m2 layers are dequantized to their declared
+    dtype at load time using their per-row/per-tensor scales, and unrotated
+    `int8_blockwise` checkpoints (per-gs×gs-block scale grids) dequantize the
+    same way. Unsupported `.comfy_quant` formats now hard-fail immediately
+    instead of silently misloading integer weights as floats, a dense-load
+    gate rejects any checkpoint carrying unplanned quantized storages with an
+    actionable message, and ROTATED quantized non-Linear layers (e.g. an
+    int8-rotated embedding) fail with explicit re-export guidance — they are
+    mathematically unexecutable without the converter's private rotation.
+*   Both llama.cpp-style and HF pass-through GGUF key naming are mapped;
+    unknown keys hard-fail listing the offenders. `tools/probe_gguf.py`
+    inventories any file (types, scheme, residency coverage).
+
+### 🛡️ Safety
+*   Dtype casting never touches quant-resident storage (raw uint8/int8 weights,
+    fp32 scales), so requesting a different model dtype can no longer corrupt
+    quantized weights. Exclusivity is validated up-front (GGUF ⊕ ConvRot ⊕
+    bnb-4bit; SageAttention over K-quants warns only).
+
+</details>
+
+<details>
+<summary><strong>v2.4.0 - Unload Previous Model on Change (Memory Fix)</strong></summary>
+
+### 🐛 Bug Fixes
+*   **Switching models no longer keeps the old model's memory filled while the
+    new one loads.** Selecting a different model in *Load VibeVoice Model*
+    (or changing the TTS/ASR dropdown model) now **fully releases the previous
+    model — RAM, VRAM, and ComfyUI's loaded-model registry — before any byte of
+    the new model is read**, so peak memory during a swap stays at ~1× model
+    size instead of ~2×. Eviction unregisters the old patcher from
+    `model_management.current_loaded_models` (with finalizer detach), nulls all
+    references, and runs an explicit GC + cache-empty pass.
+*   **External cache keys are now file-identity-aware.** Two different weight
+    files that share the same config name (e.g. a BF16 and a GGUF build of
+    VibeVoice-1.5B) previously collided in the cache: the freshly loaded model
+    was silently ignored and inference ran on the old weights. Cache identity
+    now includes the weight file name, modification time, size, resolved
+    attention mode, 4-bit flag, and dtype — switching `quantize_llm_4bit`,
+    `dtype`, or the weight file always runs the newly selected build.
+
+### ⚠️ Behavior Changes
+*   **Single active model per family** (TTS / ASR), matching common TTS node
+    semantics: loading a second VibeVoice model evicts the first. Workflows no
+    longer keep two VibeVoice models resident simultaneously.
+*   If loading a new model fails after a switch, the previous model has already
+    been released; re-select it to load it again.
+
+</details>
+
+<details open>
 <summary><strong>v2.3.2 - Fix Gibberish Output (RoPE inv_freq Regression)</strong></summary>
 
 ### 🐛 Bug Fixes

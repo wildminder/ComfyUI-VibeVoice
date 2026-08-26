@@ -225,3 +225,253 @@ def tiny_patcher(tiny_handler):
     patcher.model = tiny_handler
     patcher.pinned = set()  # ModelPatcher.__del__ → unpin_all_weights() needs this
     return patcher
+
+
+# ====================================================================
+# 6. SYNTHETIC GGUF FIXTURES (quant-resident runtime)
+# ====================================================================
+# Spec-driven builders producing real .gguf files via gguf.GGUFWriter so the
+# loader/planner/modules are exercised against genuine container bytes.
+# K-quants cannot be produced by gguf-py (dequantize-only), so Q4_K/Q5_K/Q6_K
+# blocks are handcrafted with controlled fp16 scales — valid blocks whose
+# dequantized values are finite and bounded (usable by forward-parity tests).
+
+_GGUF_BLOCK_SHAPES = {
+    "Q8_0": (32, 34),
+    "Q4_K": (256, 144),
+    "Q5_K": (256, 176),
+    "Q6_K": (256, 210),
+}
+
+
+def craft_kquant_blocks(qtype_name: str, n_elements: int, seed: int = 0):
+    """Handcraft one flat uint8 array of raw K-quant/Q8_0 blocks.
+
+    Scales are small sane fp16 values and quanta bounded, keeping
+    dequantized magnitudes well inside float range.
+    """
+    import numpy as np
+
+    block_size, type_size = _GGUF_BLOCK_SHAPES[qtype_name]
+    n_blocks = n_elements // block_size
+    rng = np.random.default_rng(seed)
+    b = np.zeros((n_blocks, type_size), dtype=np.uint8)
+
+    def _fp16_bytes(values):
+        return np.asarray(values, dtype=np.float16).view(np.uint8).reshape(-1)
+
+    d = 0.03 + np.abs(rng.standard_normal(n_blocks)) * 0.02
+    if qtype_name == "Q8_0":
+        qs = rng.integers(0, 256, size=(n_blocks, 32), dtype=np.uint8)
+        b[:, 0:2] = _fp16_bytes(d).reshape(n_blocks, 2)
+        b[:, 2:] = qs
+    elif qtype_name in ("Q4_K", "Q5_K"):
+        dmin = 0.0005 + np.abs(rng.standard_normal(n_blocks)) * 0.001
+        b[:, 0:2] = _fp16_bytes(d).reshape(n_blocks, 2)
+        b[:, 2:4] = _fp16_bytes(dmin).reshape(n_blocks, 2)
+        b[:, 4:16] = rng.integers(0, 64, size=(n_blocks, 12), dtype=np.uint8)
+        if qtype_name == "Q4_K":
+            b[:, 16:] = rng.integers(0, 256, size=(n_blocks, 128), dtype=np.uint8)
+        else:
+            b[:, 16:48] = rng.integers(0, 256, size=(n_blocks, 32), dtype=np.uint8)
+            b[:, 48:] = rng.integers(0, 256, size=(n_blocks, 128), dtype=np.uint8)
+    elif qtype_name == "Q6_K":
+        # scales int8 near zero; keep |scale| small so products stay finite
+        b[:, 0:128] = rng.integers(0, 256, size=(n_blocks, 128), dtype=np.uint8)
+        b[:, 128:192] = rng.integers(0, 256, size=(n_blocks, 64), dtype=np.uint8)
+        b[:, 192:208] = rng.integers(60, 68, size=(n_blocks, 16)).astype(np.uint8)
+        b[:, 208:210] = _fp16_bytes(
+            0.01 + np.abs(rng.standard_normal(n_blocks)) * 0.01
+        ).reshape(n_blocks, 2)
+    else:
+        raise ValueError(f"craft_kquant_blocks: unsupported type {qtype_name}")
+    return b
+
+
+def write_synthetic_gguf(path, spec, seed: int = 0):
+    """Write a .gguf file from ``spec`` and return ``path``.
+
+    Args:
+        path: Target file path (str or pathlib.Path).
+        spec: Iterable of ``(name, qtype_str_or_float, shape)`` tuples where
+            shape is the TORCH-logical shape (out, in) for weights.
+            Float types: 'F32' / 'F16' / 'BF16'. Quant types: 'Q8_0' /
+            'Q4_K' / 'Q5_K' / 'Q6_K'.
+        seed: Deterministic content seed.
+
+    Returns:
+        The written path (as given).
+    """
+    import numpy as np
+    import gguf as _gguf
+    from gguf.constants import GGMLQuantizationType as T
+
+    writer = _gguf.GGUFWriter(str(path), "vibevoice")
+    try:
+        for i, (name, kind, shape) in enumerate(spec):
+            n_elem = int(np.prod(shape))
+            if kind == "F32":
+                rng = np.random.default_rng(seed * 1000 + i)
+                writer.add_tensor(name, (rng.standard_normal(shape) * 0.05).astype(np.float32),
+                                  raw_dtype=T.F32)
+            elif kind == "F16":
+                rng = np.random.default_rng(seed * 1000 + i)
+                writer.add_tensor(name, (rng.standard_normal(shape) * 0.05).astype(np.float16),
+                                  raw_dtype=T.F16)
+            elif kind == "BF16":
+                rng = np.random.default_rng(seed * 1000 + i)
+                f32 = (rng.standard_normal(shape) * 0.05).astype(np.float32)
+                u16 = (f32.view(np.uint32) >> 16).astype(np.uint16)
+                rows = shape[0]
+                writer.add_tensor(name, u16.view(np.uint8).reshape(rows, -1),
+                                  raw_dtype=T.BF16)
+            elif kind in _GGUF_BLOCK_SHAPES:
+                block_size, type_size = _GGUF_BLOCK_SHAPES[kind]
+                if n_elem % block_size != 0 or shape[-1] % block_size != 0:
+                    raise ValueError(
+                        f"{kind} requires last dim multiple of {block_size}: {shape}"
+                        )
+                bytes_flat = craft_kquant_blocks(kind, n_elem, seed=seed * 1000 + i)
+                rows = shape[0]
+                bytes_per_row = shape[-1] // block_size * type_size
+                writer.add_tensor(name, bytes_flat.reshape(rows, bytes_per_row),
+                                  raw_dtype=getattr(T, kind))
+            else:
+                raise ValueError(f"write_synthetic_gguf: unknown kind {kind!r}")
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+    finally:
+        writer.close()
+    return path
+
+
+@pytest.fixture
+def make_gguf_file(tmp_path):
+    """Factory fixture: write_synthetic_gguf(tmp_path/'<tag>.gguf', spec)."""
+    def _make(spec, tag="model", seed=0):
+        return write_synthetic_gguf(tmp_path / f"{tag}.gguf", spec, seed=seed)
+    return _make
+
+
+def build_stub_vv(n_layers: int = 1, hidden: int = 64, ffn: int = 128,
+                  vocab: int = 96, seed: int = 0):
+    """Build a tiny real-parameter module tree mirroring VibeVoice topology.
+
+    Module paths match the HF pass-through naming seen in real checkpoints:
+        model.language_model.layers.N.{self_attn.{q,k,v,o}_proj,
+                                        mlp.{gate,up,down}_proj,
+                                        input_layernorm, post_attention_layernorm}
+        model.language_model.embed_tokens / .norm
+        lm_head (untied here for simplicity)
+        model.prediction_head.cond_proj / final_layer.linear
+
+    Returns an eager (non-meta) nn.Module in eval mode.
+    """
+    import torch.nn as nn
+
+    class _Lin(nn.Linear):
+        def __init__(self, i, o):
+            super().__init__(i, o, bias=False)
+
+    class _SelfAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = _Lin(hidden, hidden)
+            self.k_proj = _Lin(hidden, hidden // 4)
+            self.v_proj = _Lin(hidden, hidden // 4)
+            self.o_proj = _Lin(hidden, hidden)
+
+    class _MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = _Lin(hidden, ffn)
+            self.up_proj = _Lin(hidden, ffn)
+            self.down_proj = _Lin(ffn, hidden)
+
+    class _Norm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(hidden))
+
+    class _Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _SelfAttn()
+            self.mlp = _MLP()
+            self.input_layernorm = _Norm()
+            self.post_attention_layernorm = _Norm()
+
+    class _LM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(vocab, hidden)
+            self.layers = nn.ModuleList([_Layer() for _ in range(n_layers)])
+            self.norm = _Norm()
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = _LM()
+            self.prediction_head = nn.Module()
+            self.prediction_head.cond_proj = _Lin(hidden, hidden)
+            self.prediction_head.final_layer = nn.Module()
+            self.prediction_head.final_layer.linear = _Lin(hidden, hidden // 4)
+            self.speech_scaling_factor = nn.Parameter(torch.tensor(float("nan")))
+            self.speech_bias_factor = nn.Parameter(torch.tensor(float("nan")))
+
+    class _VV(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Model()
+            self.lm_head = _Lin(hidden, vocab)
+
+    torch.manual_seed(seed)
+    m = _VV().eval()
+
+    # Give every linear distinct float32 weights so parity checks are strict.
+    g = torch.Generator().manual_seed(seed)
+    for name, p in m.named_parameters():
+        if p.dtype.is_floating_point:
+            p.data = torch.randn(p.shape, generator=g) * 0.02
+    m.model.speech_scaling_factor.data.fill_(float("nan"))
+    m.model.speech_bias_factor.data.fill_(float("nan"))
+    return m
+
+
+def stub_vv_gguf_spec(n_layers: int = 1, hidden: int = 64, ffn: int = 128,
+                      vocab: int = 96, qtype: str = "Q8_0"):
+    """GGUF writer spec for :func:`build_stub_vv` linears (HF naming).
+
+    Quantizable linears use ``qtype``; everything else stays float
+    (F32 norms / BF16 embeddings + remaining linears), mirroring the real
+    vibevoice-1.5b-q8_0.gguf layout.
+    """
+    spec = [
+        ("model.language_model.embed_tokens.weight", "BF16", (vocab, hidden)),
+        ("model.language_model.norm.weight", "F32", (hidden,)),
+    ]
+    for i in range(n_layers):
+        p = f"model.language_model.layers.{i}"
+        spec += [
+            (f"{p}.input_layernorm.weight", "F32", (hidden,)),
+            (f"{p}.post_attention_layernorm.weight", "F32", (hidden,)),
+            (f"{p}.self_attn.q_proj.weight", qtype, (hidden, hidden)),
+            (f"{p}.self_attn.k_proj.weight", qtype, (hidden // 4, hidden)),
+            (f"{p}.self_attn.v_proj.weight", qtype, (hidden // 4, hidden)),
+            (f"{p}.self_attn.o_proj.weight", qtype, (hidden, hidden)),
+            (f"{p}.mlp.gate_proj.weight", qtype, (ffn, hidden)),
+            (f"{p}.mlp.up_proj.weight", qtype, (ffn, hidden)),
+            (f"{p}.mlp.down_proj.weight", qtype, (hidden, ffn)),
+        ]
+    spec += [
+        ("model.prediction_head.cond_proj.weight", "BF16", (hidden, hidden)),
+        ("model.prediction_head.final_layer.linear.weight", "F32", (hidden // 4, hidden)),
+        ("lm_head.weight", "BF16", (vocab, hidden)),
+    ]
+    return spec
+
+
+@pytest.fixture
+def make_stub_vv():
+    return build_stub_vv

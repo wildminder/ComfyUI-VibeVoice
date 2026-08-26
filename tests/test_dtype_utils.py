@@ -112,15 +112,48 @@ class TestGetDtypeStr:
 class TestCastModelToDtype:
     """Test cast_model_to_dtype function."""
 
-    def test_cast_calls_to(self):
-        model = MagicMock()
+    def test_cast_floats_only(self):
+        """cast_model_to_dtype casts floating params; raw uint8/int8 storage
+        (quant residents) must never be converted (plan 2026-08-24, E1)."""
+        class _M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.float_lin = torch.nn.Linear(4, 4)
+                self.raw = torch.nn.Parameter(
+                    torch.zeros(7, dtype=torch.uint8), requires_grad=False
+                )
+
+        model = _M()
+        model.raw._quant_resident = True  # mark via param attr is not used; module marker below
         cast_model_to_dtype(model, torch.float16)
-        model.to.assert_called_once_with(dtype=torch.float16)
+        assert model.float_lin.weight.dtype == torch.float16
+        assert model.raw.dtype == torch.uint8, "raw bytes recast!"
 
     def test_cast_none_dtype_noop(self):
         model = MagicMock()
         cast_model_to_dtype(model, None)
         model.to.assert_not_called()
+
+    def test_cast_protects_quant_resident_module(self):
+        from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
+
+        class _M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = torch.nn.Linear(4, 4)
+                from gguf.constants import GGMLQuantizationType as _T
+                self.res = GGUFLinear(8, 8, bias=True,
+                                      ggml_type=_T.Q8_0)
+                self.res.set_raw_weight(torch.full((self.res.weight.numel(),),
+                                                   17, dtype=torch.uint8))
+                self.res.bias.data = torch.ones(8, dtype=torch.float32)
+
+        model = _M()
+        cast_model_to_dtype(model, torch.float16)
+        # Resident weight stays raw uint8; its bias follows model dtype.
+        assert model.res.weight.dtype == torch.uint8
+        assert model.res.bias.dtype == torch.float16
+        assert model.lin.weight.dtype == torch.float16
 
 
 # ====================================================================
