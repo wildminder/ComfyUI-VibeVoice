@@ -166,3 +166,4 @@ cython_debug/
 .dev
 .workbuddy-ai/
 tmp/
+tools/

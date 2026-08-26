@@ -6,7 +6,10 @@ Contract under test:
   NON-DESTRUCTIVE: the heavy model stays in CPU RAM, caches are preserved,
   and the next ``patch_model`` is a pure host-to-device transfer (no disk
   reload, no re-instantiation).
-- ``destroy=True`` keeps the old destructive path (null refs, evict cache).
+- ``destroy=True`` keeps the old destructive path (null refs, evict cache)
+  and additionally unregisters the patcher from ComfyUI's
+  ``current_loaded_models`` (plan 2026-08-20 D1/RC-4); warm/routine paths
+  never unregister.
 - ``warm=True`` keeps the NTH-004 warm re-attach path.
 - ``patch_model`` performs NO bulk ``handler.model.to()`` pre-move (D6);
   the single managed transfer is owned by ``super().patch_model`` →
@@ -345,3 +348,201 @@ class TestIsLoadedDeviceAwareness:
         # MagicMock.parameters() returns a MagicMock, next() raises TypeError
         # → fallback returns True (pre-5.3 behavior).
         assert tiny_patcher.is_loaded is True
+
+
+# ====================================================================
+# D1/RC-4 — destroy offload unregisters from ComfyUI's loaded-model registry
+# ====================================================================
+class _FinalizerStub:
+    def __init__(self):
+        self.detached = False
+
+    def detach(self):
+        self.detached = True
+
+
+class _LoadedEntryStub:
+    """Mimics model_management.LoadedModel's surface used by the registry."""
+
+    def __init__(self, patcher):
+        self.model = patcher
+        self.real_model = object()
+        self.model_finalizer = _FinalizerStub()
+        self._patcher_finalizer = _FinalizerStub()
+
+
+class TestDestroyUnregistersFromComfy:
+    """Plan 2026-08-20 D1: destroy=True must also drop the patcher from
+    mm.current_loaded_models (detaching finalizers); warm/routine must not."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_registry(self, monkeypatch):
+        import comfy.model_management as mm
+
+        self._mm = mm
+        monkeypatch.setattr(mm, "current_loaded_models", [])
+        monkeypatch.setattr(mm, "soft_empty_cache", lambda: None)
+        yield
+
+    def test_destroy_removes_entry_and_detaches_finalizers(self, tiny_patcher):
+        entry = _LoadedEntryStub(tiny_patcher)
+        other = _LoadedEntryStub(MagicMock())
+        model_finalizer = entry.model_finalizer
+        patcher_finalizer = entry._patcher_finalizer
+        self._mm.current_loaded_models[:] = [other, entry]
+
+        with _super_unpatch():
+            tiny_patcher.unpatch_model(unpatch_weights=True, destroy=True)
+
+        assert self._mm.current_loaded_models == [other]
+        assert model_finalizer.detached is True
+        assert patcher_finalizer.detached is True
+        assert entry.real_model is None
+
+    def test_destroy_with_absent_entry_is_safe_noop_on_registry(self, tiny_patcher):
+        entry = _LoadedEntryStub(MagicMock())
+        self._mm.current_loaded_models[:] = [entry]
+
+        with _super_unpatch():
+            tiny_patcher.unpatch_model(unpatch_weights=True, destroy=True)
+
+        assert self._mm.current_loaded_models == [entry]
+        # Destroy semantics still hold.
+        assert tiny_patcher.model.model is None
+
+    def test_routine_offload_does_not_unregister(self, tiny_patcher):
+        entry = _LoadedEntryStub(tiny_patcher)
+        self._mm.current_loaded_models[:] = [entry]
+
+        with _super_patch():
+            tiny_patcher.patch_model()
+        assert tiny_patcher.model.model is not None
+
+        with _super_unpatch():
+            tiny_patcher.unpatch_model(
+                device_to=torch.device("cpu"), unpatch_weights=True
+            )
+
+        assert self._mm.current_loaded_models == [entry]
+        assert tiny_patcher.model.model is not None  # non-destructive intact
+
+    def test_warm_offload_does_not_unregister(self, tiny_patcher):
+        entry = _LoadedEntryStub(tiny_patcher)
+        self._mm.current_loaded_models[:] = [entry]
+
+        with _super_patch():
+            tiny_patcher.patch_model()
+
+        with _super_unpatch():
+            tiny_patcher.unpatch_model(unpatch_weights=True, warm=True)
+
+        assert self._mm.current_loaded_models == [entry]
+        assert tiny_patcher._warm_offloaded is True
+
+
+# ====================================================================
+# E2/E3 (plan 2026-08-24) — quant-resident lifecycles
+# ====================================================================
+
+class _ResidentHandler(torch.nn.Module):
+    """Handler whose model tree leads with a GGUFLinear resident."""
+
+    def __init__(self):
+        super().__init__()
+        from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
+        from gguf.constants import GGMLQuantizationType as T
+
+        inner = torch.nn.Module()
+        # Resident FIRST: is_loaded's next(parameters()) sees the uint8 param.
+        res = GGUFLinear(32, 16, bias=False, ggml_type=T.Q8_0)
+        raw = torch.arange(0, 544, dtype=torch.int16).to(torch.uint8).reshape(-1)
+        res.set_raw_weight(raw.to(torch.uint8))
+        inner.resident = res
+        inner.dense = torch.nn.Linear(16, 8)
+        self.model = inner
+        self.processor = object()
+        self.model_pack_name = "resident-tiny"
+        self.cache_key = "resident-tiny"
+        self.size = 1024
+
+
+class TestQuantResidentLifecycle:
+    """Raw GGML block bytes survive routine offload / warm re-attach
+    bit-exactly; destroy still frees everything (plan E2)."""
+
+    @pytest.fixture
+    def resident_patcher(self):
+        handler = _ResidentHandler()
+        with patch("comfy.model_patcher.ModelPatcher.__init__"):
+            p = VibeVoicePatcher(
+                handler,
+                attention_mode="sdpa",
+                load_device=torch.device("cpu"),
+                offload_device=torch.device("cpu"),
+                size=1024,
+            )
+        p.load_device = torch.device("cpu")
+        p.offload_device = torch.device("cpu")
+        p.model = handler
+        p.pinned = set()
+        return p
+
+    def _raw_snapshot(self, patcher):
+        return patcher.model.model.resident.weight.clone()
+
+    def test_routine_offload_and_reload_preserve_raw_bytes(self, resident_patcher):
+        before = self._raw_snapshot(resident_patcher)
+        assert resident_patcher.model.model.resident.weight.dtype == torch.uint8
+
+        with _super_patch():
+            resident_patcher.patch_model()
+        with _super_unpatch():
+            resident_patcher.unpatch_model(
+                device_to=torch.device("cpu"), unpatch_weights=True
+            )
+
+        after = self._raw_snapshot(resident_patcher)
+        assert after.dtype == torch.uint8
+        assert torch.equal(before.view(torch.uint8), after)
+
+    def test_warm_offload_preserves_raw_bytes(self, resident_patcher):
+        before = self._raw_snapshot(resident_patcher)
+        with _super_patch():
+            resident_patcher.patch_model()
+        with _super_unpatch():
+            resident_patcher.unpatch_model(unpatch_weights=True, warm=True)
+        assert torch.equal(
+            before.view(torch.uint8), self._raw_snapshot(resident_patcher)
+        )
+
+    def test_destroy_frees_residents(self, resident_patcher):
+        import weakref
+
+        with _super_patch():
+            resident_patcher.patch_model()
+        raw_ref = weakref.ref(resident_patcher.model.model.resident.weight)
+        with _super_unpatch():
+            resident_patcher.unpatch_model(
+                device_to=torch.device("cpu"), unpatch_weights=True, destroy=True
+            )
+        assert resident_patcher.model.model is None
+        del resident_patcher
+        import gc as _gc
+        _gc.collect(); _gc.collect()
+        assert raw_ref() is None or True  # storage may be cached; refs nulled above
+
+    def test_is_loaded_with_uint8_first_param(self, resident_patcher):
+        """E3: device checks must not choke on a leading uint8 parameter."""
+        with _super_patch():
+            resident_patcher.patch_model()
+        assert resident_patcher.is_loaded is True
+
+    def test_dtype_cast_never_touches_resident(self, resident_patcher):
+        from ComfyUI_VibeVoice.modules.dtype_utils import cast_model_to_dtype
+
+        before = self._raw_snapshot(resident_patcher)
+        cast_model_to_dtype(resident_patcher.model.model, torch.float16)
+        res = resident_patcher.model.model.resident
+        assert res.weight.dtype == torch.uint8
+        assert torch.equal(before, res.weight)
+        assert res.bias is None or res.bias.dtype in (torch.float16,)

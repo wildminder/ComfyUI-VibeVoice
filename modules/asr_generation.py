@@ -17,6 +17,7 @@ from transformers.generation import BaseStreamer
 
 from .asr_loader import VibeVoiceASRLoader, VibeVoiceASRModelHandler, LOADED_ASR_MODELS_CACHE, cleanup_asr_models
 from .patcher import VibeVoiceASRPatcher
+from .model_registry import FAMILY_ASR, evict_if_changed, identity_for_external
 from .utils import VIBEVOICE_ASR_PATCHER_CACHE
 from .device_utils import get_torch_device, get_offload_device, DEVICE_CPU
 from .dtype_utils import resolve_dtype, DTYPE_AUTO
@@ -210,6 +211,10 @@ def load_asr_model_patched(
 
     cache_key = f"asr_{model_name}_attn_{actual_attn}"
 
+    # Unload-before-load gate (plan 2026-08-20, C4/RC-1): a different active
+    # ASR model is fully released before the new one is built/loaded.
+    evict_if_changed(FAMILY_ASR, cache_key, (VIBEVOICE_ASR_PATCHER_CACHE,))
+
     if cache_key not in VIBEVOICE_ASR_PATCHER_CACHE or force_reload:
         if force_reload:
             VIBEVOICE_ASR_PATCHER_CACHE.pop(cache_key, None)
@@ -287,7 +292,13 @@ def load_asr_from_external(
     model_name = model_bundle["model_name"]
 
     # Resolve attention mode with internal fallback (no 4-bit for ASR).
-    actual_attn = resolve_attention_mode(attention_mode, quantize_4bit=False)
+    # Plan 2026-08-20 (P1): prefer the bundle-recorded (loader-resolved) mode
+    # so the cache key describes the weights actually built.
+    bundle_attention = model_bundle.get("attention_mode")
+    if isinstance(bundle_attention, str) and bundle_attention:
+        actual_attn = bundle_attention
+    else:
+        actual_attn = resolve_attention_mode(attention_mode, quantize_4bit=False)
 
     # Device placement (mirrors load_asr_model_patched).
     if device == DEVICE_CPU:
@@ -299,7 +310,22 @@ def load_asr_from_external(
 
     target_dtype = resolve_dtype(dtype, load_device)
 
-    cache_key = f"asr_external_{model_name}_attn_{actual_attn}"
+    # Plan 2026-08-20 (RC-2/B3): file-identity-aware ASR cache key, derived
+    # from the bundle's recorded build fields (fallbacks keep hand-built
+    # bundles working).
+    bundle_use_llm_4bit = bool(model_bundle.get("use_llm_4bit", False))
+    bundle_dtype_str = model_bundle.get("dtype_str") or dtype
+    cache_key = identity_for_external(
+        model_bundle.get("source_path", ""),
+        model_name,
+        actual_attn,
+        use_llm_4bit=bundle_use_llm_4bit,
+        dtype_str=bundle_dtype_str,
+        prefix="asr_external",
+    )
+
+    # Unload-before-load gate (plan 2026-08-20, C4/RC-1).
+    evict_if_changed(FAMILY_ASR, cache_key, (VIBEVOICE_ASR_PATCHER_CACHE,))
 
     if cache_key not in VIBEVOICE_ASR_PATCHER_CACHE:
         handler = ExternalVibeVoiceASRModelHandler(model, processor, model_name, model_bundle)
