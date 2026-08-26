@@ -20,6 +20,7 @@ Determinism: no network, no real GPU. Uses the conftest ``tiny_patcher`` /
 ``tiny_handler`` stubs (real ``torch.nn.Linear`` weights, CPU only).
 """
 
+import types
 import torch
 import pytest
 from unittest.mock import patch, MagicMock
@@ -546,3 +547,93 @@ class TestQuantResidentLifecycle:
         assert res.weight.dtype == torch.uint8
         assert torch.equal(before, res.weight)
         assert res.bias is None or res.bias.dtype in (torch.float16,)
+# ====================================================================
+# Lowvram partial-load completion (7B crash: tail modules left on CPU)
+# ====================================================================
+
+class _FakeTree:
+    """Stands in for the transformers tree: named_parameters() reports
+    device-tagged stand-ins; .to() records the target it was given."""
+
+    def __init__(self, devices):
+        self._devices = devices
+        self.to_calls = []
+
+    def named_parameters(self):
+        return [(f"p{i}", type("P", (), {"device": d})())
+                for i, d in enumerate(self._devices)]
+
+    def to(self, device):
+        self.to_calls.append(device)
+        return self
+
+
+def _patcher_with_tree(devices):
+    handler = types.SimpleNamespace(model=_FakeTree(devices),
+                                    model_pack_name="fake")
+    with patch("comfy.model_patcher.ModelPatcher.__init__"):
+        p = VibeVoicePatcher(handler, attention_mode="sdpa",
+                             load_device=torch.device("cuda"),
+                             offload_device=torch.device("cpu"),
+                             size=1024)
+    p.load_device = torch.device("cuda")
+    p.offload_device = torch.device("cpu")
+    p.model = handler
+    p.target_dtype = None
+    # Attributes core's __del__/detach chain touches on newer ComfyUI.
+    p.pinned = set()
+    p.is_injected = False
+    p.skip_injection = False
+    p.injections = {}
+    p.callbacks = {}
+    p.wrappers = {}
+    p.model_options = {"transformer_options": {}}
+    return p
+
+
+class TestPartialLoadCompletion:
+    """ComfyUI's lowvram partial loading leaves tail modules on CPU,
+    expecting comfy.ops streaming that a plain transformers tree lacks.
+    patch_model must complete any straggler transfer (VibeVoice-7B fix).
+    Devices are compared symbolically; no CUDA required."""
+
+    CUDA = torch.device("cuda")
+
+    def test_completes_stray_transfer(self):
+        # One parameter still on CPU after core's partial placement.
+        patcher = _patcher_with_tree([self.CUDA, self.CUDA,
+                                      torch.device("cpu")])
+        moved = patcher._complete_partial_transfer(self.CUDA)
+        assert moved == 1
+        assert patcher.model.model.to_calls == [self.CUDA]
+
+    def test_fully_placed_tree_is_noop(self):
+        patcher = _patcher_with_tree([self.CUDA, self.CUDA])
+        assert patcher._complete_partial_transfer(self.CUDA) == 0
+        assert patcher.model.model.to_calls == []
+
+    def test_patch_model_invokes_completion(self):
+        """End-to-end: core placement stubbed to a no-op; patch_model must
+        still leave every parameter on the load device."""
+        patcher = _patcher_with_tree([self.CUDA, torch.device("cpu")])
+
+        def _stub_super(*a, **k):  # core places nothing
+            return None
+
+        with patch("comfy.model_patcher.ModelPatcher.patch_model",
+                   side_effect=_stub_super):
+            patcher.patch_model(device_to=self.CUDA, load_weights=True)
+
+        assert patcher.model.model.to_calls == [self.CUDA]
+
+    def test_load_weights_false_skips_completion(self):
+        patcher = _patcher_with_tree([torch.device("cpu")])
+        moved = patcher._complete_partial_transfer(self.CUDA)
+        assert moved == 1  # direct helper still completes
+        # ...but patch_model gates on load_weights:
+        def _stub_super(*a, **k):
+            return None
+        with patch("comfy.model_patcher.ModelPatcher.patch_model",
+                   side_effect=_stub_super):
+            patcher.patch_model(device_to=self.CUDA, load_weights=False)
+        assert len(patcher.model.model.to_calls) == 1  # only the direct call above

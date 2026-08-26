@@ -57,12 +57,14 @@ logger = logging.getLogger(__name__)
 # values require a sidecar config file next to the weight file.
 _PACKAGED_CONFIG_FILES = {
     "VibeVoice-1.5B": "default_VibeVoice-1.5B_config.json",
+    "VibeVoice-7B": "default_VibeVoice-Large_config.json",
     "VibeVoice-Large": "default_VibeVoice-Large_config.json",
 }
 
 # All config_name values accepted by the loader node dropdown.
 EXTERNAL_CONFIG_OPTIONS = [
     "VibeVoice-1.5B",
+    "VibeVoice-7B",
     "VibeVoice-Large",
     "VibeVoice-Realtime-0.5B",
     "VibeVoice-ASR",

@@ -23,8 +23,8 @@ MODEL_CONFIGS = {
         "size_gb": 3.0,
         "model_type": "tts",
     },
-    "VibeVoice-Large": {
-        "repo_id": "aoi-ot/VibeVoice-Large",
+    "VibeVoice-7B": {
+        "repo_id": "vibevoice/VibeVoice-7B",
         "size_gb": 17.4,
         "model_type": "tts",
     },
@@ -58,7 +58,7 @@ def get_tokenizer_repo(model_name: str) -> str:
         HuggingFace repo ID for the tokenizer.
     """
     name_lower = model_name.lower()
-    if "large" in name_lower or "asr" in name_lower:
+    if "large" in name_lower or "asr" in name_lower or "7b" in name_lower:
         return "Qwen/Qwen2.5-7B"
     return "Qwen/Qwen2.5-1.5B"
 

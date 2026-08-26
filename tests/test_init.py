@@ -50,7 +50,7 @@ class TestOfficialModelsPopulated:
         """AVAILABLE_VIBEVOICE_MODELS should have official entries."""
         from ComfyUI_VibeVoice.modules.model_info import MODEL_CONFIGS
         assert "VibeVoice-1.5B" in MODEL_CONFIGS
-        assert "VibeVoice-Large" in MODEL_CONFIGS
+        assert "VibeVoice-7B" in MODEL_CONFIGS
 
 
 class TestEntrypointExport:

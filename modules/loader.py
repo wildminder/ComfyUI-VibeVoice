@@ -12,7 +12,6 @@ Handles:
 import os
 import json
 import gc
-import shutil
 import logging
 import contextlib
 import torch
@@ -342,8 +341,9 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
     def _load_tokenizer(tokenizer_dir: str, model_name: str) -> "VibeVoiceTextTokenizerFast":
         """Load the VibeVoice text tokenizer.
 
-        Attempts to find tokenizer.json in the model directory, copies a
-        packaged fallback if available, or downloads from HuggingFace.
+        Acquisition order: tokenizer.json in the model directory → packaged
+        tokenizer loaded DIRECTLY from the node folder (never copied into the
+        user's model directory) → download from HuggingFace as last resort.
 
         Args:
             tokenizer_dir: Directory to find/create tokenizer.json.
@@ -360,50 +360,47 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         if not os.path.exists(tokenizer_file_path):
             logger.info(f"'tokenizer.json' not found in model directory: {tokenizer_dir}")
 
-            # Try packaged fallback
+            # Packaged fallback: load straight from the node folder. The
+            # user's model directory stays untouched.
             packaged_configs_dir = os.path.join(
                 os.path.dirname(__file__), "..", "src", "vibevoice", "configs"
             )
             packaged_tokenizer_path = os.path.join(packaged_configs_dir, "tokenizer.json")
 
             if os.path.exists(packaged_tokenizer_path):
-                try:
-                    logger.info("Found pre-packaged tokenizer. Copying it to model directory...")
-                    shutil.copyfile(packaged_tokenizer_path, tokenizer_file_path)
-                except Exception as e:
-                    logger.warning(f"Failed to copy pre-packaged tokenizer: {e}. Will attempt to download.")
+                logger.info("Using pre-packaged tokenizer directly from the node folder...")
+                return VibeVoiceTextTokenizerFast(tokenizer_file=packaged_tokenizer_path)
 
             # Download from HuggingFace if still missing
-            if not os.path.exists(tokenizer_file_path):
-                repos_to_try = ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"]
-                download_successful = False
-                last_error = None
+            repos_to_try = ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"]
+            download_successful = False
+            last_error = None
 
-                for repo_id in repos_to_try:
-                    logger.info(f"Attempting to download 'tokenizer.json' from Hugging Face repo '{repo_id}'...")
-                    try:
-                        hf_hub_download(
-                            repo_id=repo_id,
-                            filename="tokenizer.json",
-                            local_dir=tokenizer_dir,
-                        )
-                        download_successful = True
-                        logger.info("Download successful.")
-                        break
-                    except Exception as e:
-                        logger.warning(f"Failed to download from '{repo_id}': {e}")
-                        last_error = e
-
-                if not download_successful:
-                    error_message = (
-                        f"FATAL: Could not get 'tokenizer.json'. All download attempts failed.\n"
-                        f"Last error: {last_error}\n\n"
-                        f"ACTION REQUIRED:\n"
-                        f"1. Manually download 'tokenizer.json' from "
-                        f"https://huggingface.co/{repos_to_try[0]}/blob/main/tokenizer.json\n"
-                        f"2. Place the downloaded file in the following directory:\n   '{tokenizer_dir}'"
+            for repo_id in repos_to_try:
+                logger.info(f"Attempting to download 'tokenizer.json' from Hugging Face repo '{repo_id}'...")
+                try:
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        filename="tokenizer.json",
+                        local_dir=tokenizer_dir,
                     )
-                    raise RuntimeError(error_message)
+                    download_successful = True
+                    logger.info("Download successful.")
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to download from '{repo_id}': {e}")
+                    last_error = e
+
+            if not download_successful:
+                error_message = (
+                    f"FATAL: Could not get 'tokenizer.json'. All download attempts failed.\n"
+                    f"Last error: {last_error}\n\n"
+                    f"ACTION REQUIRED:\n"
+                    f"1. Manually download 'tokenizer.json' from "
+                    f"https://huggingface.co/{repos_to_try[0]}/blob/main/tokenizer.json\n"
+                    f"2. Place the downloaded file in the following directory:\n   '{tokenizer_dir}'"
+                )
+                raise RuntimeError(error_message)
 
         return VibeVoiceTextTokenizerFast(tokenizer_file=tokenizer_file_path)
 

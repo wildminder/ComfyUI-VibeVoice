@@ -50,15 +50,15 @@ class TestVibeVoiceModelHandler:
         assert handler.cache_key == "VibeVoice-1.5B_attn_sdpa_q4_0"
 
     def test_handler_cache_key_4bit(self):
-        handler = VibeVoiceModelHandler("VibeVoice-Large", attention_mode="eager", use_llm_4bit=True)
-        assert handler.cache_key == "VibeVoice-Large_attn_eager_q4_1"
+        handler = VibeVoiceModelHandler("VibeVoice-7B", attention_mode="eager", use_llm_4bit=True)
+        assert handler.cache_key == "VibeVoice-7B_attn_eager_q4_1"
 
     def test_handler_size_calculation(self):
         handler = VibeVoiceModelHandler("VibeVoice-1.5B")
         assert handler.size == int(3.0 * (1024**3))
 
     def test_handler_size_large(self):
-        handler = VibeVoiceModelHandler("VibeVoice-Large")
+        handler = VibeVoiceModelHandler("VibeVoice-7B")
         assert handler.size == int(17.4 * (1024**3))
 
     def test_handler_is_torch_module(self):
@@ -653,34 +653,28 @@ class TestLoadConfig:
 # AUDIT PHASE B — B3: tokenizer acquisition order
 # ====================================================================
 class TestLoadTokenizer:
-    """B3: existing file -> packaged copy -> HF download -> RuntimeError."""
+    """B3 acquisition order, copy-free: existing file -> packaged direct
+    load -> HF download -> RuntimeError."""
 
-    def test_existing_tokenizer_no_copy_no_download(self, tmp_path):
+    def test_existing_tokenizer_no_packaged_no_download(self, tmp_path):
         (tmp_path / "tokenizer.json").write_text("{}")
-        with patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile") as mock_copy, \
-             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download") as mock_dl, \
-             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast") as mock_tok:
+        with patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download") as mock_dl,              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast") as mock_tok:
             VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
-            mock_copy.assert_not_called()
             mock_dl.assert_not_called()
-            mock_tok.assert_called_once_with(
-                tokenizer_file=str(tmp_path / "tokenizer.json")
-            )
+            assert mock_tok.call_args[1]["tokenizer_file"] ==                 str(tmp_path / "tokenizer.json")
 
-    def test_packaged_fallback_copied_no_download(self, tmp_path):
-        # No tokenizer.json in the model dir; packaged copy exists (mocked).
-        def fake_copy(src, dst):
-            with open(dst, "w") as f:
-                f.write("{}")
-
+    def test_packaged_fallback_loaded_directly_no_side_effects(self, tmp_path):
+        """Packaged tokenizer loads straight from the node folder; the
+        user's model directory is never written to."""
         with patch("os.path.exists", side_effect=lambda p: (
             True if "configs" in p else os.path.isfile(p)
-        )), patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile", side_effect=fake_copy) as mock_copy, \
-             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download") as mock_dl, \
-             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
+        )), patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download") as mock_dl,              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast") as mock_tok:
             VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
-            mock_copy.assert_called_once()
             mock_dl.assert_not_called()
+            used_path = mock_tok.call_args[1]["tokenizer_file"]
+            assert "configs" in used_path
+            assert used_path.endswith("tokenizer.json")
+            assert not (tmp_path / "tokenizer.json").exists()
 
     def test_download_fallback_second_repo_succeeds(self, tmp_path):
         calls = []
@@ -689,23 +683,20 @@ class TestLoadTokenizer:
             calls.append(repo_id)
             if repo_id == "Qwen/Qwen2.5-1.5B":
                 raise RuntimeError("offline")
-            # second repo succeeds
             with open(os.path.join(local_dir, "tokenizer.json"), "w") as f:
                 f.write("{}")
 
-        with patch("os.path.exists", side_effect=lambda p: os.path.isfile(p)), \
-             patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile"), \
-             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download", side_effect=fake_download), \
-             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
+        # Hide the packaged tokenizer so the download path runs.
+        with patch("os.path.exists",
+                   side_effect=lambda p: (False if "configs" in p
+                                          else os.path.isfile(p))),              patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download",
+                   side_effect=fake_download),              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
             VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
             assert calls == ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"]
 
     def test_all_sources_fail_raises_runtime_error(self, tmp_path):
-        with patch("os.path.exists", return_value=False), \
-             patch("ComfyUI_VibeVoice.modules.loader.shutil.copyfile"), \
-             patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download",
-                   side_effect=RuntimeError("offline")), \
-             patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
+        with patch("os.path.exists", return_value=False),              patch("ComfyUI_VibeVoice.modules.loader.hf_hub_download",
+                   side_effect=RuntimeError("offline")),              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceTextTokenizerFast"):
             with pytest.raises(RuntimeError, match="Could not get 'tokenizer.json'"):
                 VibeVoiceLoader._load_tokenizer(str(tmp_path), "TestModel")
 
