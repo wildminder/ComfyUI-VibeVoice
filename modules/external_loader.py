@@ -556,35 +556,128 @@ _QUANT_STORAGE_DTYPES = frozenset({
 })
 
 
+def _plan_quantized_safetensors_load(quant_map: dict):
+    """Build the module-replacement plan for a scanned comfy_quant map.
+
+    Pure planning — no state dict access, so both the batch path
+    (``_prepare_quantized_safetensors_load``) and the streaming path
+    (``_stream_apply_safetensors``) share one plan definition.
+
+    Returns:
+        ``(layer_plan, n_rowwise, n_fp8_resident)``.
+    """
+    from .convrot_quant import make_convrot_linear
+    from .fp8_quant import make_fp8_linear
+
+    layer_plan = {}
+    n_rowwise = 0
+    n_fp8_resident = 0
+    for prefix, info in quant_map.items():
+        if info.convrot:
+            layer_plan[prefix] = make_convrot_linear(info)
+        elif info.resident_fp8:
+            layer_plan[prefix] = make_fp8_linear(info)
+            n_fp8_resident += 1
+        else:
+            n_rowwise += 1
+    return layer_plan, n_rowwise, n_fp8_resident
+
+
+def _dequantize_rowwise_weight(prefix: str, info, w, s):
+    """Validate + dequant ONE rowwise/blockwise weight (batch + streaming).
+
+    Single-sourced so the batch dict-surgery path and the per-tensor
+    streaming path can never drift apart mathematically.
+
+    Returns:
+        The dequantized weight in the layer's declared orig dtype.
+
+    Raises:
+        QuantTargetMismatch: On storage-dtype / weight-shape / scale-shape
+            disagreement with the comfy_quant metadata.
+    """
+    from .convrot_quant import resolve_orig_dtype
+    from .quant_common import QuantTargetMismatch
+
+    storage_dtype = info.rowwise_dtype or torch.int8
+    if w.dtype != storage_dtype and w.dtype != torch.uint8:
+        raise QuantTargetMismatch(
+            f"Rowwise layer '{prefix}': expected {storage_dtype} storage, "
+            f"checkpoint has {w.dtype}"
+        )
+    if w.dim() != 2 or w.shape[0] != info.out_features \
+            or (info.in_features and w.shape[1] != info.in_features):
+        raise QuantTargetMismatch(
+            f"Rowwise layer '{prefix}': weight shape {tuple(w.shape)} "
+            f"disagrees with metadata [out={info.out_features}, "
+            f"in={info.in_features}]"
+        )
+    orig_dtype = resolve_orig_dtype(info.orig_dtype)
+
+    if info.group_size:
+        # BLOCKWISE scales: shape [out / gs, in / gs], one scale per
+        # gs x gs block (int8-blockwise checkpoints).
+        gs = int(info.group_size)
+        if w.shape[0] % gs or w.shape[1] % gs:
+            raise QuantTargetMismatch(
+                f"Blockwise layer '{prefix}': weight {tuple(w.shape)} "
+                f"not divisible by group_size {gs} on both dims"
+            )
+        og, ig = w.shape[0] // gs, w.shape[1] // gs
+        if tuple(s.shape) != (og, ig):
+            raise QuantTargetMismatch(
+                f"Blockwise layer '{prefix}': scale shape "
+                f"{tuple(s.shape)} disagrees with weight "
+                f"{tuple(w.shape)} at group_size {gs} (expected "
+                f"({og}, {ig}))"
+            )
+        # fp32 intermediate: exact rescale before the final cast.
+        return (
+            (
+                w.to(torch.float32).view(og, gs, ig, gs)
+                * s.to(torch.float32).view(og, 1, ig, 1)
+            ).reshape(w.shape).to(orig_dtype)
+        )
+
+    # SCALAR (per-tensor, fp8) or PER-ROW [out, 1] scales; both broadcast.
+    if not (s.dim() == 0 or (s.dim() == 2 and s.shape[1] == 1
+                             and s.shape[0] in (w.shape[0], 1))):
+        raise QuantTargetMismatch(
+            f"Rowwise layer '{prefix}': scale shape {tuple(s.shape)} "
+            f"is neither a scalar nor [out,1] (weight "
+            f"{tuple(w.shape)})"
+        )
+    return (w.to(torch.float32) * s.to(torch.float32)).to(orig_dtype)
+
+
 def _prepare_quantized_safetensors_load(state_dict: dict, quant_map: dict):
     """Split a scanned comfy_quant map into execution strategies (in place).
 
     - ``convrot=True`` layers  -> module-replacement plan (int8 resident +
       comfy-kitchen kernels); their int8/scale tensors stay in the state dict
       for assign.
-    - ``convrot=False`` layers -> dequant-at-load: ``weight = q * per-row
+    - ``resident_fp8=True`` layers -> module-replacement plan (fp8 resident +
+      per-matmul kitchen dequant); their fp8/scale tensors stay in the state
+      dict for assign UNTOUCHED (no load-time dequant, plan 2026-08-27 D1).
+    - remaining ``convrot=False`` layers -> dequant-at-load: ``weight = q *
       scale`` materialized back to the declared orig dtype inside
       ``state_dict``; scale + metadata keys removed.
 
     Returns:
-        ``(layer_plan, n_rowwise)``.
+        ``(layer_plan, n_rowwise, n_fp8_resident)``.
 
     Raises:
         QuantTargetMismatch: On missing/malformed rowwise tensor pairs or an
             undeclared orig dtype.
     """
-    from .convrot_quant import (
-        QUANT_META_SUFFIX,
-        make_convrot_linear,
-        resolve_orig_dtype,
-    )
+    from .convrot_quant import QUANT_META_SUFFIX
     from .quant_common import QuantTargetMismatch
 
-    layer_plan = {}
-    n_rowwise = 0
+    layer_plan, n_rowwise, n_fp8_resident = _plan_quantized_safetensors_load(
+        quant_map
+    )
     for prefix, info in quant_map.items():
         if info.convrot:
-            layer_plan[prefix] = make_convrot_linear(info)
             continue
 
         w_key = f"{prefix}.weight"
@@ -596,64 +689,274 @@ def _prepare_quantized_safetensors_load(state_dict: dict, quant_map: dict):
                 f"Rowwise-quantized layer '{prefix}' is missing its "
                 f"'{w_key}' / '{s_key}' tensors in the checkpoint"
             )
-        storage_dtype = info.rowwise_dtype or torch.int8
-        if w.dtype != storage_dtype and w.dtype != torch.uint8:
-            raise QuantTargetMismatch(
-                f"Rowwise layer '{prefix}': expected {storage_dtype} storage, "
-                f"checkpoint has {w.dtype}"
-            )
-        if w.dim() != 2 or w.shape[0] != info.out_features \
-                or (info.in_features and w.shape[1] != info.in_features):
-            raise QuantTargetMismatch(
-                f"Rowwise layer '{prefix}': weight shape {tuple(w.shape)} "
-                f"disagrees with metadata [out={info.out_features}, "
-                f"in={info.in_features}]"
-            )
-        orig_dtype = resolve_orig_dtype(info.orig_dtype)
 
-        if info.group_size:
-            # BLOCKWISE scales: shape [out / gs, in / gs], one scale per
-            # gs x gs block (int8-blockwise checkpoints).
-            gs = int(info.group_size)
-            if w.shape[0] % gs or w.shape[1] % gs:
+        if info.resident_fp8:
+            # FP8 RESIDENT: storage + scalar scale stay untouched in the dict
+            # for assign into FP8Linear; dequant happens per matmul. The scan
+            # only sets resident_fp8 for scalar scales, but verify again —
+            # assign replaces the parameter wholesale, so a wrong-shape scale
+            # would silently corrupt the module.
+            if w.dtype != info.rowwise_dtype:
                 raise QuantTargetMismatch(
-                    f"Blockwise layer '{prefix}': weight {tuple(w.shape)} "
-                    f"not divisible by group_size {gs} on both dims"
+                    f"Resident fp8 layer '{prefix}': expected "
+                    f"{info.rowwise_dtype} storage, checkpoint has {w.dtype}"
                 )
-            og, ig = w.shape[0] // gs, w.shape[1] // gs
-            if tuple(s.shape) != (og, ig):
+            if not (s.dim() == 0 or (s.dim() == 1 and s.numel() == 1)):
                 raise QuantTargetMismatch(
-                    f"Blockwise layer '{prefix}': scale shape "
-                    f"{tuple(s.shape)} disagrees with weight "
-                    f"{tuple(w.shape)} at group_size {gs} (expected "
-                    f"({og}, {ig}))"
+                    f"Resident fp8 layer '{prefix}': scale shape "
+                    f"{tuple(s.shape)} is not a per-tensor scalar"
                 )
-            state_dict[w_key] = (
-                (
-                    w.to(torch.float32).view(og, gs, ig, gs)
-                    * s.to(torch.float32).view(og, 1, ig, 1)
-                ).reshape(w.shape).to(orig_dtype)
-            )
-        else:
-            # SCALAR (per-tensor, fp8) or PER-ROW [out, 1] scales; both
-            # broadcast.
-            if not (s.dim() == 0 or (s.dim() == 2 and s.shape[1] == 1
-                                     and s.shape[0] in (w.shape[0], 1))):
-                raise QuantTargetMismatch(
-                    f"Rowwise layer '{prefix}': scale shape {tuple(s.shape)} "
-                    f"is neither a scalar nor [out,1] (weight "
-                    f"{tuple(w.shape)})"
-                )
-            # fp32 intermediate: exact rescale before the final cast.
-            state_dict[w_key] = (
-                (w.to(torch.float32) * s.to(torch.float32)).to(orig_dtype)
-            )
+            continue
+
+        state_dict[w_key] = _dequantize_rowwise_weight(prefix, info, w, s)
         state_dict.pop(s_key, None)
-        n_rowwise += 1
 
     for prefix in quant_map:
         state_dict.pop(f"{prefix}.{QUANT_META_SUFFIX}", None)
-    return layer_plan, n_rowwise
+    return layer_plan, n_rowwise, n_fp8_resident
+
+
+# ====================================================================
+# Streaming safetensors load (plan 2026-08-27, Phase 3 — RAM-spike kill)
+# ====================================================================
+
+def iter_safetensors_tensors(weight_path: str):
+    """Yield ``(key, tensor)`` one at a time from a safetensors file.
+
+    Per-tensor streaming contract (Breeze-TTS-2 pattern): only ONE tensor is
+    materialized at any moment — the full-file state dict (and its
+    ~file-size RAM residency) never exists.
+    """
+    from safetensors import safe_open
+
+    with safe_open(str(weight_path), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            yield key, f.get_tensor(key)
+
+
+def _read_safetensors_tensor(weight_path: str, key: str):
+    """Read a single named tensor from a safetensors file."""
+    from safetensors import safe_open
+
+    with safe_open(str(weight_path), framework="pt", device="cpu") as f:
+        return f.get_tensor(key)
+
+
+def _stream_apply_safetensors(model, weight_path: str, quant_map: dict):
+    """Assign a quantized safetensors checkpoint per-tensor (no full dict).
+
+    The RAM-spike killer of plan 2026-08-27 (Phase 3): replaces the batch
+    chain (``load_torch_file`` full dict -> in-dict dequant ->
+    ``load_state_dict``) with a two-pass streaming read, so peak host RAM
+    is bounded by the MODEL plus one tensor in flight instead of ~2x the
+    dequantized checkpoint.
+
+    Pass 1 reads only the tiny scale tensors of dequant-at-load layers
+    (they may follow their weight in the file); pass 2 streams every tensor
+    exactly once:
+
+    - ``*.comfy_quant`` metadata: skipped (the resident modules consumed it
+      at construction).
+    - resident layers (convrot int8 / fp8): raw storage assigned untouched,
+      dtype-checked against the swapped-in parameter.
+    - dequant-at-load layers: dequantized ONE tensor at a time via the
+      shared ``_dequantize_rowwise_weight`` (fp32 scratch freed each step).
+    - everything else: assigned at file dtype — the final dtype cast still
+      runs afterwards, unchanged.
+
+    Post-assign fixups (re-tie, meta stragglers, sentinel buffers, RoPE,
+    streaming conversion, missing/unexpected reporting) are shared with the
+    batch path via ``VibeVoiceLoader._post_assign_fixups``.
+
+    Args:
+        model: Instantiated model with resident linears ALREADY swapped in
+            (``replace_linears_for_quant`` ran first).
+        weight_path: Path to the quantized ``.safetensors`` checkpoint.
+        quant_map: Scanned ``comfy_quant`` map from
+            ``scan_checkpoint_quantization``.
+
+    Returns:
+        Tuple of (missing_keys, unexpected_keys).
+
+    Raises:
+        QuantTargetMismatch: Missing scale tensors, storage/shape
+            disagreement with the comfy_quant metadata.
+        ValueError: Shape mismatch vs the model (same friendly message as
+            the batch pre-check) or an unplanned quant-storage tensor.
+    """
+    from .convrot_quant import QUANT_META_SUFFIX
+    from .quant_common import QuantTargetMismatch
+    from .loader import VibeVoiceLoader, _shape_mismatch_error
+
+    resident_prefixes = {
+        p for p, info in quant_map.items()
+        if info.convrot or info.resident_fp8
+    }
+    dequant_infos = {
+        p: info for p, info in quant_map.items()
+        if not info.convrot and not info.resident_fp8
+    }
+
+    # Pass 1 — scales for dequant-at-load layers are tiny; read them up
+    # front so the weight stream never has to look back (file order is not
+    # guaranteed to put the scale before its weight).
+    scales = {}
+    for prefix in dequant_infos:
+        s_key = f"{prefix}.weight_scale"
+        try:
+            scales[prefix] = _read_safetensors_tensor(weight_path, s_key)
+        except Exception as e:
+            raise QuantTargetMismatch(
+                f"Rowwise-quantized layer '{prefix}' is missing its "
+                f"'{s_key}' tensor in the checkpoint"
+            ) from e
+
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+    unexpected = []
+    meta_suffix = f".{QUANT_META_SUFFIX}"
+
+    def _assign(key, tensor):
+        target = params.get(key)
+        if target is not None:
+            if tuple(tensor.shape) != tuple(target.shape):
+                raise _shape_mismatch_error(
+                    model, [(key, tuple(tensor.shape), tuple(target.shape))]
+                )
+            comfy.utils.set_attr_param(model, key, tensor)
+            return True
+        target_buf = buffers.get(key)
+        if target_buf is not None:
+            if tuple(tensor.shape) != tuple(target_buf.shape):
+                raise _shape_mismatch_error(
+                    model, [(key, tuple(tensor.shape), tuple(target_buf.shape))]
+                )
+            comfy.utils.set_attr_buffer(model, key, tensor)
+            return True
+        return False
+
+    # Pass 2 — stream every tensor exactly once.
+    assigned = set()
+    for key, tensor in iter_safetensors_tensors(weight_path):
+        if key.endswith(meta_suffix):
+            continue  # metadata consumed by the resident modules themselves
+        prefix, _, leaf = key.rpartition(".")
+        if prefix in dequant_infos and leaf == "weight_scale":
+            continue  # consumed by pass 1
+        if prefix in dequant_infos and leaf == "weight":
+            tensor = _dequantize_rowwise_weight(
+                prefix, dequant_infos[prefix], tensor, scales[prefix]
+            )
+        elif tensor.dtype in _QUANT_STORAGE_DTYPES:
+            # Planned residents assign their raw storage into the matching
+            # raw-storage parameter; anything else is an unplanned quant
+            # weight that must never reach a float parameter.
+            if prefix not in resident_prefixes \
+                    or leaf not in ("weight", "weight_scale"):
+                raise ValueError(
+                    f"Checkpoint contains quantized-weight tensors "
+                    f"({key}: {tensor.dtype}) that no comfy_quant metadata "
+                    f"declares. This node only loads quant formats it can "
+                    f"execute; re-export the checkpoint or use a dense "
+                    f"(bf16/fp16) file."
+                )
+            target = params.get(key)
+            if target is not None and tensor.dtype != target.dtype:
+                raise QuantTargetMismatch(
+                    f"Resident layer '{prefix}': expected {target.dtype} "
+                    f"storage for '{leaf}', checkpoint has {tensor.dtype}"
+                )
+        if _assign(key, tensor):
+            assigned.add(key)
+        else:
+            unexpected.append(key)
+
+    # Missing keys = expected model keys the file never delivered. Mirrors
+    # torch's own missing-key semantics (persistent state only; tied names
+    # appear individually, so a tied lm_head surfaces and is filtered by the
+    # shared fixups' tied hint).
+    expected = set(model.state_dict().keys())
+    missing_keys = [k for k in expected if k not in assigned]
+    return VibeVoiceLoader._post_assign_fixups(
+        model, missing_keys, unexpected
+    )
+
+
+def _config_ties_word_embeddings(config) -> bool:
+    """True when the config marks the lm_head as tied to input embeddings.
+
+    Only REAL boolean flags count: test doubles (MagicMock configs) must not
+    read as tied, so non-bool values are ignored.
+    """
+    decoder_config = getattr(config, "decoder_config", None)
+    for cfg in (decoder_config, config):
+        if cfg is None:
+            continue
+        flag = getattr(cfg, "tie_word_embeddings", False)
+        if isinstance(flag, bool) and flag:
+            return True
+    return False
+
+
+def _assert_lm_head_not_tied(config, quant_map: dict) -> None:
+    """Reject checkpoints that quantize a TIED lm_head.
+
+    A tied lm_head shares storage with the input embedding; a checkpoint
+    that still carries ``lm_head.comfy_quant`` (quantized or not) contradicts
+    the tied config — either the config or the export is wrong, and any load
+    path would silently discard the quantized weights at re-tie time.
+    """
+    from .quant_common import QuantTargetMismatch
+
+    if "lm_head" in quant_map and _config_ties_word_embeddings(config):
+        raise QuantTargetMismatch(
+            "Checkpoint quantizes 'lm_head' but the config sets "
+            "tie_word_embeddings=True: a tied lm_head shares the input "
+            "embedding's storage and cannot carry quantized weights. The "
+            "sidecar config.json likely does not match this checkpoint — "
+            "fix the config or re-export without quantizing lm_head."
+        )
+
+
+def _demote_nonlinear_fp8_residents(model, quant_map: dict) -> dict:
+    """Demote resident-fp8 layers whose target module is not an nn.Linear.
+
+    Real fp8 checkpoints also quantize non-Linear modules — e.g.
+    ``model.language_model.embed_tokens`` is an nn.Embedding. ``FP8Linear``
+    can only replace nn.Linear, but fp8 dequant-at-load (``weight = q *
+    scale``) is correct for ANY 2-D weight, so those layers fall back to the
+    dequant-at-load strategy instead of failing the whole load.
+
+    ConvRot layers are NOT demoted: rotated weights cannot be dequantized
+    without undoing the rotation, so a non-Linear convrot target keeps the
+    hard QuantTargetMismatch from ``replace_linears_for_quant`` (re-export
+    is the correct answer there). Missing modules are left untouched so
+    the replacement step raises its precise "not found" error.
+
+    Returns:
+        A new quant_map with affected infos replaced (QuantLayerInfo is
+        frozen); the input map is not mutated.
+    """
+    from dataclasses import replace as dc_replace
+
+    from .quant_common import resolve_module
+
+    resolved = {}
+    for prefix, info in quant_map.items():
+        if info.resident_fp8:
+            try:
+                target = resolve_module(model, prefix)
+            except KeyError:
+                target = None
+            if target is not None and not isinstance(target, torch.nn.Linear):
+                logger.debug(
+                    f"fp8-resident layer '{prefix}' targets "
+                    f"{type(target).__name__}, not nn.Linear — falling back "
+                    f"to dequant-at-load"
+                )
+                info = dc_replace(info, resident_fp8=False)
+        resolved[prefix] = info
+    return resolved
 
 
 def _assert_dense_loadable(state_dict: dict) -> None:
@@ -1097,10 +1400,22 @@ def load_external_vibevoice_model(
 
     cpu_device = torch.device("cpu")
     state_dict = None
+    # Quantized safetensors load per-tensor AFTER model instantiation
+    # (plan 2026-08-27, Phase 3): the full-file state dict never
+    # materializes, so peak RAM is bounded by the model + one tensor in
+    # flight instead of ~2x the dequantized checkpoint.
+    stream_quant_load = (
+        bool(convrot_quant_map)
+        and weight_path.lower().endswith(".safetensors")
+    )
     if gguf_reader is not None:
         logger.info(
             f"Opening external VibeVoice GGUF weights (raw-block residency): "
             f"{weight_path}"
+        )
+    elif stream_quant_load:
+        logger.info(
+            f"Streaming external VibeVoice quant weights from: {weight_path}"
         )
     else:
         logger.info(f"Loading external VibeVoice weights from: {weight_path}")
@@ -1186,17 +1501,39 @@ def load_external_vibevoice_model(
         elif convrot_quant_map:
             from .quant_common import replace_linears_for_quant
 
-            layer_plan, n_rowwise = _prepare_quantized_safetensors_load(
-                state_dict, convrot_quant_map
+            _assert_lm_head_not_tied(config, convrot_quant_map)
+            # fp8 checkpoints may quantize non-Linear modules (embed_tokens);
+            # those cannot become FP8Linear and fall back to dequant-at-load.
+            convrot_quant_map = _demote_nonlinear_fp8_residents(
+                model, convrot_quant_map
             )
-            replaced = replace_linears_for_quant(model, layer_plan)
-            model = _load_state_dict_into_model_from_memory(model, state_dict)
-            del state_dict
-            state_dict = None
-            weight_family = "convrot_int8"
+            if stream_quant_load:
+                # Streaming path: plan only, swap modules, then assign the
+                # checkpoint per-tensor (no full state dict ever exists).
+                layer_plan, n_rowwise, n_fp8_resident = (
+                    _plan_quantized_safetensors_load(convrot_quant_map)
+                )
+                replaced = replace_linears_for_quant(model, layer_plan)
+                _stream_apply_safetensors(model, weight_path, convrot_quant_map)
+            else:
+                layer_plan, n_rowwise, n_fp8_resident = (
+                    _prepare_quantized_safetensors_load(state_dict, convrot_quant_map)
+                )
+                replaced = replace_linears_for_quant(model, layer_plan)
+                model = _load_state_dict_into_model_from_memory(model, state_dict)
+                del state_dict
+                state_dict = None
+            # Family label: convrot dominates; pure fp8-resident files get
+            # their own label; pure dequant-at-load keeps the legacy one.
+            weight_family = (
+                "fp8_resident"
+                if n_fp8_resident and len(replaced) == n_fp8_resident
+                else "convrot_int8"
+            )
             quant_stats = {
                 "n_resident_layers": len(replaced),
                 "n_rowwise_layers": n_rowwise,
+                "n_fp8_resident_layers": n_fp8_resident,
             }
         else:
             # Defensive net: unplanned int8/uint8/fp8 weights must never
@@ -1378,12 +1715,23 @@ def load_external_vibevoice_asr_model(
 
     # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
     # loader). GGUF keeps a lazy mmap READER instead (raw-block residency).
+    # Quantized safetensors stream per-tensor after instantiation instead
+    # (plan 2026-08-27, Phase 3 — see the TTS branch for the full contract).
     cpu_device = torch.device("cpu")
     state_dict = None
+    stream_quant_load = (
+        bool(convrot_quant_map)
+        and weight_path.lower().endswith(".safetensors")
+    )
     if gguf_reader is not None:
         logger.info(
             f"Opening external VibeVoice ASR GGUF weights (raw-block "
             f"residency): {weight_path}"
+        )
+    elif stream_quant_load:
+        logger.info(
+            f"Streaming external VibeVoice ASR quant weights from: "
+            f"{weight_path}"
         )
     else:
         logger.info(f"Loading external VibeVoice ASR weights from: {weight_path}")
@@ -1434,17 +1782,39 @@ def load_external_vibevoice_asr_model(
         elif convrot_quant_map:
             from .quant_common import replace_linears_for_quant
 
-            layer_plan, n_rowwise = _prepare_quantized_safetensors_load(
-                state_dict, convrot_quant_map
+            _assert_lm_head_not_tied(config, convrot_quant_map)
+            # fp8 checkpoints may quantize non-Linear modules (embed_tokens);
+            # those cannot become FP8Linear and fall back to dequant-at-load.
+            convrot_quant_map = _demote_nonlinear_fp8_residents(
+                model, convrot_quant_map
             )
-            replaced = replace_linears_for_quant(model, layer_plan)
-            model = _load_state_dict_into_model_from_memory(model, state_dict)
-            del state_dict
-            state_dict = None
-            weight_family = "convrot_int8"
+            if stream_quant_load:
+                # Streaming path: plan only, swap modules, then assign the
+                # checkpoint per-tensor (no full state dict ever exists).
+                layer_plan, n_rowwise, n_fp8_resident = (
+                    _plan_quantized_safetensors_load(convrot_quant_map)
+                )
+                replaced = replace_linears_for_quant(model, layer_plan)
+                _stream_apply_safetensors(model, weight_path, convrot_quant_map)
+            else:
+                layer_plan, n_rowwise, n_fp8_resident = (
+                    _prepare_quantized_safetensors_load(state_dict, convrot_quant_map)
+                )
+                replaced = replace_linears_for_quant(model, layer_plan)
+                model = _load_state_dict_into_model_from_memory(model, state_dict)
+                del state_dict
+                state_dict = None
+            # Family label: convrot dominates; pure fp8-resident files get
+            # their own label; pure dequant-at-load keeps the legacy one.
+            weight_family = (
+                "fp8_resident"
+                if n_fp8_resident and len(replaced) == n_fp8_resident
+                else "convrot_int8"
+            )
             quant_stats = {
                 "n_resident_layers": len(replaced),
                 "n_rowwise_layers": n_rowwise,
+                "n_fp8_resident_layers": n_fp8_resident,
             }
         else:
             # Defensive net: unplanned int8/uint8/fp8 weights must never

@@ -113,6 +113,11 @@ class QuantLayerInfo:
     convrot: bool = True
     orig_dtype: str = ""
     rowwise_dtype: "torch.dtype | None" = None
+    # True for fp8 layers executed RESIDENT (fp8 storage + scalar scale stay
+    # in VRAM; per-matmul dequant via comfy-kitchen). Requires a scalar
+    # per-tensor scale and an available kitchen fp8 backend; otherwise the
+    # layer falls back to dequant-at-load (plan 2026-08-27, D1/D3).
+    resident_fp8: bool = False
 
 
 class ConvRotInt8Linear(nn.Module):
@@ -249,7 +254,10 @@ def scan_checkpoint_quantization(weights_path) -> dict:
     - ``{"format": "int8_tensorwise", "per_row": true}`` (no convrot flag)
       → plain rowwise int8; dequantized back to ``orig_dtype`` at load time.
     - ``{"format": "float8_e4m3fn" | "float8_e5m2", "orig_dtype": ...}``
-      → rowwise fp8; dequant-at-load.
+      → rowwise fp8. With a SCALAR per-tensor scale and an available
+      comfy-kitchen fp8 backend the layer is marked ``resident_fp8`` (fp8
+      stays resident, dequantized per matmul); anything else (per-row
+      scales, no backend) falls back to dequant-at-load.
 
     Returns:
         {} for a plain float checkpoint; otherwise mapping of layer prefix ->
@@ -260,6 +268,12 @@ def scan_checkpoint_quantization(weights_path) -> dict:
             (never silently misreads INT8/fp8 weights as floats).
     """
     from safetensors import safe_open
+
+    # fp8 residency is a per-file decision: probe the kitchen backend ONCE.
+    # Lazy import keeps convrot_quant importable without fp8_quant's deps.
+    from .fp8_quant import probe_fp8_backend
+
+    fp8_backend = probe_fp8_backend()
 
     quant_map: dict = {}
     weights_path = Path(weights_path)
@@ -324,10 +338,22 @@ def scan_checkpoint_quantization(weights_path) -> dict:
                 prefix = key[: -len(f".{QUANT_META_SUFFIX}")]
                 orig = str(meta.get("orig_dtype", ""))
                 resolve_orig_dtype(orig)
+                # Residency requires a per-TENSOR scale: the kitchen kernel
+                # dequantizes with one scalar. [out, 1] per-row scales keep
+                # the legacy dequant-at-load path.
+                s_key = f"{prefix}.weight_scale"
+                scalar_scale = False
+                if fp8_backend is not None and s_key in key_names:
+                    s_shape = f.get_slice(s_key).get_shape()
+                    scalar_scale = (
+                        len(s_shape) == 0
+                        or (len(s_shape) == 1 and s_shape[0] == 1)
+                    )
                 quant_map[prefix] = _rowwise_info(
                     f, key_names, prefix, meta,
                     rowwise_dtype=ROWWISE_FLOAT_FORMATS[fmt],
                     orig_dtype=orig,
+                    resident_fp8=scalar_scale,
                 )
                 continue
 
@@ -343,7 +369,7 @@ def scan_checkpoint_quantization(weights_path) -> dict:
 
 
 def _rowwise_info(f, key_names, prefix, meta, *, rowwise_dtype, orig_dtype,
-                  group_size: int = 0):
+                  group_size: int = 0, resident_fp8: bool = False):
     w_key = f"{prefix}.weight"
     in_f = int(meta.get("in_features", 0))
     out_f = int(meta.get("out_features", 0))
@@ -359,6 +385,7 @@ def _rowwise_info(f, key_names, prefix, meta, *, rowwise_dtype, orig_dtype,
         convrot=False,
         orig_dtype=orig_dtype,
         rowwise_dtype=rowwise_dtype,
+        resident_fp8=resident_fp8,
     )
 
 

@@ -45,6 +45,39 @@ def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 
+# Quantized weight STORAGE dtypes that must never be used as an
+# activation/compute dtype.
+_FP8_STORAGE_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _mlp_compute_dtype(mlp):
+    """Dtype activations should have when fed into ``mlp``.
+
+    Plain float linears: the first layer's weight dtype. Quant-resident
+    linears (fp8 checkpoints) keep raw storage in ``.weight`` and dequantize
+    to the ACTIVATION dtype per matmul — casting activations to the storage
+    dtype would feed fp8 into the kernel. Such modules declare their
+    dequantized compute dtype as ``compute_dtype``; absent that, fall back
+    to the first regular float parameter in the tree, then bfloat16
+    (VibeVoice's native compute dtype).
+    """
+    first = mlp[0]
+    declared = getattr(first, "compute_dtype", None)
+    if isinstance(declared, torch.dtype):
+        return declared
+    w = getattr(first, "weight", None)
+    if (
+        w is not None
+        and w.dtype.is_floating_point
+        and w.dtype not in _FP8_STORAGE_DTYPES
+    ):
+        return w.dtype
+    for p in mlp.parameters():
+        if p.dtype.is_floating_point and p.dtype not in _FP8_STORAGE_DTYPES:
+            return p.dtype
+    return torch.bfloat16
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -95,9 +128,11 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        # Align the embedding to the MLP's compute dtype (bf16/fp16/fp32) so the
-        # Linear layers never receive a mismatched `mat1` dtype.
-        t_emb = self.mlp(t_freq.to(self.mlp[0].weight.dtype))
+        # Align the embedding to the MLP's compute dtype (bf16/fp16/fp32) so
+        # the Linear layers never receive a mismatched `mat1` dtype. Never use
+        # `mlp[0].weight.dtype` directly: for fp8-quantized checkpoints that
+        # is the fp8 STORAGE dtype (see _mlp_compute_dtype).
+        t_emb = self.mlp(t_freq.to(_mlp_compute_dtype(self.mlp)))
         return t_emb
 
 
