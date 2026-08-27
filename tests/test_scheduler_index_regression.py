@@ -131,6 +131,11 @@ def _load_real_modeling_module():
         model_type = "vibevoice"
 
     cfg_mod.VibeVoiceConfig = _FakeConfig
+    # modeling_vibevoice imports the version-safe dtype helper from this
+    # module; provide the real implementation (never mocked).
+    from ComfyUI_VibeVoice.modules.dtype_utils import get_config_dtype, set_config_dtype
+    cfg_mod.get_config_dtype = get_config_dtype
+    cfg_mod.set_config_dtype = set_config_dtype
     sys.modules["src.vibevoice.modular.configuration_vibevoice"] = cfg_mod
 
     _HERE = os.path.dirname(os.path.abspath(__file__))

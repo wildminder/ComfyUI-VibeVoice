@@ -212,6 +212,47 @@ class TestVibeVoiceLoaderInstantiateModel:
             assert config.torch_dtype == torch.bfloat16
             assert config.decoder_config.torch_dtype == torch.bfloat16
 
+    def test_instantiate_model_real_config_no_deprecation(self):
+        """With a REAL transformers PretrainedConfig (v5: torch_dtype is a
+        deprecated property), _instantiate_model must record the dtype on the
+        canonical ``dtype`` attribute and emit no torch_dtype deprecation.
+        A capture handler is attached directly to the emitting transformers
+        logger (its warning_once is lru_cache-wrapped, so the cache is
+        cleared to keep the absence assertion non-vacuous)."""
+        import logging as pylogging
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig()
+        config.decoder_config = PretrainedConfig()
+
+        logger = pylogging.getLogger("transformers.configuration_utils")
+        records = []
+
+        class _Capture(pylogging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _Capture(level=pylogging.WARNING)
+        logger.addHandler(handler)
+        pylogging.Logger.warning_once.cache_clear()
+        try:
+            with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceForConditionalGeneration"):
+                VibeVoiceLoader._instantiate_model(
+                    config=config,
+                    is_streaming=False,
+                    attn_implementation="eager",
+                    final_load_dtype=torch.bfloat16,
+                )
+        finally:
+            logger.removeHandler(handler)
+            pylogging.Logger.warning_once.cache_clear()
+
+        assert config.dtype == torch.bfloat16
+        assert config.decoder_config.dtype == torch.bfloat16
+        assert not any(
+            "`torch_dtype` is deprecated" in m for m in records
+        ), "torch_dtype deprecation warning was emitted"
+
 
 class TestResolveCheckpointPath:
     """Test VibeVoiceLoader._resolve_checkpoint_path."""

@@ -14,6 +14,8 @@ from ComfyUI_VibeVoice.modules.dtype_utils import (
     get_dtype_str,
     cast_model_to_dtype,
     cast_model_to_dtype_if_needed,
+    set_config_dtype,
+    get_config_dtype,
 )
 
 
@@ -237,3 +239,143 @@ class TestCastModelToDtypeIfNeeded:
         cast_model_to_dtype_if_needed(model, None)
         assert model.a.weight.data_ptr() == ptr_before
         assert model.a.weight.dtype == torch.float32
+
+
+# ====================================================================
+# transformers v5 torch_dtype deprecation compat (set/get_config_dtype)
+# ====================================================================
+class _V5StyleConfig:
+    """Mimics transformers v5 PretrainedConfig: ``torch_dtype`` is a
+    deprecated property alias for ``dtype`` that records every access."""
+
+    def __init__(self):
+        self.dtype = None
+        self.torch_dtype_accesses = []
+
+    @property
+    def torch_dtype(self):
+        self.torch_dtype_accesses.append("get")
+        return self.dtype
+
+    @torch_dtype.setter
+    def torch_dtype(self, value):
+        self.torch_dtype_accesses.append("set")
+        self.dtype = value
+
+
+class _LegacyConfig:
+    """Mimics transformers < v5: ``torch_dtype`` is a plain attribute."""
+
+
+class TestSetConfigDtype:
+    """set_config_dtype must write the canonical attribute per version."""
+
+    def test_v5_property_config_uses_dtype(self):
+        config = _V5StyleConfig()
+        set_config_dtype(config, torch.bfloat16)
+        assert config.dtype == torch.bfloat16
+        assert config.torch_dtype_accesses == [], (
+            "deprecated torch_dtype property must never be touched on v5")
+
+    def test_legacy_config_uses_torch_dtype(self):
+        config = _LegacyConfig()
+        set_config_dtype(config, torch.float16)
+        assert config.torch_dtype == torch.float16
+
+    def test_magicmock_config_sets_torch_dtype(self):
+        """MagicMock (test double) has no property → legacy branch keeps the
+        existing loader-test contract (config.torch_dtype is set)."""
+        config = MagicMock()
+        set_config_dtype(config, torch.bfloat16)
+        assert config.torch_dtype == torch.bfloat16
+
+
+class TestGetConfigDtype:
+    """get_config_dtype must read the canonical attribute per version."""
+
+    def test_v5_property_config_reads_dtype(self):
+        config = _V5StyleConfig()
+        config.dtype = torch.float16
+        assert get_config_dtype(config) == torch.float16
+        assert config.torch_dtype_accesses == [], (
+            "deprecated torch_dtype property must never be touched on v5")
+
+    def test_legacy_config_reads_torch_dtype(self):
+        config = _LegacyConfig()
+        config.torch_dtype = torch.bfloat16
+        assert get_config_dtype(config) == torch.bfloat16
+
+    def test_legacy_falls_back_to_dtype(self):
+        config = _LegacyConfig()
+        config.dtype = torch.float32
+        assert get_config_dtype(config) == torch.float32
+
+    def test_string_value_resolved(self):
+        config = _LegacyConfig()
+        config.torch_dtype = "bfloat16"
+        assert get_config_dtype(config) == torch.bfloat16
+
+    def test_unset_returns_none(self):
+        assert get_config_dtype(_LegacyConfig()) is None
+
+
+class TestConfigDtypeNoDeprecationWarning:
+    """End-to-end guard for the user-visible console warning
+    '`torch_dtype` is deprecated! Use `dtype` instead!'.
+
+    The warning is emitted through transformers' own logger via an
+    ``lru_cache``-wrapped ``warning_once``. To observe it deterministically we
+    attach a capture handler directly to the emitting logger and clear the
+    ``warning_once`` cache so absence assertions are not vacuous.
+    """
+
+    _MSG = "`torch_dtype` is deprecated"
+
+    @pytest.fixture()
+    def dep_records(self):
+        import logging as pylogging
+
+        logger = pylogging.getLogger("transformers.configuration_utils")
+        records = []
+
+        class _Capture(pylogging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _Capture(level=pylogging.WARNING)
+        logger.addHandler(handler)
+        # warning_once is lru_cache-wrapped; clear so a prior emission in this
+        # process does not suppress the (single) warning we are testing.
+        pylogging.Logger.warning_once.cache_clear()
+        try:
+            yield records
+        finally:
+            logger.removeHandler(handler)
+            pylogging.Logger.warning_once.cache_clear()
+
+    def test_positive_control_direct_access_warns(self, dep_records):
+        """Sanity: the harness DOES catch the warning when the deprecated
+        property is touched directly (proves absence tests are not vacuous)."""
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig()
+        _ = config.torch_dtype  # deprecated getter
+        assert any(self._MSG in m for m in dep_records), (
+            "expected the deprecation warning when touching torch_dtype directly")
+
+    def test_set_and_get_emit_no_warning(self, dep_records):
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig()
+        set_config_dtype(config, torch.bfloat16)
+        assert get_config_dtype(config) == torch.bfloat16
+        assert not any(self._MSG in m for m in dep_records)
+
+    def test_set_writes_canonical_dtype_attribute(self):
+        from transformers import PretrainedConfig
+
+        config = PretrainedConfig()
+        set_config_dtype(config, torch.float16)
+        assert config.dtype == torch.float16
+        # The deprecated alias resolves to the same value without being set.
+        assert get_config_dtype(config) == torch.float16

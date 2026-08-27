@@ -21,6 +21,7 @@ from .modular_vibevoice_diffusion_head import VibeVoiceDiffusionHead
 from ..schedule.dpm_solver import DPMSolverMultistepScheduler
 
 from .configuration_vibevoice_streaming import VibeVoiceStreamingConfig
+from .configuration_vibevoice import get_config_dtype
 
 
 logger = logging.get_logger(__name__)
@@ -95,12 +96,8 @@ class VibeVoiceStreamingModel(VibeVoiceStreamingPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         
-        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
-            if isinstance(config.torch_dtype, str):
-                dtype = getattr(torch, config.torch_dtype)
-            else:
-                dtype = config.torch_dtype
-        else:
+        dtype = get_config_dtype(config)
+        if dtype is None:
             dtype = torch.float32
         
         # Initialize Qwen2 model for language modeling. 

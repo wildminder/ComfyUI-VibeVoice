@@ -42,6 +42,52 @@ def get_dtype_options() -> List[str]:
     return [DTYPE_AUTO, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32]
 
 
+def _torch_dtype_is_deprecated_property(config) -> bool:
+    """True when ``type(config).torch_dtype`` is the transformers >= 5.0
+    deprecated property alias (which warns on every get/set)."""
+    return isinstance(getattr(type(config), "torch_dtype", None), property)
+
+
+def set_config_dtype(config, dtype) -> None:
+    """Record the load dtype on a transformers config without triggering the
+    transformers v5 deprecation warning.
+
+    transformers v5 renamed ``torch_dtype`` to ``dtype`` and turned
+    ``torch_dtype`` into a deprecated property that logs
+    "``torch_dtype`` is deprecated! Use ``dtype`` instead!" on every access.
+    Write the canonical attribute for the installed transformers version.
+
+    This is the node-side counterpart of the vendored
+    ``configuration_vibevoice.set_config_dtype``; it lives here (rather than
+    being imported from the vendored package) so it stays a real function
+    under the test harness, which mocks ``src.vibevoice.*``.
+    """
+    if _torch_dtype_is_deprecated_property(config):
+        config.dtype = dtype
+    else:
+        config.torch_dtype = dtype
+
+
+def get_config_dtype(config):
+    """Return the torch dtype recorded on a transformers config, or None.
+
+    Version-safe read: on transformers v5 the canonical ``dtype`` attribute
+    is read (the deprecated ``torch_dtype`` property is never touched); on
+    older versions the plain ``torch_dtype`` attribute is used. String
+    values (e.g. ``"bfloat16"`` from a config.json) are resolved to the
+    corresponding ``torch.dtype``.
+    """
+    if _torch_dtype_is_deprecated_property(config):
+        dtype = getattr(config, "dtype", None)
+    else:
+        dtype = getattr(config, "torch_dtype", None)
+        if dtype is None:
+            dtype = getattr(config, "dtype", None)
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype, None)
+    return dtype
+
+
 def resolve_dtype(dtype_str: str, device: torch.device = None) -> torch.dtype:
     """Resolve a dtype string to a torch.dtype.
 
