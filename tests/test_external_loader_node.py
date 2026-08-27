@@ -149,7 +149,7 @@ class TestExternalLoaderNodeExecute:
         ):
             VibeVoiceExternalLoaderNode.execute(
                 model_file="model.safetensors",
-                config_name="VibeVoice-Large",
+                config_name="VibeVoice-7B",
                 attention_mode="eager",
                 quantize_llm_4bit=True,
                 dtype="bf16",
@@ -158,4 +158,4 @@ class TestExternalLoaderNodeExecute:
         call_kwargs = mock_load.call_args[1]
         assert call_kwargs["use_llm_4bit"] is True
         assert call_kwargs["dtype_str"] == "bf16"
-        assert call_kwargs["config_name"] == "VibeVoice-Large"
+        assert call_kwargs["config_name"] == "VibeVoice-7B"

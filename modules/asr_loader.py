@@ -141,7 +141,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
 
         cache_key = f"asr_{model_name}_{dtype_str}_{attention_mode}"
         if cache_key in LOADED_ASR_MODELS_CACHE:
-            logger.info(f"Using cached ASR model: {model_name}")
+            logger.debug(f"Using cached ASR model: {model_name}")
             return LOADED_ASR_MODELS_CACHE[cache_key]
 
         # Resolve paths
@@ -212,6 +212,6 @@ def cleanup_asr_models(keep_cache_key: str = None) -> None:
             del LOADED_ASR_MODELS_CACHE[key]
 
     if keys_to_remove:
-        logger.info(f"Cleaned up cached ASR models: {keys_to_remove}")
+        logger.debug(f"Cleaned up cached ASR models: {keys_to_remove}")
         gc.collect()
         model_management.soft_empty_cache()

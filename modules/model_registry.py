@@ -163,7 +163,7 @@ def unregister_from_comfy(patcher) -> list:
 
     if removed:
         loaded_list[:] = survivors
-        logger.info(
+        logger.debug(
             f"Unregistered {len(removed)} ComfyUI loaded-model entr(y/ies) for "
             f"patcher {getattr(patcher, 'cache_key', '<unknown>')}"
         )
@@ -255,7 +255,7 @@ def evict_if_changed(family: str, new_key: str, patcher_caches) -> list:
             continue
         for key in [k for k in list(cache_dict.keys()) if k != new_key]:
             patcher = cache_dict.get(key)
-            logger.info(
+            logger.debug(
                 f"Model changed for family '{family}' "
                 f"(active={active!r} -> {new_key!r}); evicting '{key}'..."
             )

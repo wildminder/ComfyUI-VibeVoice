@@ -421,7 +421,7 @@ def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
             len(unknown_with_params), unknown_with_params[:8],
         )
     if census:
-        logger.info(
+        logger.debug(
             "Streaming-enabled %d module(s): %s",
             sum(census.values()),
             ", ".join(f"{k}={v}" for k, v in sorted(census.items())),

@@ -93,7 +93,7 @@ def replace_linears_for_quant(model: torch.nn.Module, layer_plan: dict) -> list:
         setattr(parent_cache[parent_name], child_name, new_mod)
         replaced.append(prefix)
 
-    logger.info(f"Replaced {len(replaced)} nn.Linear(s) with quant-resident modules")
+    logger.debug(f"Replaced {len(replaced)} nn.Linear(s) with quant-resident modules")
     return replaced
 
 

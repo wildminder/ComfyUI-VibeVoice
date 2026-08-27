@@ -18,8 +18,11 @@ from comfy_api.latest import io
 from ..modules.custom_types import VibeVoiceModel
 from ..modules.external_loader import (
     load_external_vibevoice_model,
+    AUTO_CONFIG_NAME,
     EXTERNAL_CONFIG_OPTIONS,
     is_asr_config_name,
+    normalize_config_name,
+    resolve_auto_config_name,
 )
 from ..modules.attention_utils import get_available_attention_modes, resolve_attention_mode
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
@@ -139,11 +142,14 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
                 io.Combo.Input(
                     "config_name",
                     options=config_options,
-                    default="VibeVoice-1.5B",
+                    default=AUTO_CONFIG_NAME,
                     tooltip=(
-                        "Architecture config to use. A sidecar config next to the "
-                        "weight file takes priority; this selects the packaged "
-                        "default fallback when no sidecar is present."
+                        "Architecture config to use. Auto-detect reads the "
+                        "weight file's embedding fingerprint and selects the "
+                        "matching family; an explicit selection that "
+                        "contradicts the weights is auto-corrected with a "
+                        "warning. A sidecar config next to the weight file "
+                        "takes priority over the packaged default fallback."
                     ),
                 ),
                 io.Combo.Input(
@@ -172,6 +178,25 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         )
 
     @classmethod
+    def validate_inputs(cls, **kwargs) -> bool | str:
+        """Accept current options AND removed legacy aliases.
+
+        Overriding this with ``**kwargs`` makes ComfyUI core skip its own
+        combo-membership check (execution.py defers to the node when the
+        validate function has var-keywords), so saved workflows carrying the
+        removed ``VibeVoice-Large`` value still queue; ``execute()`` then
+        normalizes the alias onto its canonical option.
+        """
+        cfg = kwargs.get("config_name")
+        if cfg in EXTERNAL_CONFIG_OPTIONS or \
+                normalize_config_name(cfg) in EXTERNAL_CONFIG_OPTIONS:
+            return True
+        return (
+            f"config_name '{cfg}' is not valid. "
+            f"Choose one of: {', '.join(EXTERNAL_CONFIG_OPTIONS)}"
+        )
+
+    @classmethod
     def execute(
         cls,
         model_file: str,
@@ -180,7 +205,22 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         quantize_llm_4bit: bool,
         dtype: str,
     ) -> io.NodeOutput:
+        # Normalize removed legacy aliases (e.g. "VibeVoice-Large" -> 7B)
+        # BEFORE the identity is computed, so legacy and modern workflows
+        # produce the same cache/eviction key for the same effective model.
+        config_name = normalize_config_name(config_name)
+
         weight_path = resolve_weight_path(model_file)
+
+        # Auto-detect resolution (plan 2026-08-27, D6): resolve the effective
+        # family BEFORE the identity is computed. The consumer derives its
+        # patcher-cache key from the bundle's recorded model_name, so the
+        # node's request key must carry the same resolved name — otherwise the
+        # unload-before-load gate and patcher cache would churn on every run
+        # (same principle as alias normalization above). Inconclusive
+        # detection fails fast here with an actionable error.
+        if config_name == AUTO_CONFIG_NAME:
+            config_name = resolve_auto_config_name(weight_path)
 
         # Unload-before-load gate (plan 2026-08-20, C1/RC-1/RC-5): compute the
         # request identity EXACTLY as the external loader will record it on the

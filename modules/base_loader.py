@@ -160,12 +160,12 @@ class BaseVibeVoiceLoader:
                 raise FileNotFoundError(
                     f"Shard file not found: {shard_path} (referenced in {ckpt_path})"
                 )
-            logger.info(f"Loading shard: {shard_filename}")
+            logger.debug(f"Loading shard: {shard_filename}")
             shard_state_dict = comfy.utils.load_torch_file(shard_path, device=device)
             merged_state_dict.update(shard_state_dict)
             del shard_state_dict
 
-        logger.info(
+        logger.debug(
             f"Merged {len(merged_state_dict)} parameters from {len(shard_filenames)} shards"
         )
         return merged_state_dict

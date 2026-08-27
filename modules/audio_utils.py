@@ -131,7 +131,7 @@ def parse_script_1_based(script: str) -> tuple[list[tuple[int, str]], list[int]]
             logger.warning(f"Could not parse speaker marker, treating as part of previous line if any, or ignoring: '{line}'")
 
     if not parsed_lines and script.strip():
-        logger.info("No speaker markers found. Treating entire text as a single utterance for Speaker 1.")
+        logger.debug("No speaker markers found. Treating entire text as a single utterance for Speaker 1.")
         parsed_lines.append((0, ' ' + script.strip()))
         speaker_ids_in_script.append(1)
 
