@@ -19,13 +19,60 @@ def _convert_dtype_to_string(config_dict: dict) -> dict:
     when transformers tries to log/serialize the config with torch_dtype as a torch.dtype object.
     
     See: https://github.com/microsoft/VibeVoice/issues/199
+
+    transformers v5 renamed the attribute ``torch_dtype`` to ``dtype``; both
+    keys are converted.
     """
-    if "torch_dtype" in config_dict and config_dict["torch_dtype"] is not None:
-        dtype = config_dict["torch_dtype"]
-        if isinstance(dtype, torch.dtype):
-            # Convert torch.dtype to string (e.g., torch.bfloat16 -> "bfloat16")
-            config_dict["torch_dtype"] = str(dtype).replace("torch.", "")
+    for key in ("torch_dtype", "dtype"):
+        if key in config_dict and config_dict[key] is not None:
+            dtype = config_dict[key]
+            if isinstance(dtype, torch.dtype):
+                # Convert torch.dtype to string (e.g., torch.bfloat16 -> "bfloat16")
+                config_dict[key] = str(dtype).replace("torch.", "")
     return config_dict
+
+
+def _torch_dtype_is_deprecated_property(config) -> bool:
+    """True on transformers v5+, where ``PretrainedConfig.torch_dtype`` is a
+    deprecated property alias for ``dtype`` that warns on every access."""
+    return isinstance(getattr(type(config), "torch_dtype", None), property)
+
+
+def set_config_dtype(config, dtype):
+    """
+    Record the model dtype on a transformers config without triggering the
+    transformers v5 deprecation warning.
+
+    transformers v5 renamed ``torch_dtype`` to ``dtype`` and turned
+    ``torch_dtype`` into a deprecated property that logs
+    "``torch_dtype`` is deprecated! Use ``dtype`` instead!" on every access.
+    Set the canonical attribute for the installed transformers version.
+    """
+    if _torch_dtype_is_deprecated_property(config):
+        config.dtype = dtype
+    else:
+        config.torch_dtype = dtype
+
+
+def get_config_dtype(config):
+    """
+    Return the torch dtype recorded on a transformers config, or None.
+
+    Version-safe counterpart of reading ``config.torch_dtype``: on
+    transformers v5+ the canonical ``dtype`` attribute is read and the
+    deprecated ``torch_dtype`` property is never touched; on older versions
+    the plain ``torch_dtype`` attribute is used. String values (e.g. from a
+    config.json) are resolved to torch.dtype objects.
+    """
+    if _torch_dtype_is_deprecated_property(config):
+        dtype = getattr(config, "dtype", None)
+    else:
+        dtype = getattr(config, "torch_dtype", None)
+        if dtype is None:
+            dtype = getattr(config, "dtype", None)
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype, None)
+    return dtype
 
 
 class VibeVoiceAcousticTokenizerConfig(PretrainedConfig):
@@ -402,5 +449,7 @@ __all__ = [
     "VibeVoiceSemanticTokenizerConfig", 
     "VibeVoiceDiffusionHeadConfig", 
     "VibeVoiceConfig",
-    "VibeVoiceASRConfig"
+    "VibeVoiceASRConfig",
+    "set_config_dtype",
+    "get_config_dtype",
 ]

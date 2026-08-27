@@ -43,7 +43,7 @@ from .attention_utils import (
     get_attn_implementation_for_load,
     check_sage_attention_compatible,
 )
-from .dtype_utils import resolve_dtype, cast_model_to_dtype_if_needed
+from .dtype_utils import resolve_dtype, cast_model_to_dtype_if_needed, set_config_dtype
 from .convrot_quant import UnsupportedQuantFormat
 from .quant_common import validate_weight_plan
 
@@ -446,10 +446,10 @@ def _instantiate_asr_model(
     if hasattr(config, "decoder_config"):
         config.decoder_config._attn_implementation = attn_implementation
 
-    # Set dtype on config
-    config.torch_dtype = final_load_dtype
+    # Set dtype on config (version-safe: transformers v5 deprecated torch_dtype)
+    set_config_dtype(config, final_load_dtype)
     if hasattr(config, "decoder_config"):
-        config.decoder_config.torch_dtype = final_load_dtype
+        set_config_dtype(config.decoder_config, final_load_dtype)
 
     ctx = torch.device("meta") if use_meta else contextlib.nullcontext()
     with ctx:

@@ -40,7 +40,7 @@ from .attention_utils import (
     get_attn_implementation_for_load,
     check_sage_attention_compatible,
 )
-from .dtype_utils import resolve_dtype, get_dtype_str, cast_model_to_dtype_if_needed
+from .dtype_utils import resolve_dtype, get_dtype_str, cast_model_to_dtype_if_needed, set_config_dtype
 
 if SAGE_ATTENTION_AVAILABLE:
     from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
@@ -531,10 +531,10 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         if hasattr(config, 'decoder_config'):
             config.decoder_config._attn_implementation = attn_implementation
 
-        # Set dtype on config
-        config.torch_dtype = final_load_dtype
+        # Set dtype on config (version-safe: transformers v5 deprecated torch_dtype)
+        set_config_dtype(config, final_load_dtype)
         if hasattr(config, 'decoder_config'):
-            config.decoder_config.torch_dtype = final_load_dtype
+            set_config_dtype(config.decoder_config, final_load_dtype)
 
         # Instantiate directly — meta context by default (zero alloc, zero RNG)
         ctx = torch.device("meta") if use_meta else contextlib.nullcontext()

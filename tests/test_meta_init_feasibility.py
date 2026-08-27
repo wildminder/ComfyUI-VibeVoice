@@ -178,7 +178,7 @@ def real():
 def std_config(real):
     cfg_path = os.path.join(real["configs_dir"], "default_VibeVoice-1.5B_config.json")
     config = real["cfg"].VibeVoiceConfig.from_pretrained(cfg_path)
-    config.torch_dtype = torch.bfloat16
+    real["cfg"].set_config_dtype(config, torch.bfloat16)
     return config
 
 
@@ -202,7 +202,7 @@ class TestMetaInit:
             diffusion_head_config=std_config.diffusion_head_config,
             tts_backbone_num_hidden_layers=20,
         )
-        stream_config.torch_dtype = torch.bfloat16
+        real["cfg"].set_config_dtype(stream_config, torch.bfloat16)
         with torch.device("meta"):
             model = real["modeling_stream_infer"].VibeVoiceStreamingForConditionalGenerationInference(
                 stream_config)
@@ -217,7 +217,7 @@ class TestMetaInit:
             semantic_tokenizer_config=std_config.semantic_tokenizer_config,
             decoder_config=std_config.decoder_config,
         )
-        asr_config.torch_dtype = torch.bfloat16
+        real["cfg"].set_config_dtype(asr_config, torch.bfloat16)
         with torch.device("meta"):
             model = real["modeling_asr"].VibeVoiceASRForConditionalGeneration(asr_config)
         n_params, n_meta, sched_ok = _meta_stats(model)
@@ -311,3 +311,55 @@ class TestInstantiateModelMeta:
         # Every initializer call (if any) must have operated on a meta tensor.
         assert all(is_meta for _, is_meta in seen), (
             "an initializer touched a REAL tensor during meta construction")
+
+
+# ---------------------------------------------------------------------------
+# transformers v5 torch_dtype deprecation compat (vendored helpers)
+# ---------------------------------------------------------------------------
+class TestConfigDtypeCompat:
+    """The vendored set/get_config_dtype helpers must round-trip the dtype on
+    a REAL config without triggering the transformers v5 deprecation warning,
+    and model construction must read it back correctly."""
+
+    def test_set_get_roundtrip_real_config(self, real):
+        cfg_path = os.path.join(real["configs_dir"], "default_VibeVoice-1.5B_config.json")
+        config = real["cfg"].VibeVoiceConfig.from_pretrained(cfg_path)
+        real["cfg"].set_config_dtype(config, torch.bfloat16)
+        assert real["cfg"].get_config_dtype(config) == torch.bfloat16
+
+    def test_get_config_dtype_from_packaged_config(self, real):
+        """Packaged config.json carries "torch_dtype": "bfloat16"; transformers
+        v5 converts it to the canonical ``dtype`` at load (no warning), and the
+        helper must resolve it."""
+        cfg_path = os.path.join(real["configs_dir"], "default_VibeVoice-1.5B_config.json")
+        config = real["cfg"].VibeVoiceConfig.from_pretrained(cfg_path)
+        assert real["cfg"].get_config_dtype(config) == torch.bfloat16
+
+    def test_model_reads_dtype_via_helper(self, real, std_config):
+        """Model construction must resolve the dtype through get_config_dtype
+        (never via the deprecated config.torch_dtype attribute). Under meta
+        init the .to(dtype) casts are skipped, so we spy on the helper call
+        instead of inspecting parameter dtypes."""
+        modeling = real["modeling"]
+        real_fn = modeling.get_config_dtype
+        calls = []
+
+        def _spy(config):
+            calls.append(config)
+            return real_fn(config)
+
+        modeling.get_config_dtype = _spy
+        try:
+            with torch.device("meta"):
+                modeling.VibeVoiceForConditionalGeneration(std_config)
+        finally:
+            modeling.get_config_dtype = real_fn
+
+        assert calls, "model construction did not call get_config_dtype"
+        assert real_fn(std_config) == torch.bfloat16
+
+    def test_convert_dtype_to_string_handles_both_keys(self, real):
+        fn = real["cfg"]._convert_dtype_to_string
+        d = fn({"torch_dtype": torch.bfloat16, "dtype": torch.float16})
+        assert d["torch_dtype"] == "bfloat16"
+        assert d["dtype"] == "float16"

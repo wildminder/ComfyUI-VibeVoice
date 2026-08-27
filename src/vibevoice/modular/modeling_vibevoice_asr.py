@@ -15,7 +15,7 @@ from .modular_vibevoice_tokenizer import (
     VibeVoiceTokenizerEncoderOutput
 )
 
-from .configuration_vibevoice import VibeVoiceASRConfig
+from .configuration_vibevoice import VibeVoiceASRConfig, get_config_dtype
 from .modeling_vibevoice import (
     VibeVoiceCausalLMOutputWithPast,    
     SpeechConnector
@@ -63,12 +63,8 @@ class VibeVoiceASRModel(VibeVoiceASRPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         
-        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
-            if isinstance(config.torch_dtype, str):
-                dtype = getattr(torch, config.torch_dtype)
-            else:
-                dtype = config.torch_dtype
-        else:
+        dtype = get_config_dtype(config)
+        if dtype is None:
             dtype = torch.float32
         
         # Initialize Qwen2 model for language modeling
@@ -163,12 +159,8 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
         self.vocab_size = config.decoder_config.vocab_size
         
         # Determine the dtype to use
-        if hasattr(config, 'torch_dtype') and config.torch_dtype is not None:
-            if isinstance(config.torch_dtype, str):
-                dtype = getattr(torch, config.torch_dtype)
-            else:
-                dtype = config.torch_dtype
-        else:
+        dtype = get_config_dtype(config)
+        if dtype is None:
             dtype = torch.float32
         
         # Initialize lm_head with the correct dtype
@@ -229,12 +221,8 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
             speech_semantic_tensors: Optional pre-computed semantic tokens
             streaming_segment_duration: Segment duration in seconds for streaming processing (default: 60s)
         """
-        if hasattr(self.config, 'torch_dtype') and self.config.torch_dtype is not None:
-            if isinstance(self.config.torch_dtype, str):
-                dtype = getattr(torch, self.config.torch_dtype)
-            else:
-                dtype = self.config.torch_dtype
-        else:
+        dtype = get_config_dtype(self.config)
+        if dtype is None:
             dtype = torch.float32
             
         speech_tensors = speech_tensors.to(dtype)
