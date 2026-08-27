@@ -394,6 +394,11 @@ def build_stub_vv(n_layers: int = 1, hidden: int = 64, ffn: int = 128,
             super().__init__()
             self.weight = nn.Parameter(torch.ones(hidden))
 
+        def forward(self, x):
+            # RMSNorm-shaped residual-scale (matches real model semantics
+            # closely enough for pipeline tests).
+            return x * self.weight
+
     class _Layer(nn.Module):
         def __init__(self):
             super().__init__()

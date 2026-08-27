@@ -1,0 +1,64 @@
+"""Registration of VibeVoice-vendored + HF norm classes as streamable.
+
+Kept separate from :mod:`modules.comfy_stream` so the heavy vendored /
+transformers imports happen only when a conversion pass actually runs
+(`comfy_stream.convert_tree_for_streaming` calls this lazily).
+"""
+
+from .comfy_stream import (
+    _compute_convlayernorm,
+    _compute_convrmsnorm,
+    _compute_qwen2rmsnorm,
+    _compute_rmsnorm,
+)
+
+
+def register_vendored_types(register) -> None:
+    """Teach ``convert_tree_for_streaming`` about vendored norm classes.
+
+    Each registration is isolated: one unavailable/broken class must never
+    prevent the others (or the builtin kinds) from streaming.
+    """
+    entries = []
+
+    try:
+        from ..src.vibevoice.modular.modular_vibevoice_tokenizer import (
+            ConvLayerNorm,
+            ConvRMSNorm,
+            RMSNorm as TokenizerRMSNorm,
+        )
+        from ..src.vibevoice.modular.modular_vibevoice_diffusion_head import (
+            RMSNorm as DiffusionRMSNorm,
+        )
+        # Tokenizer and diffusion-head RMSNorm share identical math.
+        entries += [
+            (TokenizerRMSNorm, _compute_rmsnorm),
+            (DiffusionRMSNorm, _compute_rmsnorm),
+            (ConvRMSNorm, _compute_convrmsnorm),
+            (ConvLayerNorm, _compute_convlayernorm),
+        ]
+    except Exception as e:  # pragma: no cover - heavy deps optional here
+        _log_skip("vendored norms", e)
+
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+
+        entries.append((Qwen2RMSNorm, _compute_qwen2rmsnorm))
+    except Exception as e:  # pragma: no cover
+        _log_skip("Qwen2RMSNorm", e)
+
+    import logging
+
+    log = logging.getLogger(__name__)
+    for base_cls, compute_fn in entries:
+        if not isinstance(base_cls, type):
+            log.debug("Skipping non-type streaming entry %r", base_cls)
+            continue
+        register(base_cls, compute_fn)
+
+
+def _log_skip(what, e):
+    import logging
+
+    logging.getLogger(__name__).debug("Streaming registration skipped %s: %s",
+                                      what, e)

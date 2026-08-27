@@ -106,13 +106,11 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
             logger.info(f"Attention Mode: {mode_names.get(self.attention_mode, self.attention_mode)}")
             self.model.load_model(target_device, self.attention_mode)
 
-        # Plan 2026-08-18, D6/RC-5: NO bulk pre-move here. The single
-        # host-to-device transfer is owned by super().patch_model() →
-        # ModelPatcher.load(), which moves modules per-module (size-sorted,
-        # with pinning/streams) and correctly tracks
-        # model_loaded_weight_memory + supports lowvram partial loading.
-        # A bulk self.model.model.to(target_device) duplicated that transfer
-        # as one blocking, unpinned copy and defeated partial loading.
+        # Plan 2026-08-18 D6/RC-5 + 2026-08-26: the single H2D transfer is
+        # owned by super().patch_model(); the tree itself is made fluent in
+        # core's lowvram protocol by modules/comfy_stream.py (applied at load
+        # time), so partial loading/offloading streams correctly instead of
+        # stranding foreign modules on CPU.
 
         # Apply dtype casting ONLY if the model's dtype differs from the
         # target (DF-004 fix). The loader now applies the final dtype on CPU
@@ -131,11 +129,10 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                 cast_model_to_dtype(self.model.model, self.target_dtype)
 
         # Delegate to ComfyUI's standard patch_model() with load_weights=True
-        # so that ComfyUI's load() properly tracks model_loaded_weight_memory
-        # and can manage VRAM offloading. The model is already loaded and on
-        # the correct device; ComfyUI's load() will iterate over the handler's
-        # parameters (which include the VibeVoice model's parameters) and
-        # track the loaded weight memory.
+        # so that ComfyUI's load() properly tracks model_loaded_weight_memory.
+        # Every parameter is already on target_device at this point, so
+        # core's per-module movement skips entirely; its bookkeeping still
+        # records full residency for VRAM arbitration.
         result = super().patch_model(
             device_to=target_device,
             lowvram_model_memory=lowvram_model_memory,
@@ -144,42 +141,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
             *args, **kwargs
         )
 
-        if load_weights and self.model is not None and self.model.model is not None:
-            self._complete_partial_transfer(target_device)
-
         return result
-
-    def _complete_partial_transfer(self, target_device) -> int:
-        """Finish a lowvram PARTIAL load left incomplete by ComfyUI.
-
-        When the model exceeds free VRAM, core ModelPatcher.load() keeps tail
-        modules on CPU and expects comfy.ops streaming hooks to move them
-        per-forward. A plain transformers tree has no such hooks, so the
-        first CPU-resident submodule crashes at forward ("Input type
-        CUDABFloat16Type and weight type CPUBFloat16Type should be the
-        same"). Detect stragglers and complete the H2D transfer; for fully
-        loaded models this scan finds nothing and `.to()` on an already-
-        placed tree is a no-op.
-
-        Returns:
-            Number of parameters found off-target before completion.
-        """
-        try:
-            strays = [
-                name for name, p in self.model.model.named_parameters()
-                if p.device != target_device
-            ]
-        except Exception:
-            return 0
-        if not strays:
-            return 0
-        logger.info(
-            f"Lowvram partial load left {len(strays)} parameter(s) off "
-            f"{target_device} (e.g. '{strays[0]}'); completing the transfer "
-            f"for the transformers tree..."
-        )
-        self.model.model.to(target_device)
-        return len(strays)
 
     def unpatch_model(self, device_to=None, unpatch_weights=True, warm: bool = False,
                       destroy: bool = False, *args, **kwargs):

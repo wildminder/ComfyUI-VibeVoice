@@ -20,6 +20,19 @@ def _mock_audio_dict(length: int = 24000, sr: int = 24000) -> dict:
     return {"waveform": torch.randn(1, 1, length), "sample_rate": sr}
 
 
+def _patch_model_management():
+    """Patch generation.model_management with a realistic stand-in.
+
+    BUG-012: generate_audio places inputs on the runtime's compute device
+    (``model_management.get_torch_device()``), NOT ``model.device`` (which
+    lies under partial offload). A bare MagicMock breaks ``Tensor.to()``,
+    so the mock must return a real torch.device.
+    """
+    mm = MagicMock()
+    mm.get_torch_device.return_value = torch.device("cpu")
+    return patch("ComfyUI_VibeVoice.modules.generation.model_management", mm)
+
+
 class TestFullPipelineMocked:
     """End-to-end pipeline tests with mocked model."""
 
@@ -115,7 +128,7 @@ class TestFullPipelineMocked:
         mock_patcher = MagicMock()
         mock_patcher.is_loaded = True
 
-        with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
+        with _patch_model_management():
             force_offload_model(mock_patcher, "TestModel")
 
             mock_patcher.unpatch_model.assert_called_once_with(
@@ -135,7 +148,7 @@ class TestFullPipelineMocked:
         mock_processor.tokenizer = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             waveform, sr = generate_audio(
                 model=mock_model,
@@ -161,7 +174,7 @@ class TestFullPipelineMocked:
         mock_processor.tokenizer = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             waveform, sr = generate_audio(
                 model=mock_model,

@@ -181,6 +181,32 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.6.0 - Native Lowvram Streaming (oversized models work)</strong></summary>
+
+### 🚀 Performance / Memory
+*   **Models larger than your VRAM now load and generate correctly** instead
+    of crashing with `Input type (CUDABFloat16Type) and weight type
+    (CPUBFloat16Type)` (VibeVoice-7B). The tree is converted at load time to
+    comfy-native streaming modules (`comfy_cast_weights` +
+    `cast_bias_weight(offloadable=True)`), so ComfyUI's lowvram arbiter can
+    partially load and partially offload it like any native model — hot
+    layers stay in VRAM, cold layers stream from CPU on demand.
+*   Previously, foreign transformers modules were silently stranded on CPU by
+    core's `partially_unload` and had no way back; the temporary
+    force-full-placement workaround (which blocked legitimate offloading) is
+    removed in favor of the native protocol.
+
+### 🛡️ Safety
+*   Quant residents (GGUF raw blocks / ConvRot INT8) participate in streaming
+    with their storage dtype pinned (`weight_comfy_model_dtype`) and a
+    dtype-preserving pull path — raw bytes are moved, never recast.
+*   Vendored norm classes (RMSNorm/ConvRMSNorm/LayerNorm variants, Qwen2
+    RMSNorm) gained streaming forwards with parity tests against the
+    originals.
+
+</details>
+
+<details>
 <summary><strong>v2.5.0 - Quant-Resident Runtime: GGUF Raw-Block Residency + ConvRot INT8</strong></summary>
 
 ### 🚀 Performance / Memory
