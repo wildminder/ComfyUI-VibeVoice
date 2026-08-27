@@ -58,17 +58,137 @@ logger = logging.getLogger(__name__)
 _PACKAGED_CONFIG_FILES = {
     "VibeVoice-1.5B": "default_VibeVoice-1.5B_config.json",
     "VibeVoice-7B": "default_VibeVoice-Large_config.json",
-    "VibeVoice-Large": "default_VibeVoice-Large_config.json",
 }
+
+# Sentinel config_name that resolves the architecture from the weight file's
+# embedding fingerprint at load time (plan 2026-08-27, D6).
+AUTO_CONFIG_NAME = "Auto-detect"
 
 # All config_name values accepted by the loader node dropdown.
 EXTERNAL_CONFIG_OPTIONS = [
+    AUTO_CONFIG_NAME,
     "VibeVoice-1.5B",
     "VibeVoice-7B",
-    "VibeVoice-Large",
     "VibeVoice-Realtime-0.5B",
     "VibeVoice-ASR",
 ]
+
+# Legacy config_name values removed from the dropdown but still honored so
+# saved workflows keep loading (plan 2026-08-27, D1/D2). Keys are compared
+# case-insensitively.
+_LEGACY_CONFIG_ALIASES = {
+    "vibevoice-large": "VibeVoice-7B",
+}
+
+
+def normalize_config_name(config_name: str) -> str:
+    """Map legacy/alias config_name values onto their canonical option.
+
+    Exact options pass through unchanged; case-insensitive alias hits return
+    the canonical name; anything unknown is returned as-is (callers decide
+    validity).
+
+    Args:
+        config_name: Raw config_name value (may come from a saved workflow).
+
+    Returns:
+        Canonical config_name when an alias applies, else the input value.
+    """
+    if not config_name:
+        return config_name
+    if config_name in EXTERNAL_CONFIG_OPTIONS:
+        return config_name
+    return _LEGACY_CONFIG_ALIASES.get(config_name.lower(), config_name)
+
+
+def resolve_auto_config_name(weight_path: str, gguf_reader=None, weights_fp=None) -> str:
+    """Resolve ``AUTO_CONFIG_NAME`` to a concrete family from the weights.
+
+    Plan 2026-08-27 (D6): Auto-detect reads the weight file's architecture
+    fingerprint (header-only). A conclusive fingerprint becomes the selected
+    config_name; an inconclusive one raises an actionable ``ValueError``
+    BEFORE any heavy load work. Shared by the node (which must resolve the
+    name before computing the cache identity) and the loader (defense in
+    depth for direct callers) so both fail fast with the same message.
+
+    Args:
+        weight_path: Absolute path to the external weight file.
+        gguf_reader: Optional open ``gguf.GGUFReader`` for ``.gguf`` files
+            (avoids re-opening when the loader already holds one).
+        weights_fp: Optional precomputed ``WeightsFingerprint``; when omitted
+            the fingerprint is computed here (header-only).
+
+    Returns:
+        The detected config_name (e.g. ``"VibeVoice-7B"``).
+
+    Raises:
+        ValueError: When the architecture cannot be determined.
+    """
+    if weights_fp is None:
+        from .config_detect import fingerprint_weights
+
+        weights_fp = fingerprint_weights(weight_path, gguf_reader=gguf_reader)
+
+    detected = weights_fp.config_name if weights_fp is not None else None
+    if not detected:
+        explicit = [o for o in EXTERNAL_CONFIG_OPTIONS if o != AUTO_CONFIG_NAME]
+        raise ValueError(
+            f"config_name '{AUTO_CONFIG_NAME}': could not determine the "
+            f"VibeVoice architecture from "
+            f"'{os.path.basename(weight_path)}'. Auto-detect reads the "
+            f"checkpoint's embedding fingerprint, which is unavailable for "
+            f"this file (.bin/.pt checkpoints and unknown architectures "
+            f"cannot be auto-detected). Select config_name explicitly "
+            f"(one of: {', '.join(explicit)}) or place a sidecar config.json "
+            f"next to the weight file."
+        )
+    logger.info(
+        f"Auto-detected architecture '{detected}' from "
+        f"'{os.path.basename(weight_path)}'"
+    )
+    return detected
+
+
+def reconcile_config(selected_name: str, resolved_config, weights_fp):
+    """Reconcile the selected config against the weights' fingerprint.
+
+    Plan 2026-08-27 (D5): the checkpoint's embedding shape is a perfect
+    architecture fingerprint. When it CONTRADICTS the resolved config family,
+    the fingerprint wins and the detected family's config is substituted —
+    a mismatching config (dropdown or sidecar) is a guaranteed size-mismatch
+    crash otherwise. When the fingerprint is inconclusive (``None``) or
+    agrees, the selection stands.
+
+    Args:
+        selected_name: The (normalized) config_name in effect.
+        resolved_config: The config object loaded for ``selected_name``.
+        weights_fp: ``WeightsFingerprint`` from the weight file, or ``None``.
+
+    Returns:
+        ``(effective_name, changed)`` — the config_name to use and whether
+        it differs from ``selected_name``.
+    """
+    from .config_detect import config_fingerprint
+
+    if weights_fp is None:
+        return selected_name, False
+
+    cfg_fp = config_fingerprint(resolved_config)
+    if cfg_fp is None or cfg_fp == (weights_fp.hidden_size, weights_fp.vocab_size):
+        return selected_name, False
+
+    detected = weights_fp.config_name
+    if not detected or detected == selected_name:
+        return selected_name, False
+
+    logger.warning(
+        f"Config mismatch: weights contain '{weights_fp.source_key}' with "
+        f"shape (vocab={weights_fp.vocab_size}, hidden={weights_fp.hidden_size}) "
+        f"-> {detected}, but config '{selected_name}' "
+        f"(hidden={cfg_fp[0]}, vocab={cfg_fp[1]}) was selected. "
+        f"Using '{detected}'."
+    )
+    return detected, True
 
 
 # ====================================================================
@@ -119,19 +239,19 @@ def resolve_sidecar_config(weight_path: str, config_name: str) -> str:
     # 1. Sidecar: <weight_path>.config.json
     sidecar_path = weight_path + ".config.json"
     if os.path.exists(sidecar_path):
-        logger.info(f"Using sidecar config: {sidecar_path}")
+        logger.debug(f"Using sidecar config: {sidecar_path}")
         return sidecar_path
 
     # 2. Sidecar: config.json in the same directory
     dir_sidecar = os.path.join(os.path.dirname(weight_path), "config.json")
     if os.path.exists(dir_sidecar):
-        logger.info(f"Using directory sidecar config: {dir_sidecar}")
+        logger.debug(f"Using directory sidecar config: {dir_sidecar}")
         return dir_sidecar
 
     # 3. Packaged default based on config_name
     packaged = _get_packaged_config_path(config_name)
     if packaged and os.path.exists(packaged):
-        logger.info(f"Using packaged default config for '{config_name}': {packaged}")
+        logger.debug(f"Using packaged default config for '{config_name}': {packaged}")
         return packaged
 
     raise FileNotFoundError(
@@ -161,12 +281,12 @@ def resolve_sidecar_preprocessor(weight_path: str) -> str:
     """
     sidecar_path = weight_path + ".preprocessor.json"
     if os.path.exists(sidecar_path):
-        logger.info(f"Using sidecar preprocessor config: {sidecar_path}")
+        logger.debug(f"Using sidecar preprocessor config: {sidecar_path}")
         return sidecar_path
 
     dir_sidecar = os.path.join(os.path.dirname(weight_path), "preprocessor_config.json")
     if os.path.exists(dir_sidecar):
-        logger.info(f"Using directory sidecar preprocessor config: {dir_sidecar}")
+        logger.debug(f"Using directory sidecar preprocessor config: {dir_sidecar}")
         return dir_sidecar
 
     return ""
@@ -244,7 +364,7 @@ def _load_asr_tokenizer(tokenizer_dir: str) -> "VibeVoiceASRTextTokenizerFast":
             _packaged_configs_dir(), "tokenizer.json"
         )
         if os.path.exists(packaged_tokenizer_path):
-            logger.info(
+            logger.debug(
                 f"Using packaged tokenizer.json fallback for ASR: {packaged_tokenizer_path}"
             )
             tokenizer_file_path = packaged_tokenizer_path
@@ -371,7 +491,7 @@ def _load_gguf_state_dict(weight_path: str, device=None) -> dict:
             "Install it with: pip install gguf"
         ) from e
 
-    logger.info(f"Loading GGUF state dict from: {weight_path}")
+    logger.debug(f"Loading GGUF state dict from: {weight_path}")
     reader = gguf.GGUFReader(weight_path)
 
     state_dict = {}
@@ -382,7 +502,7 @@ def _load_gguf_state_dict(weight_path: str, device=None) -> dict:
         dequantized = gguf.dequantize(tensor.data, tensor.tensor_type)
         state_dict[tensor.name] = torch.from_numpy(dequantized.copy()).to(device)
 
-    logger.info(f"Loaded {len(state_dict)} tensors from GGUF file")
+    logger.debug(f"Loaded {len(state_dict)} tensors from GGUF file")
     return state_dict
 
 
@@ -870,7 +990,8 @@ def load_external_vibevoice_model(
             (safetensors / .bin / .gguf).
         config_name: Architecture config selector. Used for the packaged-default
             fallback when no sidecar config is present. One of
-            ``EXTERNAL_CONFIG_OPTIONS``.
+            ``EXTERNAL_CONFIG_OPTIONS``; ``AUTO_CONFIG_NAME`` resolves the
+            family from the weights' embedding fingerprint.
         attention_mode: Attention implementation
             ("eager", "sdpa", "flash_attention_2", "sage").
         use_llm_4bit: Whether to quantize the LLM to 4-bit NF4.
@@ -892,8 +1013,14 @@ def load_external_vibevoice_model(
 
     Raises:
         FileNotFoundError: If the weight file or config cannot be found.
+        ValueError: If ``AUTO_CONFIG_NAME`` is selected but the architecture
+            cannot be determined from the weight file.
         RuntimeError: If model instantiation or loading fails.
     """
+    # Legacy alias normalization (plan 2026-08-27, D1): saved workflows may
+    # still carry removed option values (e.g. "VibeVoice-Large").
+    config_name = normalize_config_name(config_name)
+
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
 
@@ -953,6 +1080,21 @@ def load_external_vibevoice_model(
         gguf_kquant_present=_gguf_kquant_present(gguf_reader) if gguf_reader else False,
     )
 
+    # Architecture fingerprint (plan 2026-08-27, D3): header-only for
+    # safetensors, reuses the open GGUF reader. Computed BEFORE the heavy
+    # state-dict load so Auto-detect can fail fast (D6) and reconciliation
+    # (D5) reuses it below without re-reading the file.
+    from .config_detect import fingerprint_weights
+
+    weights_fp = fingerprint_weights(weight_path, gguf_reader=gguf_reader)
+
+    # Auto-detect (D6): resolve the architecture from the fingerprint BEFORE
+    # any heavy work. Conclusive -> adopt the detected family; inconclusive
+    # -> actionable ValueError (fail-fast, no partial load). Explicit
+    # selections skip this and self-heal via reconciliation below (D5).
+    if config_name == AUTO_CONFIG_NAME:
+        config_name = resolve_auto_config_name(weight_path, weights_fp=weights_fp)
+
     cpu_device = torch.device("cpu")
     state_dict = None
     if gguf_reader is not None:
@@ -966,14 +1108,22 @@ def load_external_vibevoice_model(
         # loader). Always CPU — the patcher owns the single H2D transfer.
         state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
-    # Step 2: Resolve and load the architecture config.
+    # Step 2: Resolve and load the architecture config, reconciled against
+    # the weights' architecture fingerprint (plan 2026-08-27, D5). When the
+    # fingerprint contradicts the selected config family, the detected
+    # family's packaged config is substituted with a WARNING.
     config_path = resolve_sidecar_config(weight_path, config_name)
     config = VibeVoiceLoader._load_config(config_path, config_name)
+    effective_name, config_changed = reconcile_config(config_name, config, weights_fp)
+    if config_changed:
+        config_name = effective_name
+        config_path = resolve_sidecar_config(weight_path, config_name)
+        config = VibeVoiceLoader._load_config(config_path, config_name)
 
     # Step 3: Detect streaming from the loaded config.
     is_streaming = isinstance(config, VibeVoiceStreamingConfig)
     if is_streaming:
-        logger.info(f"External model '{config_name}' detected as streaming model")
+        logger.debug(f"External model '{config_name}' detected as streaming model")
 
     # Step 4: Resolve and load the tokenizer.
     tokenizer_dir = resolve_sidecar_tokenizer_dir(weight_path)
@@ -1009,7 +1159,7 @@ def load_external_vibevoice_model(
     attn_implementation_for_load = get_attn_implementation_for_load(attention_mode)
 
     try:
-        logger.info(
+        logger.debug(
             f"Instantiating external VibeVoice model '{config_name}' with "
             f"dtype={final_load_dtype}, attention='{attn_implementation_for_load}'"
         )
@@ -1178,6 +1328,9 @@ def load_external_vibevoice_asr_model(
         FileNotFoundError: If the weight file, config, or tokenizer cannot be found.
         RuntimeError: If model instantiation or loading fails.
     """
+    # Legacy alias normalization (plan 2026-08-27, D1) — mirrors the TTS branch.
+    config_name = normalize_config_name(config_name)
+
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
 
@@ -1258,7 +1411,7 @@ def load_external_vibevoice_asr_model(
     attn_implementation_for_load = get_attn_implementation_for_load(attention_mode)
 
     try:
-        logger.info(
+        logger.debug(
             f"Instantiating external VibeVoice ASR model '{config_name}' with "
             f"dtype={model_dtype}, attention='{attn_implementation_for_load}'"
         )

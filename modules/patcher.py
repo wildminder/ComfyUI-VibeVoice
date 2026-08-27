@@ -103,7 +103,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                 "flash_attention_2": "Flash Attention 2 (Fastest)",
                 "sage": "SageAttention (Quantized High-Performance)",
             }
-            logger.info(f"Attention Mode: {mode_names.get(self.attention_mode, self.attention_mode)}")
+            logger.debug(f"Attention Mode: {mode_names.get(self.attention_mode, self.attention_mode)}")
             self.model.load_model(target_device, self.attention_mode)
 
         # Plan 2026-08-18 D6/RC-5 + 2026-08-26: the single H2D transfer is
@@ -166,7 +166,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                     offload_target = self.offload_device
                 self.model.model = self.model.model.to(offload_target)
                 self._warm_offloaded = True
-                logger.info(
+                logger.debug(
                     f"Warm offloading VibeVoice models for '{self.model.model_pack_name}' "
                     f"({self.attention_mode}) to {offload_target} (tensors retained)..."
                 )
@@ -176,7 +176,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
 
             if destroy:
                 # Destructive offload (explicit): null references and clear cache.
-                logger.info(
+                logger.debug(
                     f"Destroying VibeVoice models for '{self.model.model_pack_name}' "
                     f"({self.attention_mode}) (weights freed)..."
                 )
@@ -197,7 +197,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                 cache = self._model_cache
                 if self.cache_key in cache:
                     del cache[self.cache_key]
-                    logger.info(f"Cleared model cache for: {self.cache_key}")
+                    logger.debug(f"Cleared model cache for: {self.cache_key}")
 
                 gc.collect()
                 model_management.soft_empty_cache()
@@ -209,7 +209,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
             # device_to and resets model_loaded_weight_memory. The next
             # patch_model() is then a pure host-to-device transfer.
             self._warm_offloaded = False
-            logger.info(
+            logger.debug(
                 f"Offloading VibeVoice models for '{self.model.model_pack_name}' "
                 f"({self.attention_mode}) to {device_to} (weights kept in RAM)..."
             )

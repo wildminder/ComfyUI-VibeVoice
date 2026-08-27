@@ -130,8 +130,60 @@ def _recompute_rope_buffers(model) -> int:
                 f"{module.__class__.__name__}: {e}"
             )
     if recomputed:
-        logger.info(f"Recomputed RoPE inv_freq for {recomputed} rotary module(s).")
+        logger.debug(f"Recomputed RoPE inv_freq for {recomputed} rotary module(s).")
     return recomputed
+
+
+def _assert_shapes_compatible(model, state_dict, max_reported: int = 5) -> None:
+    """Raise a friendly error when checkpoint shapes contradict the model.
+
+    Plan 2026-08-27 (D8): a config/weights family mismatch would otherwise
+    surface as torch's raw ``size mismatch`` RuntimeError deep inside
+    ``load_state_dict``. Comparing the shapes of keys present in BOTH the
+    checkpoint and the model first lets us name the offending keys and hint
+    at the likely cause (wrong config_name) before any load work begins.
+    Meta parameters still carry their shape, so this works on meta-
+    initialized models. Missing / unexpected keys are NOT compared —
+    ``strict=False`` handles those separately.
+
+    Args:
+        model: Instantiated model (meta- or eager-initialized).
+        state_dict: Checkpoint state dict.
+        max_reported: How many mismatched keys to enumerate in the message.
+
+    Raises:
+        ValueError: When at least one shared key has a contradictory shape.
+    """
+    model_tensors = dict(model.named_parameters(remove_duplicate=False))
+    model_tensors.update(dict(model.named_buffers()))
+
+    mismatches = []
+    for key, tensor in state_dict.items():
+        model_tensor = model_tensors.get(key)
+        if model_tensor is None or not hasattr(tensor, "shape"):
+            continue
+        if tuple(tensor.shape) != tuple(model_tensor.shape):
+            mismatches.append(
+                (key, tuple(tensor.shape), tuple(model_tensor.shape))
+            )
+
+    if not mismatches:
+        return
+
+    lines = [
+        f"  {key}: checkpoint shape {ckpt} vs model shape {mdl}"
+        for key, ckpt, mdl in mismatches[:max_reported]
+    ]
+    if len(mismatches) > max_reported:
+        lines.append(f"  ... and {len(mismatches) - max_reported} more")
+    raise ValueError(
+        f"Checkpoint weight shapes do not match the "
+        f"'{type(model).__name__}' model for {len(mismatches)} shared "
+        f"key(s):\n" + "\n".join(lines) +
+        "\nThis almost always means the selected config does not match the "
+        "weight file. Verify config_name (or the sidecar config.json) "
+        "matches the checkpoint's architecture, or use 'Auto-detect'."
+    )
 
 # Cache for loaded (model, processor) tuples, keyed by cache_key
 LOADED_MODELS_CACHE = {}
@@ -170,7 +222,7 @@ def cleanup_old_models(keep_cache_key: str = None) -> None:
                 logger.warning(f"Error cleaning up patcher {key}: {e}")
 
     if keys_to_remove:
-        logger.info(f"Cleaned up cached models: {keys_to_remove}")
+        logger.debug(f"Cleaned up cached models: {keys_to_remove}")
         gc.collect()
         model_management.soft_empty_cache()
 
@@ -321,7 +373,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             model_type = config_data.get("model_type", "")
 
             if model_type == "vibevoice_streaming":
-                logger.info(f"Detected streaming config for '{model_name}'")
+                logger.debug(f"Detected streaming config for '{model_name}'")
                 return VibeVoiceStreamingConfig.from_pretrained(config_path)
             else:
                 return VibeVoiceConfig.from_pretrained(config_path)
@@ -358,7 +410,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         tokenizer_file_path = os.path.join(tokenizer_dir, "tokenizer.json")
 
         if not os.path.exists(tokenizer_file_path):
-            logger.info(f"'tokenizer.json' not found in model directory: {tokenizer_dir}")
+            logger.debug(f"'tokenizer.json' not found in model directory: {tokenizer_dir}")
 
             # Packaged fallback: load straight from the node folder. The
             # user's model directory stays untouched.
@@ -368,7 +420,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             packaged_tokenizer_path = os.path.join(packaged_configs_dir, "tokenizer.json")
 
             if os.path.exists(packaged_tokenizer_path):
-                logger.info("Using pre-packaged tokenizer directly from the node folder...")
+                logger.debug("Using pre-packaged tokenizer directly from the node folder...")
                 return VibeVoiceTextTokenizerFast(tokenizer_file=packaged_tokenizer_path)
 
             # Download from HuggingFace if still missing
@@ -533,25 +585,25 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # Check for single safetensors file
         single_safetensors = os.path.join(model_path, "model.safetensors")
         if os.path.isfile(single_safetensors):
-            logger.info(f"Found single safetensors checkpoint: {single_safetensors}")
+            logger.debug(f"Found single safetensors checkpoint: {single_safetensors}")
             return single_safetensors, False
 
         # Check for sharded safetensors
         sharded_safetensors_index = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.isfile(sharded_safetensors_index):
-            logger.info(f"Found sharded safetensors checkpoint: {sharded_safetensors_index}")
+            logger.debug(f"Found sharded safetensors checkpoint: {sharded_safetensors_index}")
             return sharded_safetensors_index, True
 
         # Check for single PyTorch checkpoint
         single_bin = os.path.join(model_path, "pytorch_model.bin")
         if os.path.isfile(single_bin):
-            logger.info(f"Found single PyTorch checkpoint: {single_bin}")
+            logger.debug(f"Found single PyTorch checkpoint: {single_bin}")
             return single_bin, False
 
         # Check for sharded PyTorch checkpoint
         sharded_bin_index = os.path.join(model_path, "pytorch_model.bin.index.json")
         if os.path.isfile(sharded_bin_index):
-            logger.info(f"Found sharded PyTorch checkpoint: {sharded_bin_index}")
+            logger.debug(f"Found sharded PyTorch checkpoint: {sharded_bin_index}")
             return sharded_bin_index, True
 
         # No checkpoint found
@@ -606,6 +658,10 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             Tuple of (missing_keys, unexpected_keys).
         """
         known_missing = known_missing or set()
+        # Friendly shape pre-check (plan 2026-08-27, D8): a config/weights
+        # family mismatch becomes a clear, actionable ValueError naming the
+        # offending keys instead of torch's raw "size mismatch" RuntimeError.
+        _assert_shapes_compatible(model, state_dict)
         missing_keys, unexpected_keys = model.load_state_dict(
             state_dict, strict=False, assign=True
         )
@@ -616,6 +672,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # top-level config flag — check both, and let each model's own
         # tie_weights() apply its internal guard.
         config = getattr(model, "config", None)
+        tied = False
         if config is not None and hasattr(model, "tie_weights"):
             decoder_config = getattr(config, "decoder_config", None)
             tied = bool(getattr(decoder_config, "tie_word_embeddings", False)) or \
@@ -674,7 +731,18 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 f"Streaming conversion failed (continuing without it): {e}"
             )
 
-        reported_missing = [k for k in missing_keys if k not in known_missing]
+        # Tied embeddings (e.g. 1.5B's tie_word_embeddings=True): the
+        # checkpoint legitimately omits lm_head.weight — it is re-tied above,
+        # so its absence is expected, not a problem.
+        if tied and "lm_head.weight" in missing_keys:
+            logger.debug(
+                "lm_head.weight absent from checkpoint (tied to input "
+                "embeddings via tie_word_embeddings) — expected."
+            )
+        reported_missing = [
+            k for k in missing_keys
+            if k not in known_missing and not (tied and k == "lm_head.weight")
+        ]
         if reported_missing:
             logger.warning(f"Missing keys when loading state dict: {len(reported_missing)} keys")
             if len(reported_missing) < 20:
@@ -738,7 +806,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             state_dict = VibeVoiceLoader._load_sharded_state_dict(ckpt_path, model_dir, cpu_device)
         else:
             # Load single checkpoint file (onto CPU)
-            logger.info(f"Loading state dict from: {ckpt_path}")
+            logger.debug(f"Loading state dict from: {ckpt_path}")
             state_dict = comfy.utils.load_torch_file(ckpt_path, device=cpu_device)
 
         # Assign-based load (D2/D3): checkpoint tensors replace the meta/random
@@ -792,7 +860,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
         cache_key = f"{model_name}_attn_{attention_mode}_q4_{int(use_llm_4bit)}"
         if cache_key in LOADED_MODELS_CACHE:
-            logger.info(f"Using cached model with {attention_mode} attention and q4={use_llm_4bit}")
+            logger.debug(f"Using cached model with {attention_mode} attention and q4={use_llm_4bit}")
             return LOADED_MODELS_CACHE[cache_key]
 
         model_info = AVAILABLE_VIBEVOICE_MODELS[model_name]
@@ -808,7 +876,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # Detect if this is a streaming model
         is_streaming = isinstance(config, VibeVoiceStreamingConfig)
         if is_streaming:
-            logger.info(f"Model '{model_name}' detected as streaming model")
+            logger.debug(f"Model '{model_name}' detected as streaming model")
 
         # Load tokenizer
         vibevoice_tokenizer = VibeVoiceLoader._load_tokenizer(tokenizer_dir, model_name)
@@ -840,7 +908,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         attn_implementation_for_load = get_attn_implementation_for_load(attention_mode)
 
         try:
-            logger.info(
+            logger.debug(
                 f"Loading model '{model_name}' with dtype: {final_load_dtype} "
                 f"and attention: '{attn_implementation_for_load}'"
             )

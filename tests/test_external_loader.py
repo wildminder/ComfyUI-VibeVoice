@@ -105,12 +105,16 @@ class TestPathResolution:
         assert result.endswith("default_VibeVoice-1.5B_config.json")
         assert os.path.exists(result)
 
-    def test_sidecar_config_missing_falls_back_to_large(self, tmp_path):
-        """No sidecar + config_name='VibeVoice-Large' → packaged Large default."""
+    def test_sidecar_config_missing_falls_back_to_7b(self, tmp_path):
+        """No sidecar + config_name='VibeVoice-7B' → packaged 7B default.
+
+        Plan 2026-08-27: the option 'VibeVoice-Large' was removed (it was an
+        alias of 7B); the packaged FILE keeps its historical name.
+        """
         weight = tmp_path / "foo.safetensors"
         weight.write_bytes(b"")
 
-        result = resolve_sidecar_config(str(weight), "VibeVoice-Large")
+        result = resolve_sidecar_config(str(weight), "VibeVoice-7B")
         assert result.endswith("default_VibeVoice-Large_config.json")
         assert os.path.exists(result)
 
@@ -161,9 +165,11 @@ class TestPathResolution:
     def test_external_config_options_contains_expected(self):
         """EXTERNAL_CONFIG_OPTIONS contains the documented config names."""
         assert "VibeVoice-1.5B" in EXTERNAL_CONFIG_OPTIONS
-        assert "VibeVoice-Large" in EXTERNAL_CONFIG_OPTIONS
+        assert "VibeVoice-7B" in EXTERNAL_CONFIG_OPTIONS
         assert "VibeVoice-Realtime-0.5B" in EXTERNAL_CONFIG_OPTIONS
         assert "VibeVoice-ASR" in EXTERNAL_CONFIG_OPTIONS
+        # Plan 2026-08-27: ambiguous alias removed from the visible list.
+        assert "VibeVoice-Large" not in EXTERNAL_CONFIG_OPTIONS
 
 
 # ====================================================================
@@ -701,3 +707,367 @@ class TestWarnIfLowbitQuantization:
         with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
             warn_if_lowbit_quantization(str(path))
         assert not any("naive int cast" in r.message for r in caplog.records)
+
+
+# ====================================================================
+# Plan 2026-08-27 (Phase 3): config/weights reconciliation
+# ====================================================================
+
+from ComfyUI_VibeVoice.modules.config_detect import WeightsFingerprint
+from ComfyUI_VibeVoice.modules.external_loader import reconcile_config
+
+
+def _cfg_stub(hidden: int, vocab: int):
+    """A config object whose decoder_config carries hidden/vocab."""
+    decoder = MagicMock(spec=["hidden_size", "vocab_size"])
+    decoder.hidden_size = hidden
+    decoder.vocab_size = vocab
+    cfg = MagicMock(spec=["decoder_config"])
+    cfg.decoder_config = decoder
+    return cfg
+
+
+_FP_7B = WeightsFingerprint(
+    hidden_size=3584, vocab_size=152064,
+    source_key="model.language_model.embed_tokens.weight",
+)
+_FP_15B = WeightsFingerprint(
+    hidden_size=1536, vocab_size=151936,
+    source_key="model.language_model.embed_tokens.weight",
+)
+
+
+class TestReconcileConfig:
+    """Pure decision helper: fingerprint wins over any config source."""
+
+    def test_no_fingerprint_keeps_selection(self):
+        name, changed = reconcile_config("VibeVoice-1.5B", _cfg_stub(1536, 151936), None)
+        assert (name, changed) == ("VibeVoice-1.5B", False)
+
+    def test_matching_fingerprint_keeps_selection(self):
+        name, changed = reconcile_config(
+            "VibeVoice-1.5B", _cfg_stub(1536, 151936), _FP_15B
+        )
+        assert (name, changed) == ("VibeVoice-1.5B", False)
+
+    def test_mismatch_swaps_to_detected_family(self, caplog):
+        with caplog.at_level(
+            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            name, changed = reconcile_config(
+                "VibeVoice-1.5B", _cfg_stub(1536, 151936), _FP_7B
+            )
+        assert (name, changed) == ("VibeVoice-7B", True)
+        assert any("Config mismatch" in r.message for r in caplog.records)
+        assert any("VibeVoice-7B" in r.message for r in caplog.records)
+
+    def test_mismatch_reverse_direction(self, caplog):
+        with caplog.at_level(
+            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            name, changed = reconcile_config(
+                "VibeVoice-7B", _cfg_stub(3584, 152064), _FP_15B
+            )
+        assert (name, changed) == ("VibeVoice-1.5B", True)
+
+    def test_config_without_fingerprint_keeps_selection(self):
+        """Unknown config layouts (no decoder_config) are never swapped."""
+        cfg = MagicMock(spec=[])
+        name, changed = reconcile_config("VibeVoice-Realtime-0.5B", cfg, _FP_7B)
+        assert (name, changed) == ("VibeVoice-Realtime-0.5B", False)
+
+    def test_no_warning_when_matching(self, caplog):
+        with caplog.at_level(
+            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            reconcile_config("VibeVoice-7B", _cfg_stub(3584, 152064), _FP_7B)
+        assert not any("Config mismatch" in r.message for r in caplog.records)
+
+
+class TestConfigFingerprint:
+    """config_fingerprint(): decoder_config extraction.
+
+    The vendored config classes are mocked in the test env (conftest), so
+    the packaged JSONs are exercised via the dict form — the same nested
+    'decoder_config' layout the loader produces.
+    """
+
+    def test_packaged_7b_config(self):
+        import json
+
+        from ComfyUI_VibeVoice.modules.config_detect import config_fingerprint
+
+        path = external_loader._get_packaged_config_path("VibeVoice-7B")
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        assert config_fingerprint(raw) == (3584, 152064)
+
+    def test_packaged_15b_config(self):
+        import json
+
+        from ComfyUI_VibeVoice.modules.config_detect import config_fingerprint
+
+        path = external_loader._get_packaged_config_path("VibeVoice-1.5B")
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        assert config_fingerprint(raw) == (1536, 151936)
+
+    def test_missing_decoder_config_returns_none(self):
+        from ComfyUI_VibeVoice.modules.config_detect import config_fingerprint
+
+        assert config_fingerprint(MagicMock(spec=[])) is None
+
+    def test_dict_form_supported(self):
+        from ComfyUI_VibeVoice.modules.config_detect import config_fingerprint
+
+        raw = {"decoder_config": {"hidden_size": 3584, "vocab_size": 152064}}
+        assert config_fingerprint(raw) == (3584, 152064)
+
+
+class TestLoaderReconciliationWiring:
+    """load_external_vibevoice_model swaps a contradicting config (D5)."""
+
+    @pytest.fixture
+    def weight_file(self, tmp_path):
+        weight = tmp_path / "model.safetensors"
+        weight.write_bytes(b"dummy")
+        return str(weight)
+
+    def _run(self, weight_file, config_name, weights_fp, caplog=None):
+        """Run the loader with heavy deps mocked; fingerprint controlled.
+
+        resolve_sidecar_config records every config_name it receives and
+        returns a per-name fake path; _load_config returns a config stub
+        whose fingerprint matches the requested family.
+        """
+        resolve_calls = []
+
+        def fake_resolve(weight_path, name):
+            resolve_calls.append(name)
+            return f"/fake/{name}.json"
+
+        family_fp = {
+            "VibeVoice-7B": (3584, 152064),
+            "VibeVoice-1.5B": (1536, 151936),
+        }
+
+        def fake_load_config(config_path, name):
+            hidden, vocab = family_fp.get(name, (0, 0))
+            return _cfg_stub(hidden, vocab)
+
+        fake_model = MagicMock()
+        fake_model.load_state_dict.return_value = ([], [])
+        fake_model.to.return_value = fake_model
+
+        with patch.object(
+            external_loader.comfy.utils, "load_torch_file",
+            return_value={"w": torch.zeros(1)},
+        ), patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=weights_fp,
+        ), patch.object(
+            external_loader, "resolve_sidecar_config", side_effect=fake_resolve
+        ), patch.object(
+            external_loader.VibeVoiceLoader, "_load_config",
+            side_effect=fake_load_config,
+        ), patch.object(
+            external_loader.VibeVoiceLoader, "_load_tokenizer",
+            return_value=MagicMock(),
+        ), patch.object(
+            external_loader.VibeVoiceLoader, "_load_processor",
+            return_value=MagicMock(),
+        ), patch.object(
+            external_loader.VibeVoiceLoader, "_instantiate_model",
+            return_value=fake_model,
+        ), patch.object(
+            external_loader, "resolve_sidecar_preprocessor", return_value=""
+        ), patch.object(
+            external_loader, "resolve_sidecar_tokenizer_dir", return_value="/fake"
+        ), patch.object(
+            external_loader, "resolve_dtype", return_value=torch.float32
+        ), patch.object(
+            external_loader, "resolve_attention_mode", side_effect=lambda m, q: m
+        ), patch.object(
+            external_loader, "get_attn_implementation_for_load", return_value="eager"
+        ), patch.object(
+            external_loader, "VibeVoiceStreamingConfig", _FakeStreamingCfg
+        ):
+            result = load_external_vibevoice_model(weight_file, config_name)
+        return result, resolve_calls
+
+    def test_mismatched_selection_is_swapped(self, weight_file, caplog):
+        with caplog.at_level(
+            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            result, resolve_calls = self._run(
+                weight_file, "VibeVoice-1.5B", _FP_7B
+            )
+        # First resolution used the selection, second used the detection.
+        assert resolve_calls == ["VibeVoice-1.5B", "VibeVoice-7B"]
+        assert result["model_name"] == "VibeVoice-7B"
+        assert any("Config mismatch" in r.message for r in caplog.records)
+
+    def test_matching_selection_not_swapped(self, weight_file, caplog):
+        with caplog.at_level(
+            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            result, resolve_calls = self._run(
+                weight_file, "VibeVoice-1.5B", _FP_15B
+            )
+        assert resolve_calls == ["VibeVoice-1.5B"]
+        assert result["model_name"] == "VibeVoice-1.5B"
+        assert not any("Config mismatch" in r.message for r in caplog.records)
+
+    def test_unfingerprintable_weights_honor_selection(self, weight_file):
+        result, resolve_calls = self._run(weight_file, "VibeVoice-7B", None)
+        assert resolve_calls == ["VibeVoice-7B"]
+        assert result["model_name"] == "VibeVoice-7B"
+
+    def test_sidecar_config_mismatch_still_swapped(self, weight_file, caplog):
+        """A sidecar-resolved config is not exempt: fingerprint wins (D5)."""
+        with caplog.at_level(
+            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            result, resolve_calls = self._run(
+                weight_file, "VibeVoice-7B", _FP_15B
+            )
+        assert resolve_calls == ["VibeVoice-7B", "VibeVoice-1.5B"]
+        assert result["model_name"] == "VibeVoice-1.5B"
+
+    def test_asr_branch_never_runs_detection(self, weight_file):
+        """ASR dispatch happens before any fingerprinting."""
+        with patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights"
+        ) as m_fp, patch.object(
+            external_loader, "load_external_vibevoice_asr_model",
+            return_value={"model_name": "asr"},
+        ) as m_asr:
+            result = load_external_vibevoice_model(
+                weight_file, "VibeVoice-ASR"
+            )
+        m_asr.assert_called_once()
+        m_fp.assert_not_called()
+        assert result["model_name"] == "asr"
+
+
+# ====================================================================
+# Phase 4 (plan 2026-08-27, D6): Auto-detect semantics
+# ====================================================================
+
+from ComfyUI_VibeVoice.modules.external_loader import (  # noqa: E402
+    AUTO_CONFIG_NAME,
+    ASR_CONFIG_NAMES,
+    is_asr_config_name,
+    resolve_auto_config_name,
+)
+
+
+class TestResolveAutoConfigName:
+    """resolve_auto_config_name(): detection -> family or actionable error."""
+
+    @pytest.fixture
+    def weight_file(self, tmp_path):
+        weight = tmp_path / "model.safetensors"
+        weight.write_bytes(b"dummy")
+        return str(weight)
+
+    def test_conclusive_fingerprint_returns_family(self, weight_file, caplog):
+        with caplog.at_level(
+            logging.INFO, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            name = resolve_auto_config_name(weight_file, weights_fp=_FP_7B)
+        assert name == "VibeVoice-7B"
+        assert any("Auto-detected" in r.message for r in caplog.records)
+
+    def test_precomputed_fingerprint_skips_recomputation(self, weight_file):
+        with patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights"
+        ) as m_fp:
+            name = resolve_auto_config_name(weight_file, weights_fp=_FP_15B)
+        assert name == "VibeVoice-1.5B"
+        m_fp.assert_not_called()
+
+    def test_computes_fingerprint_when_not_provided(self, tmp_path):
+        weight = tmp_path / "model.gguf"
+        weight.write_bytes(b"dummy")
+        sentinel_reader = object()
+        with patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=_FP_7B,
+        ) as m_fp:
+            name = resolve_auto_config_name(
+                str(weight), gguf_reader=sentinel_reader
+            )
+        assert name == "VibeVoice-7B"
+        # A caller-provided GGUF reader must be reused (no re-open, D3).
+        assert m_fp.call_args[1]["gguf_reader"] is sentinel_reader
+
+    def test_inconclusive_raises_actionable_error(self, weight_file):
+        with patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=None,
+        ):
+            with pytest.raises(ValueError, match="could not determine"):
+                resolve_auto_config_name(weight_file)
+
+    def test_error_message_offers_explicit_choices_only(self, weight_file):
+        with patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=None,
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                resolve_auto_config_name(weight_file)
+        message = str(excinfo.value)
+        offered = message.split("one of:")[1]
+        for option in EXTERNAL_CONFIG_OPTIONS:
+            if option != AUTO_CONFIG_NAME:
+                assert option in offered
+        # The sentinel is never offered as an explicit choice.
+        assert AUTO_CONFIG_NAME not in offered
+
+    def test_unknown_family_fingerprint_raises(self, weight_file):
+        foreign = WeightsFingerprint(
+            hidden_size=999, vocab_size=888, source_key="k"
+        )
+        with pytest.raises(ValueError, match="could not determine"):
+            resolve_auto_config_name(weight_file, weights_fp=foreign)
+
+
+class TestAutoDetectLoaderSemantics:
+    """load_external_vibevoice_model resolves AUTO_CONFIG_NAME (Step 4.2)."""
+
+    @pytest.fixture
+    def weight_file(self, tmp_path):
+        weight = tmp_path / "model.safetensors"
+        weight.write_bytes(b"dummy")
+        return str(weight)
+
+    def test_auto_adopts_detected_family(self, weight_file, caplog):
+        harness = TestLoaderReconciliationWiring()
+        with caplog.at_level(
+            logging.INFO, logger="ComfyUI_VibeVoice.modules.external_loader"
+        ):
+            result, resolve_calls = harness._run(
+                weight_file, AUTO_CONFIG_NAME, _FP_7B
+            )
+        assert resolve_calls == ["VibeVoice-7B"]
+        assert result["model_name"] == "VibeVoice-7B"
+        assert any("Auto-detected" in r.message for r in caplog.records)
+
+    def test_auto_inconclusive_fails_before_state_dict_load(self, weight_file):
+        """Fail-fast: no heavy load work before the actionable error (D6)."""
+        with patch.object(
+            external_loader.comfy.utils, "load_torch_file",
+            return_value={"w": torch.zeros(1)},
+        ) as m_load, patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=None,
+        ):
+            with pytest.raises(ValueError, match="could not determine"):
+                load_external_vibevoice_model(weight_file, AUTO_CONFIG_NAME)
+        m_load.assert_not_called()
+
+    def test_auto_never_dispatches_asr(self):
+        """Auto is TTS-branch only; ASR remains an explicit selection."""
+        assert AUTO_CONFIG_NAME not in ASR_CONFIG_NAMES
+        assert is_asr_config_name(AUTO_CONFIG_NAME) is False

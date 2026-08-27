@@ -148,7 +148,7 @@ By default the nodes download / load official VibeVoice checkpoints from the `mo
     *   `<weight_file>.config.json` — architecture config (preferred), or a `config.json` in the same directory.
     *   `<weight_file>.preprocessor.json` — audio preprocessor config (preferred), or a `preprocessor_config.json` in the same directory.
     *   `tokenizer.json` — Qwen2.5 text tokenizer (same directory). Falls back to the packaged tokenizer or a HuggingFace download if absent.
-3.  Add the **`Load VibeVoice Model`** node, select your file in `model_file`, and pick the matching architecture in `config_name` (`VibeVoice-1.5B`, `VibeVoice-Large`, `VibeVoice-Realtime-0.5B`, or `VibeVoice-ASR`). When no sidecar config is present, `config_name` selects the packaged default config (available for `1.5B` and `Large`).
+3.  Add the **`Load VibeVoice Model`** node, select your file in `model_file`, and pick the architecture in `config_name` (`Auto-detect`, `VibeVoice-1.5B`, `VibeVoice-7B`, `VibeVoice-Realtime-0.5B`, or `VibeVoice-ASR`). `Auto-detect` (the default) reads the weight file's embedding fingerprint and selects the matching family; an explicit selection that contradicts the weights is auto-corrected with a warning. When no sidecar config is present, `config_name` selects the packaged default config (available for `1.5B` and `7B`).
 4.  Connect the node's `VIBEVOICE_MODEL` output to the `external_model` input of the TTS / Realtime TTS / ASR node. When connected, `external_model` **overrides** the `model_name` dropdown.
 
 **Notes:**
@@ -157,6 +157,7 @@ By default the nodes download / load official VibeVoice checkpoints from the `mo
 *   Type guards prevent mis-wiring: a streaming model on the TTS node, a TTS model on the ASR node, etc. raise a clear error pointing to the correct node.
 *   4-bit LLM quantization (`quantize_llm_4bit`) applies to TTS / Realtime models only; ASR models are always loaded at full precision.
 *   **GGUF support:** `.gguf` files are listed in the `model_file` dropdown and dequantized via the `gguf` Python package (`pip install gguf`). ComfyUI's stock `Load Diffusion Model` cannot parse GGUF, so this node handles it directly. Files in both `models/diffusion_models/` and the ComfyUI-GGUF `unet_gguf` folder are discovered.
+*   **Config/weight mismatch guard:** if the selected `config_name` does not match the weight file's architecture, loading fails fast with a clear error naming the offending tensors and suggesting the correct `config_name` (or `Auto-detect`) — instead of a raw `size mismatch` stack trace.
 
 <!-- PERFORMANCE SECTION -->
 ## ⚙️ Performance & Advanced Features

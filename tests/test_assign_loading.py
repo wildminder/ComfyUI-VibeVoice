@@ -306,3 +306,116 @@ class TestRopeRecomputeRegression:
         model = _UntiedTinyModel()
         n = _recompute_rope_buffers(model)
         assert n == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (plan 2026-08-27, D8): friendly shape pre-check
+# ---------------------------------------------------------------------------
+class TestShapePreCheck:
+    """A config/weights family mismatch raises a clear ValueError naming the
+    offending keys + a config hint BEFORE torch's raw 'size mismatch' error."""
+
+    def test_shape_mismatch_raises_friendly_valueerror(self):
+        model = _UntiedTinyModel()  # embed.weight is (4, 4)
+        sd = {"embed.weight": torch.ones(6, 6)}  # wrong family shape
+        with pytest.raises(ValueError) as excinfo:
+            VibeVoiceLoader._apply_state_dict(model, sd)
+        msg = str(excinfo.value)
+        # Names the offending key...
+        assert "embed.weight" in msg
+        # ...shows both shapes...
+        assert "(6, 6)" in msg and "(4, 4)" in msg
+        # ...and hints at the likely cause (config mismatch).
+        assert "config" in msg.lower()
+
+    def test_shape_mismatch_mentions_auto_detect(self):
+        model = _UntiedTinyModel()
+        sd = {"embed.weight": torch.ones(6, 6)}
+        with pytest.raises(ValueError) as excinfo:
+            VibeVoiceLoader._apply_state_dict(model, sd)
+        assert "Auto-detect" in str(excinfo.value)
+
+    def test_matching_shapes_load_normally(self):
+        model = _UntiedTinyModel()
+        sd = {"embed.weight": torch.full((4, 4), 5.0)}
+        # No ValueError; the value is assigned.
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        assert torch.equal(model.embed.weight, torch.full((4, 4), 5.0))
+
+    def test_missing_and_unexpected_keys_not_flagged(self):
+        """Only SHARED keys are shape-checked; missing/unexpected are left to
+        strict=False (they must NOT trigger the shape pre-check)."""
+        model = _TiedTinyModel()
+        # lm_head.weight is tied (absent from sd -> missing); bogus -> unexpected.
+        sd = {"embed.weight": torch.ones(4, 4), "bogus.key": torch.zeros(9, 9)}
+        missing, unexpected = VibeVoiceLoader._apply_state_dict(model, sd)
+        assert "bogus.key" in unexpected
+        assert isinstance(missing, list)
+
+    def test_meta_param_model_matching_shapes_load(self):
+        """Meta-initialized models still pass the pre-check (meta has shape)."""
+        with torch.device("meta"):
+            model = _UntiedTinyModel()
+        assert all(p.is_meta for p in model.parameters())
+        sd = {"embed.weight": torch.full((4, 4), 2.0),
+              "lm_head.weight": torch.full((4, 4), 3.0)}
+        VibeVoiceLoader._apply_state_dict(model, sd)
+        assert torch.equal(model.embed.weight, torch.full((4, 4), 2.0))
+
+    def test_meta_param_model_shape_mismatch_caught(self):
+        """The pre-check works on meta models (shapes exist before load)."""
+        with torch.device("meta"):
+            model = _UntiedTinyModel()
+        sd = {"embed.weight": torch.ones(5, 5)}
+        with pytest.raises(ValueError, match="config"):
+            VibeVoiceLoader._apply_state_dict(model, sd)
+
+    def test_buffer_shape_mismatch_caught(self):
+        class _BufModel(_UntiedTinyModel):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("position_ids", torch.arange(4))
+
+        model = _BufModel()
+        sd = {"embed.weight": torch.ones(4, 4), "position_ids": torch.arange(9)}
+        with pytest.raises(ValueError) as excinfo:
+            VibeVoiceLoader._apply_state_dict(model, sd)
+        assert "position_ids" in str(excinfo.value)
+
+    def test_many_mismatches_truncated_with_more(self):
+        class _WideModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                for i in range(8):
+                    setattr(self, f"w{i}", torch.nn.Linear(2, 2, bias=False))
+                self.config = MagicMock()
+                self.config.decoder_config.tie_word_embeddings = False
+                self.config.tie_word_embeddings = False
+
+        model = _WideModel()
+        sd = {f"w{i}.weight": torch.ones(7, 7) for i in range(8)}
+        with pytest.raises(ValueError) as excinfo:
+            VibeVoiceLoader._apply_state_dict(model, sd)
+        msg = str(excinfo.value)
+        assert "8 shared" in msg
+        assert "... and" in msg  # truncated beyond max_reported
+
+
+class TestAssertShapesCompatibleHelper:
+    """Direct unit tests for the _assert_shapes_compatible helper."""
+
+    def test_no_mismatch_returns_none(self):
+        from ComfyUI_VibeVoice.modules.loader import _assert_shapes_compatible
+        model = _UntiedTinyModel()
+        assert _assert_shapes_compatible(model, {"embed.weight": torch.ones(4, 4)}) is None
+
+    def test_empty_state_dict_ok(self):
+        from ComfyUI_VibeVoice.modules.loader import _assert_shapes_compatible
+        model = _UntiedTinyModel()
+        assert _assert_shapes_compatible(model, {}) is None
+
+    def test_non_tensor_value_skipped(self):
+        from ComfyUI_VibeVoice.modules.loader import _assert_shapes_compatible
+        model = _UntiedTinyModel()
+        # A non-tensor entry (no .shape) must not crash the pre-check.
+        assert _assert_shapes_compatible(model, {"embed.weight": "not-a-tensor"}) is None

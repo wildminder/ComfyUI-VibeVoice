@@ -272,9 +272,6 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
                     "constant",
                     0,
                 )
-            print("Tied input and output embeddings using standard assignment.")
-        else:
-            print("tie_word_embeddings is False, not tying weights.")
 
     # Also, ensure set_output_embeddings is safe, though your implementation looks okay.
     # The key is to avoid calling it after accelerator.prepare().
