@@ -158,6 +158,7 @@ By default the nodes download / load official VibeVoice checkpoints from the `mo
 *   4-bit LLM quantization (`quantize_llm_4bit`) applies to TTS / Realtime models only; ASR models are always loaded at full precision.
 *   **GGUF support:** `.gguf` files are listed in the `model_file` dropdown and dequantized via the `gguf` Python package (`pip install gguf`). ComfyUI's stock `Load Diffusion Model` cannot parse GGUF, so this node handles it directly. Files in both `models/diffusion_models/` and the ComfyUI-GGUF `unet_gguf` folder are discovered.
 *   **Config/weight mismatch guard:** if the selected `config_name` does not match the weight file's architecture, loading fails fast with a clear error naming the offending tensors and suggesting the correct `config_name` (or `Auto-detect`) — instead of a raw `size mismatch` stack trace.
+*   **Windows RAM / `Pin error.` note:** when a model is partially offloaded to CPU, ComfyUI core tries to pin the offloaded weights (`cudaHostRegister`) as a best-effort, non-fatal optimization. Under RAM pressure this can log a flood of `[WARNING] Pin error.` messages — harmless, but noisy. Quant-resident loads (GGUF / ConvRot INT8 / fp8) avoid the situation entirely because their VRAM residency is roughly the file size, so nothing gets offloaded. If you still see pin errors with other oversized models, start ComfyUI with `--disable-pinned-memory` to opt out of the pinning attempt.
 
 <!-- PERFORMANCE SECTION -->
 ## ⚙️ Performance & Advanced Features
@@ -182,6 +183,59 @@ This node features a sophisticated system for managing performance, memory, and 
 ## Changelog
 
 <details open>
+<summary><strong>v2.8.0 - FP8-Resident Loading + Streaming Safetensors (RAM-spike fix)</strong></summary>
+
+### 🚀 Performance / Memory
+*   **fp8 checkpoints (e.g. `VibeVoice-7B-fp8_e4m3.safetensors`) no longer
+    spike RAM or flood `[WARNING] Pin error.`** Previously the file was
+    dequantized to bf16 *at load time* (full in-memory dict + fp32
+    transients, ~25 GB peak for the 7B file), producing a ~16 GB model that
+    no longer fit VRAM — ComfyUI then partially offloaded it, and core's
+    best-effort pinned-memory registration failed under the RAM pressure.
+*   **fp8 weights now stay resident:** fp8 storage + per-tensor fp32 scales
+    are installed untouched (VRAM residency ≈ file size, ~9 GB for the 7B
+    file, so it fully fits a 12 GB card) and are dequantized per matrix
+    multiply via comfy-kitchen's `dequantize_per_tensor_fp8`
+    (triton/cuda/eager backends; bit-exact vs float math).
+*   **Quantized safetensors now stream per-tensor:** the full-file state
+    dict is never materialized, so peak host RAM is bounded by the model
+    plus one tensor in flight instead of ~2× the dequantized checkpoint.
+    Dense bf16 files and `.bin`/`.pt` keep the existing batch loader.
+
+### 🛡️ Safety
+*   fp8 files with per-row scales — or boxes without a working comfy-kitchen
+    fp8 backend — transparently fall back to the previous dequant-at-load
+    behavior.
+*   A quantized checkpoint whose `lm_head` is quantized while the config
+    ties word embeddings is rejected with a clear error (tied heads cannot
+    be quant-resident).
+*   Mid-stream shape / storage-dtype disagreements fail fast with the same
+    actionable config-mismatch message as the dense path.
+
+</details>
+
+<details>
+<summary><strong>v2.7.1 - Config dtype access fix</strong></summary>
+
+### 🐛 Bug Fixes
+*   Version-safe `torch_dtype` config access — silences the transformers
+    deprecation warning on newer versions.
+
+</details>
+
+<details>
+<summary><strong>v2.7.0 - Auto-detect config, drop VibeVoice-Large</strong></summary>
+
+### ✨ New Features
+*   `config_name` gains **Auto-detect** (default): the architecture family is
+    resolved from the weight file's embedding fingerprint before any heavy
+    load; explicit selections that contradict the weights are auto-corrected
+    with a warning.
+*   The legacy `VibeVoice-Large` option is removed.
+
+</details>
+
+<details>
 <summary><strong>v2.6.0 - Native Lowvram Streaming (oversized models work)</strong></summary>
 
 ### 🚀 Performance / Memory

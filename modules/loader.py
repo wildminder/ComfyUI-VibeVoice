@@ -169,14 +169,23 @@ def _assert_shapes_compatible(model, state_dict, max_reported: int = 5) -> None:
 
     if not mismatches:
         return
+    raise _shape_mismatch_error(model, mismatches, max_reported)
 
+
+def _shape_mismatch_error(model, mismatches, max_reported: int = 5):
+    """Build the friendly config/weights-mismatch ValueError.
+
+    Shared by the batch pre-check (``_assert_shapes_compatible``) and the
+    per-tensor streaming loader, which raises on the FIRST mismatch it sees
+    instead of collecting them all.
+    """
     lines = [
         f"  {key}: checkpoint shape {ckpt} vs model shape {mdl}"
         for key, ckpt, mdl in mismatches[:max_reported]
     ]
     if len(mismatches) > max_reported:
         lines.append(f"  ... and {len(mismatches) - max_reported} more")
-    raise ValueError(
+    return ValueError(
         f"Checkpoint weight shapes do not match the "
         f"'{type(model).__name__}' model for {len(mismatches)} shared "
         f"key(s):\n" + "\n".join(lines) +
@@ -665,8 +674,48 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         missing_keys, unexpected_keys = model.load_state_dict(
             state_dict, strict=False, assign=True
         )
+        return VibeVoiceLoader._post_assign_fixups(
+            model, missing_keys, unexpected_keys, known_missing
+        )
 
-        # Re-tie weights broken by assign=True (e.g. lm_head.weight <->
+    @staticmethod
+    def _post_assign_fixups(model, missing_keys, unexpected_keys,
+                            known_missing=None):
+        """Post-assign model fixups shared by the batch and streaming loads.
+
+        Everything that must happen after checkpoint tensors have replaced
+        the model's parameter objects, regardless of how they got there
+        (``load_state_dict(assign=True)`` for the batch path, per-tensor
+        ``set_attr_param`` for the streaming path — plan 2026-08-27, 3.1):
+
+        1. Re-tie weights. ``assign`` semantics break tied pairs (the
+           checkpoint omits ``lm_head.weight``), so ``tie_weights()`` is
+           re-invoked — the same mitigation transformers' ``from_pretrained``
+           applies.
+        2. Materialize any parameter still on meta (checkpoint omitted the
+           key) with zeros, mirroring ComfyUI's ``_zero_init_parameter``.
+        3. Materialize meta buffers, sentinel-aware (see
+           ``_SENTINEL_BUFFER_VALUES``).
+        4. Recompute RoPE ``inv_freq`` buffers destroyed by meta-init.
+        5. Convert the tree for native lowvram streaming.
+        6. Report missing / unexpected keys (tied lm_head filtered).
+
+        Args:
+            model: Model with checkpoint tensors already assigned.
+            missing_keys: Keys torch reported as missing.
+            unexpected_keys: Keys torch (or the streaming reader) reported
+                as unexpected.
+            known_missing: Optional set of keys INTENTIONALLY absent from
+                the checkpoint (e.g. quant-resident linear weights installed
+                separately); excluded from missing-key warnings but still
+                returned in ``missing_keys``.
+
+        Returns:
+            Tuple of (missing_keys, unexpected_keys).
+        """
+        known_missing = known_missing or set()
+
+        # Re-tie weights broken by assign semantics (e.g. lm_head.weight <->
         # embed_tokens.weight). Standard/ASR models gate on
         # decoder_config.tie_word_embeddings; streaming gates on the
         # top-level config flag — check both, and let each model's own

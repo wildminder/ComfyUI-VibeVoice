@@ -24,6 +24,7 @@ from ComfyUI_VibeVoice.modules.external_loader import (
 )
 from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
 from ComfyUI_VibeVoice.modules.convrot_quant import ConvRotInt8Linear
+from ComfyUI_VibeVoice.modules.fp8_quant import FP8Linear
 from conftest import build_stub_vv, stub_vv_gguf_spec
 
 
@@ -53,7 +54,8 @@ def stubbed_load_env():
         kwargs.setdefault("attention_mode", "sdpa")
         kwargs.setdefault("use_llm_4bit", False)
         kwargs.setdefault("dtype_str", "auto")
-        with patch.object(EL.VibeVoiceLoader, "_load_config", return_value=MagicMock()), \
+        with patch.object(EL.VibeVoiceLoader, "_load_config",
+                          return_value=holder.get("config", MagicMock())), \
              patch.object(EL.VibeVoiceLoader, "_load_tokenizer", return_value=MagicMock()), \
              patch.object(EL.VibeVoiceLoader, "_load_processor", return_value=MagicMock()), \
              patch.object(EL.VibeVoiceLoader, "_instantiate_model",
@@ -333,7 +335,7 @@ class TestPrepareQuantizedSafetensorsLoad:
             prefix="l", group_size=0, in_features=2, out_features=2,
             convrot=False, orig_dtype="torch.bfloat16",
         )}
-        plan, n_rowwise = _prepare_quantized_safetensors_load(sd, qmap)
+        plan, n_rowwise, n_fp8 = _prepare_quantized_safetensors_load(sd, qmap)
 
         assert n_rowwise == 1 and plan == {}
         expected = (
@@ -356,7 +358,7 @@ class TestPrepareQuantizedSafetensorsLoad:
             prefix="c", group_size=16, in_features=64, out_features=64,
             convrot=True,
         )}
-        plan, n_rowwise = _prepare_quantized_safetensors_load(sd, qmap)
+        plan, n_rowwise, n_fp8 = _prepare_quantized_safetensors_load(sd, qmap)
 
         assert n_rowwise == 0 and set(plan) == {"c"}
         assert "c.weight_scale" in sd      # consumed by resident assign
@@ -380,7 +382,7 @@ class TestPrepareQuantizedSafetensorsLoad:
             prefix="l", group_size=0, in_features=2, out_features=1,
             convrot=False, orig_dtype="torch.bfloat16",
         )}
-        plan, n_rowwise = _prepare_quantized_safetensors_load(sd, qmap)
+        plan, n_rowwise, n_fp8 = _prepare_quantized_safetensors_load(sd, qmap)
         assert n_rowwise == 1
         assert torch.equal(
             sd["l.weight"],
@@ -429,6 +431,7 @@ class TestRowwiseLoaderIntegration:
         assert bundle["quant_stats"] == {
             "n_resident_layers": 1,
             "n_rowwise_layers": 1,
+            "n_fp8_resident_layers": 0,
         }
         q = bundle["model"].model.language_model.layers[0].self_attn.q_proj
         assert isinstance(q, ConvRotInt8Linear)
@@ -444,7 +447,42 @@ class TestRowwiseLoaderIntegration:
         assert cond.weight.dtype == torch.bfloat16
         assert torch.equal(cond.weight.data, ref_w)
 
-    def test_fp8_rowwise_end_to_end(self, tmp_path, stubbed_load_env):
+    def test_fp8_per_row_scale_dequants_at_load(self, tmp_path, stubbed_load_env):
+        """[out, 1] per-row fp8 scales cannot run through the per-tensor
+        kitchen kernel -> legacy dequant-at-load (plan 2026-08-27, D2)."""
+        run, holder = stubbed_load_env
+        from safetensors.torch import save_file as _sf
+
+        prefix = "model.prediction_head.cond_proj"
+        tensors = {
+            f"{prefix}.weight": torch.randint(-100, 100, (64, 64)).to(
+                torch.float8_e4m3fn),
+            f"{prefix}.weight_scale": torch.full((64, 1), 0.5),
+        }
+        tensors[f"{prefix}.comfy_quant"] = torch.frombuffer(
+            bytearray(_json.dumps({"format": "float8_e4m3fn",
+                                   "orig_dtype": "torch.bfloat16"})
+                      .encode("utf-8")), dtype=torch.uint8
+        )
+        p = tmp_path / "fp8_perrow.safetensors"
+        _sf(tensors, str(p))
+
+        bundle = run(p, dims=(1, 64, 128))
+
+        assert bundle["quant_stats"]["n_rowwise_layers"] == 1
+        assert bundle["quant_stats"]["n_fp8_resident_layers"] == 0
+        cond = bundle["model"].model.prediction_head.cond_proj
+        assert not isinstance(cond, FP8Linear)  # stays a plain Linear
+        assert cond.weight.dtype == torch.bfloat16
+        ref_w = (tensors[f"{prefix}.weight"].float()
+                 * tensors[f"{prefix}.weight_scale"]).to(torch.bfloat16)
+        assert torch.equal(cond.weight.data, ref_w)
+
+
+class TestFP8ResidentLoading:
+    """Scalar-scale fp8 checkpoints execute resident (plan 2026-08-27, D1)."""
+
+    def test_fp8_scalar_scale_resident_end_to_end(self, tmp_path, stubbed_load_env):
         run, holder = stubbed_load_env
         p = _save_qcheckpoint(tmp_path / "fp8.safetensors", [
             ("model.prediction_head.cond_proj", "rowwise_fp8", (64, 64)),
@@ -452,10 +490,194 @@ class TestRowwiseLoaderIntegration:
 
         bundle = run(p, dims=(1, 64, 128))
 
-        assert bundle["quant_stats"]["n_rowwise_layers"] == 1
+        assert bundle["weight_family"] == "fp8_resident"
+        assert bundle["quant_stats"] == {
+            "n_resident_layers": 1,
+            "n_rowwise_layers": 0,
+            "n_fp8_resident_layers": 1,
+        }
         cond = bundle["model"].model.prediction_head.cond_proj
+        assert isinstance(cond, FP8Linear)
+        assert cond.weight.dtype == torch.float8_e4m3fn
+        assert not cond.weight.is_meta
+        assert cond.weight_scale.dtype == torch.float32
+        assert not cond.weight_scale.is_meta
+
+        # Forward parity vs the manual dequant reference (bit-exact eager).
+        from safetensors.torch import load_file
+        raw = load_file(str(p))
+        w = raw["model.prediction_head.cond_proj.weight"]
+        s = raw["model.prediction_head.cond_proj.weight_scale"]
+        x = torch.randn(2, 64, dtype=torch.bfloat16)
+        ref = torch.nn.functional.linear(
+            x, (w.float() * s).to(torch.bfloat16)
+        )
+        assert torch.equal(cond(x), ref)
+
+    def test_fp8_resident_survives_final_dtype_cast(self, tmp_path,
+                                                    stubbed_load_env):
+        """cast_model_to_dtype_if_needed(bf16) after load must not touch the
+        fp8 storage or the fp32 scale (_quant_protected_names)."""
+        run, holder = stubbed_load_env
+        p = _save_qcheckpoint(tmp_path / "fp8cast.safetensors", [
+            ("model.prediction_head.cond_proj", "rowwise_fp8", (64, 64)),
+        ])
+        bundle = run(p, dims=(1, 64, 128))
+        cond = bundle["model"].model.prediction_head.cond_proj
+        assert cond.weight.dtype == torch.float8_e4m3fn
+        assert cond.weight_scale.dtype == torch.float32
+
+    def test_fp8_no_backend_falls_back_to_dequant(self, tmp_path,
+                                                  stubbed_load_env):
+        """Without a kitchen fp8 backend the scalar-scale file dequantizes at
+        load (correct, just heavier) instead of failing (plan D3)."""
+        run, holder = stubbed_load_env
+        from ComfyUI_VibeVoice.modules import fp8_quant as FQ
+
+        p = _save_qcheckpoint(tmp_path / "fp8fb.safetensors", [
+            ("model.prediction_head.cond_proj", "rowwise_fp8", (64, 64)),
+        ])
+        with patch.object(FQ, "probe_fp8_backend", return_value=None):
+            bundle = run(p, dims=(1, 64, 128))
+
+        assert bundle["quant_stats"]["n_rowwise_layers"] == 1
+        assert bundle["quant_stats"]["n_fp8_resident_layers"] == 0
+        cond = bundle["model"].model.prediction_head.cond_proj
+        assert not isinstance(cond, FP8Linear)
         assert cond.weight.dtype == torch.bfloat16
         assert torch.isfinite(cond.weight.data.float()).all()
+
+    def test_mixed_convrot_and_fp8_resident(self, tmp_path, stubbed_load_env):
+        """ConvRot int8 + scalar fp8 in one file: both resident families
+        install; the family label stays convrot_int8 (it dominates)."""
+        run, holder = stubbed_load_env
+        p = _save_qcheckpoint(tmp_path / "mixfp8.safetensors", [
+            ("model.language_model.layers.0.self_attn.q_proj",
+             "convrot", (64, 64)),
+            ("model.prediction_head.cond_proj", "rowwise_fp8", (64, 64)),
+        ])
+
+        bundle = run(p, dims=(1, 64, 128))
+
+        assert bundle["weight_family"] == "convrot_int8"
+        assert bundle["quant_stats"] == {
+            "n_resident_layers": 2,
+            "n_rowwise_layers": 0,
+            "n_fp8_resident_layers": 1,
+        }
+        q = bundle["model"].model.language_model.layers[0].self_attn.q_proj
+        assert isinstance(q, ConvRotInt8Linear)
+        cond = bundle["model"].model.prediction_head.cond_proj
+        assert isinstance(cond, FP8Linear)
+
+    def test_prepare_routes_resident_fp8_and_keeps_tensors(self):
+        sd = {
+            "l.weight": torch.randint(-100, 100, (4, 4)).to(
+                torch.float8_e4m3fn),
+            "l.weight_scale": torch.tensor(0.25),
+            "l.comfy_quant": torch.zeros(3, dtype=torch.uint8),
+        }
+        qmap = {"l": QuantLayerInfo(
+            prefix="l", group_size=0, in_features=4, out_features=4,
+            convrot=False, orig_dtype="torch.bfloat16",
+            rowwise_dtype=torch.float8_e4m3fn, resident_fp8=True,
+        )}
+        plan, n_rowwise, n_fp8 = _prepare_quantized_safetensors_load(sd, qmap)
+
+        assert n_rowwise == 0 and n_fp8 == 1 and set(plan) == {"l"}
+        # Storage stays fp8 + scale stays in the dict for assign.
+        assert sd["l.weight"].dtype == torch.float8_e4m3fn
+        assert "l.weight_scale" in sd
+        assert "l.comfy_quant" not in sd
+
+    def test_prepare_resident_fp8_rejects_wrong_storage_dtype(self):
+        sd = {
+            "l.weight": torch.zeros(4, 4, dtype=torch.int8),
+            "l.weight_scale": torch.tensor(0.25),
+        }
+        qmap = {"l": QuantLayerInfo(
+            prefix="l", group_size=0, in_features=4, out_features=4,
+            convrot=False, orig_dtype="torch.bfloat16",
+            rowwise_dtype=torch.float8_e4m3fn, resident_fp8=True,
+        )}
+        with pytest.raises(Exception, match="expected"):
+            _prepare_quantized_safetensors_load(sd, qmap)
+
+    def test_prepare_resident_fp8_rejects_per_row_scale(self):
+        sd = {
+            "l.weight": torch.randint(-100, 100, (4, 4)).to(
+                torch.float8_e4m3fn),
+            "l.weight_scale": torch.full((4, 1), 0.25),
+        }
+        qmap = {"l": QuantLayerInfo(
+            prefix="l", group_size=0, in_features=4, out_features=4,
+            convrot=False, orig_dtype="torch.bfloat16",
+            rowwise_dtype=torch.float8_e4m3fn, resident_fp8=True,
+        )}
+        with pytest.raises(Exception, match="not a per-tensor scalar"):
+            _prepare_quantized_safetensors_load(sd, qmap)
+
+
+class TestTiedLmHeadGuard:
+    """A quantized lm_head contradicts tie_word_embeddings (plan 2026-08-27)."""
+
+    def _cfg(self, tied):
+        class _Cfg:
+            pass
+
+        c = _Cfg()
+        c.tie_word_embeddings = tied
+        return c
+
+    def test_tied_config_with_quantized_lm_head_raises(self):
+        from ComfyUI_VibeVoice.modules.external_loader import (
+            _assert_lm_head_not_tied,
+        )
+        from ComfyUI_VibeVoice.modules.quant_common import QuantTargetMismatch
+
+        qmap = {"lm_head": QuantLayerInfo(prefix="lm_head", group_size=0)}
+        with pytest.raises(QuantTargetMismatch, match="tie_word_embeddings"):
+            _assert_lm_head_not_tied(self._cfg(True), qmap)
+
+    def test_untied_config_passes(self):
+        from ComfyUI_VibeVoice.modules.external_loader import (
+            _assert_lm_head_not_tied,
+        )
+
+        qmap = {"lm_head": QuantLayerInfo(prefix="lm_head", group_size=0)}
+        _assert_lm_head_not_tied(self._cfg(False), qmap)  # no raise
+
+    def test_tied_config_without_lm_head_quant_passes(self):
+        from ComfyUI_VibeVoice.modules.external_loader import (
+            _assert_lm_head_not_tied,
+        )
+
+        qmap = {"model.layers.0.mlp": QuantLayerInfo(
+            prefix="model.layers.0.mlp", group_size=0)}
+        _assert_lm_head_not_tied(self._cfg(True), qmap)  # no raise
+
+    def test_magicmock_config_not_treated_as_tied(self):
+        """Test doubles must not read as tied (non-bool flags ignored)."""
+        from ComfyUI_VibeVoice.modules.external_loader import (
+            _assert_lm_head_not_tied,
+        )
+
+        qmap = {"lm_head": QuantLayerInfo(prefix="lm_head", group_size=0)}
+        _assert_lm_head_not_tied(MagicMock(), qmap)  # no raise
+
+    def test_loader_rejects_tied_fp8_lm_head_end_to_end(self, tmp_path,
+                                                       stubbed_load_env):
+        run, holder = stubbed_load_env
+        p = _save_qcheckpoint(tmp_path / "tiedlm.safetensors", [
+            ("lm_head", "rowwise_fp8", (96, 64)),
+        ])
+        cfg = MagicMock()
+        cfg.tie_word_embeddings = True
+        cfg.decoder_config = None
+        holder["config"] = cfg
+
+        with pytest.raises(RuntimeError, match="tie_word_embeddings"):
+            run(p, dims=(1, 64, 128))
 
     def test_unknown_format_propagates_not_swallowed(self, tmp_path,
                                                      stubbed_load_env):
@@ -527,7 +749,7 @@ class TestBlockwiseLoading:
             prefix="l", group_size=2, in_features=4, out_features=4,
             convrot=False, orig_dtype="torch.float32",
         )}
-        plan, n_rowwise = _prepare_quantized_safetensors_load(sd, qmap)
+        plan, n_rowwise, n_fp8 = _prepare_quantized_safetensors_load(sd, qmap)
 
         assert n_rowwise == 1 and plan == {}
         # Block layout: rows 0-1 scaled by s[:,0] column-group 0, etc.
@@ -558,6 +780,7 @@ class TestBlockwiseLoading:
         assert bundle["quant_stats"] == {
             "n_resident_layers": 0,
             "n_rowwise_layers": 1,
+            "n_fp8_resident_layers": 0,
         }
         cond = bundle["model"].model.prediction_head.cond_proj
         assert isinstance(cond, torch.nn.Linear)
@@ -612,7 +835,7 @@ class TestBlockwiseLoading:
             prefix="emb", group_size=0, in_features=64, out_features=96,
             convrot=False, orig_dtype="torch.bfloat16",
         )}
-        plan, n_rowwise = _prepare_quantized_safetensors_load(sd, qmap)
+        plan, n_rowwise, n_fp8 = _prepare_quantized_safetensors_load(sd, qmap)
         assert n_rowwise == 1 and plan == {}
         assert sd["emb.weight"].dtype == torch.bfloat16
         assert torch.isfinite(sd["emb.weight"].float()).all()

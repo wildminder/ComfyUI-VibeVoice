@@ -157,13 +157,25 @@ def representative_dtype(model):
 
     Unlike transformers' ``dtype`` property this never reports an integer
     raw-storage param (uint8 GGUF blocks), so callers comparing dtypes don't
-    spuriously schedule casts. Falls back to the model's ``dtype`` attribute
-    when the parameter tree cannot be walked (e.g. test doubles).
+    spuriously schedule casts. Quant-resident modules are skipped ENTIRELY:
+    fp8 storage IS floating point, and reporting it (or an uncast fp32
+    resident bias) would make the patcher's dtype guard fire a pointless
+    filtered cast walk on every patch (plan 2026-08-27, D6). Falls back to
+    the model's ``dtype`` attribute when the parameter tree cannot be walked
+    (e.g. test doubles).
     """
     try:
-        for p in model.parameters():
-            if p.dtype.is_floating_point:
-                return p.dtype
+        resident_modules = {
+            name for name, mod in model.named_modules()
+            if getattr(mod, "_quant_resident", False)
+        }
+        for name, p in model.named_parameters():
+            if not p.dtype.is_floating_point:
+                continue
+            owner = name.rpartition(".")[0]
+            if owner in resident_modules:
+                continue
+            return p.dtype
     except Exception:
         pass
     return getattr(model, "dtype", None)

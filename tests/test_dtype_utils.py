@@ -14,6 +14,7 @@ from ComfyUI_VibeVoice.modules.dtype_utils import (
     get_dtype_str,
     cast_model_to_dtype,
     cast_model_to_dtype_if_needed,
+    representative_dtype,
     set_config_dtype,
     get_config_dtype,
 )
@@ -379,3 +380,52 @@ class TestConfigDtypeNoDeprecationWarning:
         assert config.dtype == torch.float16
         # The deprecated alias resolves to the same value without being set.
         assert get_config_dtype(config) == torch.float16
+
+
+class TestRepresentativeDtype:
+    """representative_dtype drives the patcher's cast guard (plan D6)."""
+
+    def _model_with_fp8_resident_first(self):
+        from ComfyUI_VibeVoice.modules.fp8_quant import FP8Linear
+
+        m = torch.nn.Sequential()
+        m.add_module("fp8", FP8Linear(4, 4, True, torch.float8_e4m3fn))
+        m.add_module("dense", torch.nn.Linear(4, 4, bias=False))
+        return m
+
+    def test_returns_first_floating_dtype(self):
+        m = torch.nn.Sequential(torch.nn.Linear(4, 4))
+        assert representative_dtype(m) == torch.float32
+
+    def test_skips_integer_storage(self):
+        m = torch.nn.Module()
+        m.raw = torch.nn.Parameter(torch.zeros(4, dtype=torch.uint8),
+                                   requires_grad=False)
+        m.dense = torch.nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+        assert representative_dtype(m) == torch.bfloat16
+
+    def test_skips_fp8_resident_modules_entirely(self):
+        """fp8 IS floating point; a resident module's fp8 weight (or its
+        uncast fp32 bias) must not be reported."""
+        m = self._model_with_fp8_resident_first()
+        m.dense.to(torch.bfloat16)
+        assert representative_dtype(m) == torch.bfloat16
+
+    def test_falls_back_to_dtype_attribute(self):
+        class _Stub:
+            dtype = torch.float16
+
+            def named_modules(self):
+                raise RuntimeError("no tree")
+
+        assert representative_dtype(_Stub()) == torch.float16
+
+    def test_no_floating_params_returns_none(self):
+        class _IntOnly:
+            def named_modules(self):
+                return iter([("", None)])
+
+            def named_parameters(self):
+                yield "idx", torch.zeros(4, dtype=torch.int64)
+
+        assert representative_dtype(_IntOnly()) is None

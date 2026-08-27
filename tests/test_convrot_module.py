@@ -212,6 +212,56 @@ class TestRowwiseFormatScanning:
         info = qmap[prefix]
         assert info.convrot is False
         assert info.rowwise_dtype == torch.float8_e4m3fn
+        # PER-ROW [out, 1] scales cannot use the per-tensor kitchen kernel.
+        assert info.resident_fp8 is False
+
+    def _write_fp8(self, path, prefix, scale):
+        from safetensors.torch import save_file as _sf
+        import json as _json
+
+        tensors = {
+            f"{prefix}.weight": torch.randint(-100, 100, (64, 64)).to(
+                torch.float8_e4m3fn),
+            f"{prefix}.weight_scale": scale,
+            f"{prefix}.comfy_quant": torch.frombuffer(
+                bytearray(_json.dumps({
+                    "format": "float8_e4m3fn",
+                    "orig_dtype": "torch.bfloat16",
+                }).encode("utf-8")), dtype=torch.uint8),
+        }
+        _sf(tensors, str(path))
+        return path
+
+    def test_fp8_scalar_scale_marked_resident(self, tmp_path):
+        """Scalar per-tensor scale + available kitchen backend -> resident."""
+        p = self._write_fp8(tmp_path / "fp8s.safetensors",
+                            "model.prediction_head.cond_proj",
+                            torch.tensor(0.5))
+        info = scan_checkpoint_quantization(p)["model.prediction_head.cond_proj"]
+        assert info.resident_fp8 is True
+        assert info.rowwise_dtype == torch.float8_e4m3fn
+        assert (info.out_features, info.in_features) == (64, 64)
+
+    def test_fp8_single_element_1d_scale_marked_resident(self, tmp_path):
+        p = self._write_fp8(tmp_path / "fp8s1.safetensors",
+                            "model.prediction_head.cond_proj",
+                            torch.tensor([0.5]))
+        info = scan_checkpoint_quantization(p)["model.prediction_head.cond_proj"]
+        assert info.resident_fp8 is True
+
+    def test_fp8_not_resident_without_backend(self, tmp_path):
+        """No kitchen fp8 backend -> dequant-at-load fallback (plan D3)."""
+        from unittest.mock import patch
+        from ComfyUI_VibeVoice.modules import fp8_quant as FQ
+
+        p = self._write_fp8(tmp_path / "fp8nb.safetensors",
+                            "model.prediction_head.cond_proj",
+                            torch.tensor(0.5))
+        with patch.object(FQ, "probe_fp8_backend", return_value=None):
+            info = scan_checkpoint_quantization(p)[
+                "model.prediction_head.cond_proj"]
+        assert info.resident_fp8 is False
+        assert info.rowwise_dtype == torch.float8_e4m3fn
 
     def test_unknown_format_raises_specific_class(self, tmp_path):
         self._meta(tmp_path / "bad.safetensors", "layer",
