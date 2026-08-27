@@ -22,6 +22,7 @@ Determinism: no network, no real GPU. Uses the conftest ``tiny_patcher`` /
 
 import types
 import torch
+import torch.nn as nn
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -548,92 +549,93 @@ class TestQuantResidentLifecycle:
         assert torch.equal(before, res.weight)
         assert res.bias is None or res.bias.dtype in (torch.float16,)
 # ====================================================================
-# Lowvram partial-load completion (7B crash: tail modules left on CPU)
+# Native partial residency (plan 2026-08-26): converted trees stream
 # ====================================================================
 
-class _FakeTree:
-    """Stands in for the transformers tree: named_parameters() reports
-    device-tagged stand-ins; .to() records the target it was given."""
+class TestNativePartialResidency:
+    """With streaming conversion applied, core's lowvram machinery treats
+    our tree natively: stripped modules carry weight_function hooks and
+    forwards keep working across load/unload transitions. Driven through
+    the REAL core ModelPatcher on CPU devices."""
 
-    def __init__(self, devices):
-        self._devices = devices
-        self.to_calls = []
+    def _converted_tree(self):
+        from modules.comfy_stream import convert_tree_for_streaming
 
-    def named_parameters(self):
-        return [(f"p{i}", type("P", (), {"device": d})())
-                for i, d in enumerate(self._devices)]
+        class _Tree(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.hot = nn.Linear(128, 128)
+                self.tail = nn.Linear(4, 4)
 
-    def to(self, device):
-        self.to_calls.append(device)
-        return self
+        t = _Tree()
+        convert_tree_for_streaming(t)
+        return t
 
+    def _patcher(self, tree):
+        import comfy.model_management as mm
+        from comfy.model_patcher import ModelPatcher as _CorePatcher
 
-def _patcher_with_tree(devices):
-    handler = types.SimpleNamespace(model=_FakeTree(devices),
-                                    model_pack_name="fake")
-    with patch("comfy.model_patcher.ModelPatcher.__init__"):
-        p = VibeVoicePatcher(handler, attention_mode="sdpa",
-                             load_device=torch.device("cuda"),
-                             offload_device=torch.device("cpu"),
-                             size=1024)
-    p.load_device = torch.device("cuda")
-    p.offload_device = torch.device("cpu")
-    p.model = handler
-    p.target_dtype = None
-    # Attributes core's __del__/detach chain touches on newer ComfyUI.
-    p.pinned = set()
-    p.is_injected = False
-    p.skip_injection = False
-    p.injections = {}
-    p.callbacks = {}
-    p.wrappers = {}
-    p.model_options = {"transformer_options": {}}
-    return p
+        mp = _CorePatcher(tree,
+                          load_device=torch.device("cpu"),
+                          offload_device=torch.device("cpu"),
+                          size=mm.module_size(tree))
+        return mp
 
+    def test_converted_hot_module_gets_streaming_hooks(self):
+        tree = self._converted_tree()
+        hot_mem = torch.nn.utils.parameters_to_vector(
+            tree.hot.parameters()).numel() * 4
+        tail_mem = torch.nn.utils.parameters_to_vector(
+            tree.tail.parameters()).numel() * 4
+        budget = tail_mem + max(tail_mem // 8, 1)
 
-class TestPartialLoadCompletion:
-    """ComfyUI's lowvram partial loading leaves tail modules on CPU,
-    expecting comfy.ops streaming that a plain transformers tree lacks.
-    patch_model must complete any straggler transfer (VibeVoice-7B fix).
-    Devices are compared symbolically; no CUDA required."""
+        mp = self._patcher(tree)
+        # Register a dummy weight patch so core attaches a real LowVramPatch
+        # hook to the offloaded module (hooks are only added for patched
+        # keys; unpatched castable modules stream via cast device-move).
+        mp.add_patches({"hot.weight": ("diff", (torch.zeros(128, 128),))}, 1.0)
+        mp.patch_model(device_to=torch.device("cpu"),
+                       lowvram_model_memory=budget)
 
-    CUDA = torch.device("cuda")
+        # The over-budget module was treated as an OFFLOADABLE STREAMING
+        # unit (flagged lowvram), not silently abandoned.
+        assert mp.model.model_lowvram is True
+        assert not getattr(tree.hot, "comfy_patched_weights", False)
+        # Forward through the wrapper still works with weights off-device.
+        x = torch.randn(2, 128)
+        with torch.no_grad():
+            y = tree.hot(x)
+        assert torch.isfinite(y).all()
 
-    def test_completes_stray_transfer(self):
-        # One parameter still on CPU after core's partial placement.
-        patcher = _patcher_with_tree([self.CUDA, self.CUDA,
-                                      torch.device("cpu")])
-        moved = patcher._complete_partial_transfer(self.CUDA)
-        assert moved == 1
-        assert patcher.model.model.to_calls == [self.CUDA]
+    def test_forward_works_after_partial_unload(self):
+        from modules.comfy_stream import convert_tree_for_streaming
 
-    def test_fully_placed_tree_is_noop(self):
-        patcher = _patcher_with_tree([self.CUDA, self.CUDA])
-        assert patcher._complete_partial_transfer(self.CUDA) == 0
-        assert patcher.model.model.to_calls == []
+        tree = self._converted_tree()
+        mp = self._patcher(tree)
+        mp.patch_model(device_to=torch.device("cpu"),
+                       lowvram_model_memory=0)
+        freed = mp.partially_unload(torch.device("cpu"), memory_to_free=1)
+        assert freed > 0
 
-    def test_patch_model_invokes_completion(self):
-        """End-to-end: core placement stubbed to a no-op; patch_model must
-        still leave every parameter on the load device."""
-        patcher = _patcher_with_tree([self.CUDA, torch.device("cpu")])
+        x = torch.randn(2, 128)
+        with torch.no_grad():
+            y = tree.hot(x)
+        assert torch.isfinite(y).all()
 
-        def _stub_super(*a, **k):  # core places nothing
-            return None
+    def test_round_trip_partial_unload_load(self):
+        from modules.comfy_stream import convert_tree_for_streaming
 
-        with patch("comfy.model_patcher.ModelPatcher.patch_model",
-                   side_effect=_stub_super):
-            patcher.patch_model(device_to=self.CUDA, load_weights=True)
+        tree = self._converted_tree()
+        mp = self._patcher(tree)
+        mp.patch_model(device_to=torch.device("cpu"),
+                       lowvram_model_memory=0)
+        x0 = torch.randn(2, 128)
+        with torch.no_grad():
+            ref = tree.hot(x0).clone()
 
-        assert patcher.model.model.to_calls == [self.CUDA]
-
-    def test_load_weights_false_skips_completion(self):
-        patcher = _patcher_with_tree([torch.device("cpu")])
-        moved = patcher._complete_partial_transfer(self.CUDA)
-        assert moved == 1  # direct helper still completes
-        # ...but patch_model gates on load_weights:
-        def _stub_super(*a, **k):
-            return None
-        with patch("comfy.model_patcher.ModelPatcher.patch_model",
-                   side_effect=_stub_super):
-            patcher.patch_model(device_to=self.CUDA, load_weights=False)
-        assert len(patcher.model.model.to_calls) == 1  # only the direct call above
+        mp.partially_unload(torch.device("cpu"), memory_to_free=1)
+        mp.partially_load(torch.device("cpu"), extra_memory=1e32,
+                          force_patch_weights=False)
+        with torch.no_grad():
+            y = tree.hot(x0)
+        assert torch.equal(ref, y)

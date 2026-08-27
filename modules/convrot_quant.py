@@ -120,6 +120,11 @@ class ConvRotInt8Linear(nn.Module):
 
     # Dtype-cast filter marker: int8 weight + fp32 scale must never be recast.
     _quant_resident = True
+    # Native comfy streaming (plan 2026-08-26): core may offload this module;
+    # forward pulls the int8 weight back through cast_bias_weight.
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
 
     def __init__(self, in_features: int, out_features: int, bias: bool,
                  group_size: int):
@@ -136,6 +141,9 @@ class ConvRotInt8Linear(nn.Module):
         self.weight_scale = nn.Parameter(
             torch.empty(out_features, 1, dtype=torch.float32), requires_grad=False
         )
+        # Documentation/core-interop marker: int8 storage is moved, never
+        # recast (our streamed forward handles pulls itself).
+        self.weight_comfy_model_dtype = torch.int8
         self.bias = (
             nn.Parameter(torch.empty(out_features), requires_grad=False)
             if bias else None
@@ -161,11 +169,49 @@ class ConvRotInt8Linear(nn.Module):
                 f"{x.dtype}."
             )
 
+        wf = getattr(self, "weight_function", None)
+        if (self.weight.device != x.device) or (wf and len(wf) > 0):
+            return self._forward_streamed(x)
+
         return comfy_kitchen.int8_linear(
             x.contiguous(),
             self.weight,
             self.weight_scale,
             self.bias,
+            out_dtype=x.dtype,
+            convrot=True,
+            convrot_groupsize=self.convrot_groupsize,
+        )
+
+    def _forward_streamed(self, x):
+        """Lowvram path: pull the int8 weight back dtype-preservingly.
+
+        Deliberately NOT comfy.ops.cast_bias_weight — it recasts the weight
+        to the ACTIVATION dtype whenever they differ (ops.py:
+        "if weight_has_function or weight.dtype != dtype: weight =
+        weight.to(dtype=dtype)"), which would destroy int8 storage. Core's
+        partial-unload contract attaches LowVramPatch callables whose job is
+        exactly "move tensor to device, keep dtype"; we honor those. The
+        tiny fp32 scale rides along with a cheap device guard."""
+        import comfy_kitchen
+
+        w = self.weight
+        if w.device != x.device:
+            w = w.to(x.device)
+        for fn in (getattr(self, "weight_function", None) or ()):
+            w = fn(w)
+        if w.device != x.device:
+            w = w.to(x.device)
+
+        scale = (self.weight_scale if self.weight_scale.device == x.device
+                 else self.weight_scale.to(x.device))
+        bias = (self.bias if self.bias is None
+                or self.bias.device == x.device else self.bias.to(x.device))
+        return comfy_kitchen.int8_linear(
+            x.contiguous(),
+            w,
+            scale,
+            bias,
             out_dtype=x.dtype,
             convrot=True,
             convrot_groupsize=self.convrot_groupsize,

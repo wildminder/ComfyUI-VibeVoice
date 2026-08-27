@@ -662,6 +662,18 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # gibberish. Re-run each rotary module's config-based computation.
         _recompute_rope_buffers(model)
 
+        # Native lowvram streaming (plan 2026-08-26): convert leaf modules so
+        # core's partial load/offload machinery can stream them instead of
+        # silently stranding them on CPU. Class-only swap; weights untouched.
+        try:
+            from .comfy_stream import convert_tree_for_streaming
+
+            convert_tree_for_streaming(model)
+        except Exception as e:
+            logger.warning(
+                f"Streaming conversion failed (continuing without it): {e}"
+            )
+
         reported_missing = [k for k in missing_keys if k not in known_missing]
         if reported_missing:
             logger.warning(f"Missing keys when loading state dict: {len(reported_missing)} keys")

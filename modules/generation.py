@@ -410,9 +410,11 @@ def generate_audio(
                 logger.error(f"Input tensor '{key}' contains NaN or Inf values")
                 raise ValueError(f"Invalid values in input tensor: {key}")
 
-    # Move inputs to model device
+    # Move inputs to the compute device. NOT `model.device`: that property is
+    # derived from the first parameter's residency, which under partial
+    # offload is CPU even while compute happens on the load device (BUG-012).
     inputs = {
-        k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+        k: v.to(model_management.get_torch_device()) if isinstance(v, torch.Tensor) else v
         for k, v in inputs.items()
     }
 
@@ -610,7 +612,9 @@ def generate_streaming_audio(
 
     set_seed(seed)
 
-    device = model.device
+    # Compute device: NOT `model.device` (parameter-residency-derived; lies
+    # under partial offload, see BUG-012).
+    device = model_management.get_torch_device()
     tokenizer = processor.tokenizer
     # Tokenize the script text into tts_text_ids (the windowed-streaming input).
     tts_text_ids = torch.tensor(

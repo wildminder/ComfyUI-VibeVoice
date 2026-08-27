@@ -601,7 +601,9 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         # `sigmas[step_index + 1]` -> IndexError. The streaming reference
         # (sample_speech_tokens, L891) does exactly this.
         self.model.noise_scheduler.set_timesteps(num_steps)
-        head_dev = self.model.prediction_head.device
+        # BUG-012: derive the compute device from the incoming activations,
+        # not from prediction_head's parameter residency (see generate()).
+        head_dev = condition.device
         condition = condition.to(head_dev)
         neg_condition = neg_condition.to(head_dev)
         cond_in = torch.cat([condition, neg_condition], dim=0)
@@ -671,7 +673,9 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         scaled positive latents ``(N, acoustic_vae_dim)``.
         """
         self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
-        condition = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
+        # BUG-012: derive the compute device from the incoming activations,
+        # not from prediction_head's parameter residency (see generate()).
+        condition = torch.cat([condition, neg_condition.to(condition.device)], dim=0)
         speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
         for t in self.model.noise_scheduler.timesteps:
             half = speech[: len(speech) // 2]
@@ -860,9 +864,17 @@ class VibeVoiceForConditionalGeneration(VibeVoicePreTrainedModel):
         constraint[0, valid_tokens_t] = 0.0
 
         embed = self.get_input_embeddings()
-        head_dev = self.model.prediction_head.device
-        lm_dev = getattr(self.lm_head.weight, "device", None) or device
-        ac_dev = self.model.acoustic_tokenizer.device
+        # BUG-012: under ComfyUI streaming offload, parameters stay on CPU
+        # while compute happens on the load device (leaf weights stream via
+        # cast buffers; direct params relocate on access), so submodule
+        # `.device` queries (prediction_head / lm_head.weight /
+        # acoustic_tokenizer) report CPU and silently move the diffusion /
+        # decode stages off the activation device -> "tensors on the same
+        # device" crashes. Every stage must compute where the activations
+        # are, which is the entry `device` resolved above.
+        head_dev = device
+        lm_dev = device
+        ac_dev = device
         sf = self.model.speech_scaling_factor
         bf = self.model.speech_bias_factor
 

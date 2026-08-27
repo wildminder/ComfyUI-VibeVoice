@@ -356,6 +356,11 @@ class GGUFLinear(torch.nn.Module):
 
     # Dtype-cast filter marker: raw uint8 storage must never be recast.
     _quant_resident = True
+    # Native comfy streaming (plan 2026-08-26): core may offload this module;
+    # forward pulls raw bytes back through cast_bias_weight.
+    comfy_cast_weights = True
+    weight_function = []
+    bias_function = []
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False,
                  ggml_type=None):
@@ -372,6 +377,9 @@ class GGUFLinear(torch.nn.Module):
             torch.nn.Parameter(torch.empty(out_features), requires_grad=False)
             if bias else None
         )
+        # Documentation/core-interop marker: raw uint8 blocks are moved,
+        # never recast (our streamed forward handles pulls itself).
+        self.weight_comfy_model_dtype = torch.uint8
         self._gguf: GGUFTensor | None = None
         # Reserved seam for future scratch-buffer reuse; intentionally unused.
         self.weight_scratch_cache = None
@@ -403,11 +411,48 @@ class GGUFLinear(torch.nn.Module):
                 f"{x.dtype}. Callers must not cast hidden states to the "
                 f"raw weight dtype."
             )
+
+        wf = getattr(self, "weight_function", None)
+        if (self.weight.device != x.device) or (wf and len(wf) > 0):
+            return self._forward_streamed(x)
+
         w = dequantize_blocks(
             self.weight, self.ggml_type, x.dtype,
             (self.out_features, self.in_features),
         )
         return torch.nn.functional.linear(x, w, self.bias)
+
+    def _forward_streamed(self, x):
+        """Lowvram path: raw blocks were offloaded; pull them back
+        dtype-preservingly.
+
+        NOTE: deliberately NOT comfy.ops.cast_bias_weight — it recasts the
+        weight to the ACTIVATION dtype whenever they differ
+        (ops.py: "if weight_has_function or weight.dtype != dtype:
+        weight = weight.to(dtype=dtype)"), which would corrupt raw byte
+        blocks. Core's own partial-unload contract attaches LowVramPatch
+        callables whose job is exactly "move tensor to device, keep dtype";
+        we honor those directly."""
+        w_raw = self._pull_to_device(self.weight, x.device)
+        bias = self.bias
+        if bias is not None and bias.device != x.device:
+            bias = bias.to(x.device)
+        w = dequantize_blocks(
+            w_raw, self.ggml_type, x.dtype,
+            (self.out_features, self.in_features),
+        )
+        return torch.nn.functional.linear(x, w, bias)
+
+    def _pull_to_device(self, tensor, device):
+        if tensor.device != device:
+            tensor = tensor.to(device)
+        # Honor core's LowVramPatch-style callables (move-to-device,
+        # dtype-preserving) exactly as cast_bias_weight would.
+        for fn in (getattr(self, "weight_function", None) or ()):
+            tensor = fn(tensor)
+        if tensor.device != device:
+            tensor = tensor.to(device)
+        return tensor
 
     def extra_repr(self):
         return (

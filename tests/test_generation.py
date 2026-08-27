@@ -19,6 +19,19 @@ def _mock_voice_sample(length: int = 24000) -> np.ndarray:
     return np.random.randn(length).astype(np.float32)
 
 
+def _patch_model_management():
+    """Patch generation.model_management with a realistic stand-in.
+
+    BUG-012: generate_audio places inputs on the runtime's compute device
+    (``model_management.get_torch_device()``), NOT ``model.device`` (which
+    lies under partial offload). A bare MagicMock breaks ``Tensor.to()``,
+    so the mock must return a real torch.device.
+    """
+    mm = MagicMock()
+    mm.get_torch_device.return_value = torch.device("cpu")
+    return patch("ComfyUI_VibeVoice.modules.generation.model_management", mm)
+
+
 class TestLoadVibevoiceModel:
     """Test load_vibevoice_model function."""
 
@@ -349,7 +362,7 @@ class TestGenerateAudio:
         mock_processor.tokenizer = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             waveform, sample_rate = generate_audio(
                 model=mock_model,
@@ -397,7 +410,7 @@ class TestGenerateAudio:
         mock_processor.tokenizer = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             generate_audio(
                 model=mock_model,
@@ -448,7 +461,7 @@ class TestGenerateAudio:
         test_script = "[1] Hello world"
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             generate_audio(
                 model=mock_model,
@@ -484,7 +497,7 @@ class TestGenerateAudio:
         test_script = "[1] Hello world\n[2] Hi there"
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             generate_audio(
                 model=mock_model,
@@ -519,7 +532,7 @@ class TestGenerateAudio:
         test_script = "Speaker 1: Hello world"
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             generate_audio(
                 model=mock_model,
@@ -555,7 +568,7 @@ class TestGenerateAudio:
         mock_processor = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=None):
             with pytest.raises(ValueError, match="No valid voice samples"):
                 generate_audio(
@@ -574,7 +587,7 @@ class TestGenerateAudio:
         mock_processor = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=None):
             with pytest.raises(ValueError, match="voice sample"):
                 generate_audio(
@@ -601,7 +614,7 @@ class TestGenerateAudio:
         mock_processor.tokenizer = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             waveform, sr = generate_audio(
                 model=mock_model,
@@ -628,7 +641,7 @@ class TestGenerateAudio:
         mock_processor.tokenizer = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             _, sr = generate_audio(
                 model=mock_model,
@@ -649,7 +662,7 @@ class TestForceOffloadModel:
         mock_patcher = MagicMock()
         mock_patcher.is_loaded = True
 
-        with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
+        with _patch_model_management():
             force_offload_model(mock_patcher, "TestModel")
 
             mock_patcher.unpatch_model.assert_called_once_with(
@@ -660,7 +673,7 @@ class TestForceOffloadModel:
         mock_patcher = MagicMock()
         mock_patcher.is_loaded = False
 
-        with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
+        with _patch_model_management():
             force_offload_model(mock_patcher, "TestModel")
 
             mock_patcher.unpatch_model.assert_not_called()
@@ -670,7 +683,7 @@ class TestForceOffloadModel:
         mock_patcher = MagicMock()
         mock_patcher.is_loaded = True
 
-        with patch("ComfyUI_VibeVoice.modules.generation.model_management"):
+        with _patch_model_management():
             force_offload_model(mock_patcher, "TestModel", warm=True)
 
         mock_patcher.unpatch_model.assert_called_once_with(unpatch_weights=True, warm=True)
@@ -927,7 +940,7 @@ class TestGenerateAudioNoneSpeechOutputs:
         mock_processor.tokenizer = MagicMock()
 
         with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management"), \
+             _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             return generate_audio(
                 model=mock_model,
