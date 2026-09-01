@@ -67,7 +67,7 @@ class TestComfyUtilsSurface:
         assert "device" in sig.parameters
 
     def test_progressbar_exists(self):
-        # generation.py imports ProgressBar from comfy.utils.
+        # progress_utils.ProgressBarWithConsole wraps comfy.utils.ProgressBar.
         assert hasattr(comfy_utils, "ProgressBar")
 
 

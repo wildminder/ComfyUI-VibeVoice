@@ -58,7 +58,7 @@ class TestFullPipelineMocked:
         with patch("ComfyUI_VibeVoice.modules.generation.VibeVoiceModelHandler") as mock_handler_cls, \
              patch("ComfyUI_VibeVoice.modules.generation.VibeVoicePatcher", return_value=mock_patcher), \
              patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"), \
-             patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+             patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole"), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             mock_handler = MagicMock()
             mock_handler.size = 1000
@@ -147,7 +147,7 @@ class TestFullPipelineMocked:
         mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
         mock_processor.tokenizer = MagicMock()
 
-        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole"), \
              _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             waveform, sr = generate_audio(
@@ -173,7 +173,7 @@ class TestFullPipelineMocked:
         mock_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
         mock_processor.tokenizer = MagicMock()
 
-        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole"), \
              _patch_model_management(), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             waveform, sr = generate_audio(
@@ -201,7 +201,7 @@ class TestFullPipelineMocked:
         mock_processor.tokenizer = MagicMock()
 
         # Patch ProgressBar but keep model_management real for the exception class
-        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole"), \
              patch("ComfyUI_VibeVoice.modules.generation.model_management.interrupt_current_processing", return_value=False), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
             with pytest.raises(InterruptException):
@@ -243,7 +243,7 @@ class TestNodeProgressIntegration:
         with patch("ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_model",
                    return_value=(mock_patcher, mock_model, mock_processor)), \
              patch("ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()), \
-             patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole") as mock_pbar_cls, \
              patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted"), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio",
                    return_value=_mock_voice_sample()):
@@ -302,7 +302,7 @@ class TestNodeProgressIntegration:
         with patch("ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_model",
                    return_value=(mock_patcher, mock_model, mock_processor)), \
              patch("ComfyUI_VibeVoice.nodes.realtime_node.ui.PreviewAudio", MagicMock()), \
-             patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole") as mock_pbar_cls, \
              patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted"), \
              patch("ComfyUI_VibeVoice.modules.generation.prefill_voice_prompt",
                    return_value={"lm": MagicMock()}), \
@@ -366,7 +366,7 @@ class TestNodeProgressIntegration:
 
         with patch("ComfyUI_VibeVoice.nodes.asr_node.load_asr_model_patched",
                    return_value=(mock_patcher, mock_model, mock_processor)), \
-             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBarWithConsole") as mock_pbar_cls, \
              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.throw_exception_if_processing_interrupted"):
             mock_pbar = MagicMock()
             mock_pbar.total = 32768
@@ -466,7 +466,7 @@ class TestExternalModelFullFlow:
         fake_processor.return_value = {"input_ids": torch.randint(0, 100, (1, 10))}
         fake_processor.tokenizer = MagicMock()
 
-        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar"), \
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole"), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio",
                    return_value=_mock_voice_sample()):
             waveform, sr = generate_audio(

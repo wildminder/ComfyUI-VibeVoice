@@ -1,10 +1,17 @@
 [project]
+# Name intentionally keeps the "ComfyUI-" prefix although the registry
+# naming guide says not to: the package is already published under this
+# exact ID (see .github/workflows/publish.yml), and renaming would orphan
+# the existing registry entry and break updates for installed users.
 name = "ComfyUI-VibeVoice"
 description = "VibeVoice TTS. Expressive, long-form, multi-speaker conversational audio"
 version = "2.8.0"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
-dependencies = ["torch", "torchaudio", "numpy", "huggingface_hub", "einops", "tokenizers", "soundfile", "s3tokenizer", "tqdm", "conformer", "safetensors", "transformers>=4.51.3", "diffusers", "bitsandbytes"]
+# Keep in sync with requirements.txt (guarded by tests/test_pyproject.py).
+# bitsandbytes + accelerate serve the transformers 4-bit quantization path
+# (BitsAndBytesConfig), which imports them lazily at runtime.
+dependencies = ["torch", "torchaudio", "numpy", "huggingface_hub", "accelerate", "soundfile", "tqdm", "safetensors", "transformers>=4.51.3", "diffusers", "bitsandbytes"]
 classifiers = [
     "Operating System :: OS Independent",
     "Environment :: GPU :: NVIDIA CUDA",
@@ -24,6 +31,5 @@ Issues = "https://github.com/wildminder/ComfyUI-VibeVoice/issues"
 
 [tool.comfy]
 PublisherId = "wildai"
-DisplayName = "ComfyUI-VibeVoice"
-Icon = ""
+DisplayName = "VibeVoice TTS"
 requires-comfyui = ">=0.28.0"

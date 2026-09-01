@@ -156,7 +156,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
         attn_implementation = get_attn_implementation_for_load(attention_mode)
 
         try:
-            logger.info(
+            logger.debug(
                 f"Loading ASR model '{model_name}' with dtype: {model_dtype} "
                 f"and attention: '{attn_implementation}'"
             )

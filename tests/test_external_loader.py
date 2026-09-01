@@ -1015,7 +1015,7 @@ class TestResolveAutoConfigName:
 
     def test_conclusive_fingerprint_returns_family(self, weight_file, caplog):
         with caplog.at_level(
-            logging.INFO, logger="ComfyUI_VibeVoice.modules.external_loader"
+            logging.DEBUG, logger="ComfyUI_VibeVoice.modules.external_loader"
         ):
             name = resolve_auto_config_name(weight_file, weights_fp=_FP_7B)
         assert name == "VibeVoice-7B"
@@ -1087,7 +1087,7 @@ class TestAutoDetectLoaderSemantics:
     def test_auto_adopts_detected_family(self, weight_file, caplog):
         harness = TestLoaderReconciliationWiring()
         with caplog.at_level(
-            logging.INFO, logger="ComfyUI_VibeVoice.modules.external_loader"
+            logging.DEBUG, logger="ComfyUI_VibeVoice.modules.external_loader"
         ):
             result, resolve_calls = harness._run(
                 weight_file, AUTO_CONFIG_NAME, _FP_7B

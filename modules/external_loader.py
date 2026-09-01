@@ -37,6 +37,7 @@ from ..src.vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProces
 from ..src.vibevoice.processor.vibevoice_tokenizer_processor import VibeVoiceTokenizerProcessor
 
 from .loader import VibeVoiceLoader
+from .base_loader import iter_safetensors_tensors
 from .attention_utils import (
     SAGE_ATTENTION_AVAILABLE,
     resolve_attention_mode,
@@ -142,7 +143,7 @@ def resolve_auto_config_name(weight_path: str, gguf_reader=None, weights_fp=None
             f"(one of: {', '.join(explicit)}) or place a sidecar config.json "
             f"next to the weight file."
         )
-    logger.info(
+    logger.debug(
         f"Auto-detected architecture '{detected}' from "
         f"'{os.path.basename(weight_path)}'"
     )
@@ -720,18 +721,8 @@ def _prepare_quantized_safetensors_load(state_dict: dict, quant_map: dict):
 # Streaming safetensors load (plan 2026-08-27, Phase 3 — RAM-spike kill)
 # ====================================================================
 
-def iter_safetensors_tensors(weight_path: str):
-    """Yield ``(key, tensor)`` one at a time from a safetensors file.
-
-    Per-tensor streaming contract (Breeze-TTS-2 pattern): only ONE tensor is
-    materialized at any moment — the full-file state dict (and its
-    ~file-size RAM residency) never exists.
-    """
-    from safetensors import safe_open
-
-    with safe_open(str(weight_path), framework="pt", device="cpu") as f:
-        for key in f.keys():
-            yield key, f.get_tensor(key)
+# iter_safetensors_tensors lives in base_loader (shared with the standard
+# loader's sharded/dense streaming path); imported at module top.
 
 
 def _read_safetensors_tensor(weight_path: str, key: str):
@@ -844,28 +835,37 @@ def _stream_apply_safetensors(model, weight_path: str, quant_map: dict):
         if prefix in dequant_infos and leaf == "weight_scale":
             continue  # consumed by pass 1
         if prefix in dequant_infos and leaf == "weight":
+            # Dequantization builds a fresh tensor that already owns its
+            # memory — no file mapping to sever.
             tensor = _dequantize_rowwise_weight(
                 prefix, dequant_infos[prefix], tensor, scales[prefix]
             )
-        elif tensor.dtype in _QUANT_STORAGE_DTYPES:
-            # Planned residents assign their raw storage into the matching
-            # raw-storage parameter; anything else is an unplanned quant
-            # weight that must never reach a float parameter.
-            if prefix not in resident_prefixes \
-                    or leaf not in ("weight", "weight_scale"):
-                raise ValueError(
-                    f"Checkpoint contains quantized-weight tensors "
-                    f"({key}: {tensor.dtype}) that no comfy_quant metadata "
-                    f"declares. This node only loads quant formats it can "
-                    f"execute; re-export the checkpoint or use a dense "
-                    f"(bf16/fp16) file."
-                )
-            target = params.get(key)
-            if target is not None and tensor.dtype != target.dtype:
-                raise QuantTargetMismatch(
-                    f"Resident layer '{prefix}': expected {target.dtype} "
-                    f"storage for '{leaf}', checkpoint has {tensor.dtype}"
-                )
+        else:
+            if tensor.dtype in _QUANT_STORAGE_DTYPES:
+                # Planned residents assign their raw storage into the matching
+                # raw-storage parameter; anything else is an unplanned quant
+                # weight that must never reach a float parameter.
+                if prefix not in resident_prefixes \
+                        or leaf not in ("weight", "weight_scale"):
+                    raise ValueError(
+                        f"Checkpoint contains quantized-weight tensors "
+                        f"({key}: {tensor.dtype}) that no comfy_quant metadata "
+                        f"declares. This node only loads quant formats it can "
+                        f"execute; re-export the checkpoint or use a dense "
+                        f"(bf16/fp16) file."
+                    )
+                target = params.get(key)
+                if target is not None and tensor.dtype != target.dtype:
+                    raise QuantTargetMismatch(
+                        f"Resident layer '{prefix}': expected {target.dtype} "
+                        f"storage for '{leaf}', checkpoint has {tensor.dtype}"
+                    )
+            # Sever the checkpoint file mapping: everything assigned raw from
+            # the stream is a zero-copy mmap view, and a view retained by an
+            # offloaded parameter would pin the whole file in the process
+            # working set (same ghost-RAM / pin hazard as the dense sharded
+            # path in VibeVoiceLoader._stream_apply_dense).
+            tensor = tensor.clone()
         if _assign(key, tensor):
             assigned.add(key)
         else:
@@ -1041,7 +1041,10 @@ def _install_gguf_weights(model, reader) -> dict:
                 tensor = torch.from_numpy(data)
             else:  # BF16 arrives as raw uint8 bytes
                 tensor = torch.from_numpy(data).view(torch.bfloat16)
-            dense_state[target_key] = tensor.reshape(logical_shape)
+            # clone() severs the reader's file mapping (same hazard class as
+            # the safetensors mmap views); float tensors in a GGUF file are
+            # the small minority (embeddings/norms/biases), so this is cheap.
+            dense_state[target_key] = tensor.reshape(logical_shape).clone()
             continue
 
         if tt not in SUPPORTED_GGML_TYPES:
@@ -1266,6 +1269,17 @@ def _load_state_dict_into_model_from_memory(model, state_dict: dict):
     Returns:
         The model with the state dict loaded (still on CPU).
     """
+    # Sever file-backed storage before assign: comfy.utils.load_torch_file
+    # returns zero-copy mmap views for safetensors checkpoints, and any view
+    # that survives into an offloaded CPU parameter keeps the whole file
+    # mapping resident in the process working set (ghost RAM on top of the
+    # VRAM copy + unstable cudaHostRegister pins). Clone in place so peak
+    # RAM stays at dict + one tensor. Already-owned tensors (e.g. freshly
+    # dequantized ones) pay one extra copy — harmless.
+    for key in list(state_dict.keys()):
+        tensor = state_dict[key]
+        if isinstance(tensor, torch.Tensor):
+            state_dict[key] = tensor.clone()
     VibeVoiceLoader._apply_state_dict(model, state_dict)
     return model
 
@@ -1409,16 +1423,16 @@ def load_external_vibevoice_model(
         and weight_path.lower().endswith(".safetensors")
     )
     if gguf_reader is not None:
-        logger.info(
+        logger.debug(
             f"Opening external VibeVoice GGUF weights (raw-block residency): "
             f"{weight_path}"
         )
     elif stream_quant_load:
-        logger.info(
+        logger.debug(
             f"Streaming external VibeVoice quant weights from: {weight_path}"
         )
     else:
-        logger.info(f"Loading external VibeVoice weights from: {weight_path}")
+        logger.debug(f"Loading external VibeVoice weights from: {weight_path}")
         # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
         # loader). Always CPU — the patcher owns the single H2D transfer.
         state_dict = _load_weight_state_dict(weight_path, cpu_device)
@@ -1724,17 +1738,17 @@ def load_external_vibevoice_asr_model(
         and weight_path.lower().endswith(".safetensors")
     )
     if gguf_reader is not None:
-        logger.info(
+        logger.debug(
             f"Opening external VibeVoice ASR GGUF weights (raw-block "
             f"residency): {weight_path}"
         )
     elif stream_quant_load:
-        logger.info(
+        logger.debug(
             f"Streaming external VibeVoice ASR quant weights from: "
             f"{weight_path}"
         )
     else:
-        logger.info(f"Loading external VibeVoice ASR weights from: {weight_path}")
+        logger.debug(f"Loading external VibeVoice ASR weights from: {weight_path}")
         state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
     # Step 2: Resolve and load the ASR architecture config.

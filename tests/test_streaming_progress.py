@@ -48,7 +48,7 @@ def _run_streaming(generate_side_effect=None, expect_exception=None):
         }
     )
 
-    with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+    with patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole") as mock_pbar_cls, \
          patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted") as mock_interrupt, \
          patch("ComfyUI_VibeVoice.modules.generation.prefill_voice_prompt", return_value={"lm": MagicMock()}), \
          patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):
@@ -110,7 +110,7 @@ class TestStreamingProgressReporting:
             }
         )
 
-        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBar") as mock_pbar_cls, \
+        with patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole") as mock_pbar_cls, \
              patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted") as mock_interrupt, \
              patch("ComfyUI_VibeVoice.modules.generation.prefill_voice_prompt", return_value={"lm": MagicMock()}), \
              patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio", return_value=_mock_voice_sample()):

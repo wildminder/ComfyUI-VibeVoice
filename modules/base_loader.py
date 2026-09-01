@@ -31,6 +31,25 @@ def _default_device() -> torch.device:
     return torch.device("cpu")
 
 
+def iter_safetensors_tensors(ckpt_path: str):
+    """Yield ``(key, tensor)`` one at a time from a safetensors file.
+
+    Per-tensor streaming contract (Breeze-TTS-2 pattern): only ONE tensor is
+    materialized at any moment — the full-file state dict (and its
+    ~file-size RAM residency) never exists.
+
+    Tensors are zero-copy views into the memory-mapped file (same semantics
+    as ``comfy.utils.load_torch_file``). A consumer that keeps a tensor past
+    the iterator's lifetime must copy it into private memory first — a view
+    keeps the ENTIRE file mapping resident in the process working set.
+    """
+    from safetensors import safe_open
+
+    with safe_open(str(ckpt_path), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            yield key, f.get_tensor(key)
+
+
 class BaseVibeVoiceLoader:
     """Base class holding GPU-free, reusable loader helpers."""
 
@@ -169,3 +188,77 @@ class BaseVibeVoiceLoader:
             f"Merged {len(merged_state_dict)} parameters from {len(shard_filenames)} shards"
         )
         return merged_state_dict
+
+    @staticmethod
+    def iter_checkpoint_tensors(ckpt_path: str):
+        """Yield ``(key, tensor)`` from a single-file checkpoint.
+
+        safetensors files stream per-tensor (see
+        :func:`iter_safetensors_tensors`); other formats (``.bin`` / ``.pt``)
+        are pickle archives that cannot be streamed and fall back to
+        ``comfy.utils.load_torch_file`` + item iteration.
+
+        Tensors may be zero-copy views into the checkpoint file — a consumer
+        that keeps a tensor must copy it into private memory first.
+
+        Args:
+            ckpt_path: Path to a single checkpoint file.
+
+        Yields:
+            ``(key, tensor)`` pairs on CPU.
+        """
+        if str(ckpt_path).lower().endswith(".safetensors"):
+            yield from iter_safetensors_tensors(ckpt_path)
+            return
+        state_dict = comfy.utils.load_torch_file(ckpt_path, device=_default_device())
+        yield from state_dict.items()
+
+    @staticmethod
+    def iter_sharded_tensors(local_dir: str):
+        """Yield ``(key, tensor)`` across every shard of a checkpoint directory.
+
+        Streaming twin of :meth:`load_state_dict_sharded`: resolves the same
+        checkpoint priority (single safetensors -> sharded index -> single
+        bin -> sharded bin index) but never materializes a merged dict —
+        peak host RAM is bounded by the model plus one tensor in flight, and
+        each shard's file mapping can be released as soon as its tensors have
+        been consumed.
+
+        Tensors may be zero-copy views into the shard files — a consumer that
+        keeps a tensor must copy it into private memory first (a retained
+        view pins its whole shard mapping in the process working set).
+
+        Args:
+            local_dir: Directory containing the checkpoint file(s).
+
+        Yields:
+            ``(key, tensor)`` pairs on CPU.
+
+        Raises:
+            FileNotFoundError: If the directory or a referenced shard is missing.
+            ValueError: If a sharded index has an empty ``weight_map``.
+        """
+        ckpt_path, is_sharded = BaseVibeVoiceLoader._resolve_checkpoint_file(local_dir)
+
+        if not is_sharded:
+            yield from BaseVibeVoiceLoader.iter_checkpoint_tensors(ckpt_path)
+            return
+
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+
+        weight_map = index.get("weight_map", {})
+        if not weight_map:
+            raise ValueError(f"Sharded checkpoint index '{ckpt_path}' has empty weight_map")
+
+        shard_filenames = sorted(set(weight_map.values()))
+        logger.info(f"Loading {len(shard_filenames)} shards from {local_dir}")
+
+        for shard_filename in shard_filenames:
+            shard_path = os.path.join(local_dir, shard_filename)
+            if not os.path.isfile(shard_path):
+                raise FileNotFoundError(
+                    f"Shard file not found: {shard_path} (referenced in {ckpt_path})"
+                )
+            logger.debug(f"Loading shard: {shard_filename}")
+            yield from BaseVibeVoiceLoader.iter_checkpoint_tensors(shard_path)

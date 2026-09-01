@@ -73,6 +73,9 @@ class _LedgerModel(torch.nn.Module):
         self._ledger = ledger
         self._device = CPU
         self._dtype = torch.float32
+        # Real parameter so the streaming assign (_stream_apply_dense) has a
+        # target for the ("w", ...) tensors the tests stream in.
+        self.w = torch.nn.Parameter(torch.zeros(1))
 
     def to(self, *args, **kwargs):
         device, dtype = _parse_to_call(args, kwargs)
@@ -128,8 +131,9 @@ def _patched_loader(ledger_model, registry=None):
     """Patch every loader seam EXCEPT ``_load_state_dict_into_model``.
 
     The state-dict loading path is the unit under test, so it stays real;
-    its own seams (``_resolve_checkpoint_path``, ``comfy.utils.load_torch_file``)
-    are patched by the individual tests.
+    its own seams (``_resolve_checkpoint_path``, the streaming tensor
+    iterators ``iter_checkpoint_tensors`` / ``iter_sharded_tensors``) are
+    patched by the individual tests.
     """
 
     class _FakeStreamingCfg:  # isinstance() target must be a real class
@@ -206,14 +210,6 @@ class TestP01LedgerHarness:
 # ====================================================================
 # P1.1/P1.2 — State dict is ALWAYS loaded onto CPU (DF-001/DF-002 fix)
 # ====================================================================
-def _ltf_device(mock_ltf):
-    """Extract the device passed to a comfy.utils.load_torch_file call."""
-    device_arg = mock_ltf.call_args.kwargs.get("device")
-    if device_arg is None and len(mock_ltf.call_args.args) > 1:
-        device_arg = mock_ltf.call_args.args[1]
-    return device_arg
-
-
 class TestP1StateDictLoadedToCpu:
     """Contract: checkpoints are read to CPU regardless of target device."""
 
@@ -223,47 +219,46 @@ class TestP1StateDictLoadedToCpu:
         with _patched_loader(ledger_model, registry=registry), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
-            mock_ltf.return_value = {"w": torch.zeros(1)}
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.zeros(1))])) as mock_iter:
             VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa", dtype_str="bf16"
             )
 
-        assert mock_ltf.call_count == 1
-        device_arg = _ltf_device(mock_ltf)
-        assert device_arg is not None and device_arg.type == "cpu", (
-            f"state dict must be loaded onto CPU, got device={device_arg!r}"
-        )
+        mock_iter.assert_called_once_with("fake.safetensors")
+        # Streaming iterator contract: tensors always arrive on CPU (the
+        # iterator has no device parameter); the patcher owns the single
+        # H2D transfer after ComfyUI's VRAM arbitration.
+        assert ledger_model.w.device.type == "cpu"
 
     def test_state_dict_loaded_to_cpu_sharded(self, ledger, ledger_model):
-        """Sharded path: base loader receives the CPU device; shards merge."""
+        """Sharded path: the streaming shard iterator feeds the assign loop."""
         captured = {}
 
-        def fake_sharded(model_dir, device):
-            captured["device"] = device
+        def fake_iter(model_dir):
             captured["model_dir"] = model_dir
-            return {"a": torch.zeros(1), "b": torch.zeros(1)}
+            yield "w", torch.zeros(1)
 
         with _patched_loader(ledger_model), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("model.safetensors.index.json", True)), \
-             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.load_state_dict_sharded",
-                   side_effect=fake_sharded) as mock_sharded:
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_sharded_tensors",
+                   side_effect=fake_iter) as mock_iter:
             VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa", dtype_str="bf16"
             )
 
-        mock_sharded.assert_called_once()
-        assert captured["device"] is not None and captured["device"].type == "cpu"
-        # Merged state dict was applied to the model
-        assert any(e[0] == "load_state_dict" for e in ledger)
+        mock_iter.assert_called_once()
+        assert captured["model_dir"] == "mp"
+        # Shards stream onto CPU; the merged-dict device arg is gone.
+        assert ledger_model.w.device.type == "cpu"
 
     def test_load_state_dict_into_model_ignores_device_arg(self, ledger, ledger_model):
         """Direct unit test of _load_state_dict_into_model: device arg is reserved."""
         with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
-            mock_ltf.return_value = {"w": torch.zeros(1)}
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.zeros(1))])):
             VibeVoiceLoader._load_state_dict_into_model(
                 model=ledger_model,
                 model_path="mp",
@@ -271,7 +266,8 @@ class TestP1StateDictLoadedToCpu:
                 model_info={"type": "official"},
                 device=CUDA,  # must be ignored for placement
             )
-        assert _ltf_device(mock_ltf).type == "cpu"
+        # Streaming iterator yields CPU tensors unconditionally.
+        assert ledger_model.w.device.type == "cpu"
 
 
 # ====================================================================
@@ -284,8 +280,8 @@ class TestP1LoaderReturnsCpuModel:
         with _patched_loader(ledger_model), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
-            mock_ltf.return_value = {"w": torch.zeros(1)}
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.zeros(1))])):
             model, _ = VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa", dtype_str="bf16"
             )
@@ -311,10 +307,10 @@ class TestP1LoaderReturnsCpuModel:
         with _patched_loader(ledger_model), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf, \
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.zeros(1))])), \
              patch("ComfyUI_VibeVoice.modules.loader.cast_model_to_dtype_if_needed",
                    side_effect=fake_cast):
-            mock_ltf.return_value = {"w": torch.zeros(1)}
             VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa", dtype_str="fp16"
             )
@@ -348,10 +344,10 @@ class TestP1LoaderReturnsCpuModel:
         with _patched_loader(ledger_model), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf, \
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.zeros(1))])), \
              patch("ComfyUI_VibeVoice.modules.loader.BitsAndBytesConfig"), \
              patch(_bnb_target, side_effect=fake_replace) as mock_replace:
-            mock_ltf.return_value = {"w": torch.zeros(1)}
             VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa",
                 use_llm_4bit=True, dtype_str="bf16",
@@ -601,6 +597,9 @@ class TestP2PatcherCastGuard:
 
     def test_patcher_skips_cast_when_dtype_matches(self, ledger, ledger_model):
         ledger_model._dtype = torch.float16
+        # The cast guard walks REAL parameter dtypes (representative_dtype),
+        # so the ledger's parameter must match the target dtype too.
+        ledger_model.w = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
         handler = _LedgerHandler(ledger, model=None, simulate_loader=False)
         handler.model = ledger_model
         patcher = _make_ledger_patcher(handler, target_dtype=torch.float16)
@@ -687,22 +686,28 @@ class TestP3AssignWithRetie:
         assert not torch.equal(model.lm_head.weight, torch.ones(4, 4))
 
     def test_loader_uses_assign_semantics(self, ledger):
-        """The production loader MUST pass assign=True (D2)."""
-        with _patched_loader(_LedgerModel(ledger)), \
+        """The production loader MUST assign per-tensor (D2, streaming form).
+
+        Plan 2026-08-28: the batch ``load_state_dict(assign=True)`` call was
+        replaced by ``_stream_apply_dense`` (per-tensor ``set_attr_param`` of
+        a private clone). The contract is unchanged: parameter objects are
+        REPLACED with the checkpoint values, never copied into.
+        """
+        ledger_model = _LedgerModel(ledger)
+        with _patched_loader(ledger_model), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
-            mock_ltf.return_value = {"w": torch.zeros(1)}
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.full((1,), 3.0))])):
             VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa", dtype_str="bf16"
             )
 
-        lsd_calls = [e for e in ledger if e[0] == "load_state_dict"]
-        assert lsd_calls, "load_state_dict must be called"
-        # entry format: ("load_state_dict", strict, assign)
-        assert all(e[2] is True for e in lsd_calls), (
-            "assign=True is required (D2) — eliminates the copy pass (RC-2)"
+        assert not any(e[0] == "load_state_dict" for e in ledger), (
+            "streaming assign must not route through load_state_dict"
         )
+        # The parameter object now holds the checkpoint value (assign).
+        assert float(ledger_model.w.item()) == 3.0
 
     def test_loader_reties_after_assign(self, ledger):
         """The loader must re-invoke tie_weights() after assign load (D2)."""
@@ -716,16 +721,18 @@ class TestP3AssignWithRetie:
         with _patched_loader(ledger_model), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
-            mock_ltf.return_value = {"w": torch.zeros(1)}
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   # bf16 = target dtype, so the conditional cast takes its
+                   # fast path and the only tie comes from the assign fixups.
+                   return_value=iter([("w", torch.zeros(1, dtype=torch.bfloat16))])):
             VibeVoiceLoader.load_model(
                 "TestModel", CUDA, attention_mode="sdpa", dtype_str="bf16"
             )
 
         ledger_model.tie_weights.assert_called_once()
-        # tie_weights must be called AFTER load_state_dict
-        lsd_idx = next(i for i, e in enumerate(ledger) if e[0] == "load_state_dict")
-        assert lsd_idx >= 0
+        # tie_weights runs in the post-assign fixups, which execute only
+        # after the assign loop has delivered the weights.
+        assert hasattr(ledger_model, "w")
 
 
 # ====================================================================
@@ -809,11 +816,11 @@ class TestP4VramArbitration:
         with _patched_loader(ledger_model, registry=registry), \
              patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
-             patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_ltf:
-            mock_ltf.return_value = {"w": torch.zeros(1)}
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.zeros(1))])):
             handler.load_model(CUDA, attention_mode="sdpa")
 
-        assert _ltf_device(mock_ltf).type == "cpu"
+        assert ledger_model.w.device.type == "cpu"
         assert ledger_model.device == CPU
         assert not any(
             e[0] == "to" and e[1] is not None and e[1].type == "cuda"
