@@ -1,18 +1,24 @@
-torch
+# Runtime dependencies for ComfyUI-Manager / git-clone installs.
+# Only packages NOT bundled with ComfyUI itself are listed here — torch,
+# numpy, safetensors and tqdm ship with every ComfyUI (see ComfyUI's own
+# requirements.txt). The full declared dependency surface lives in
+# pyproject.toml (used by the Comfy registry); every entry here must be a
+# subset of it (guarded by tests/test_pyproject.py).
+#
+# torchaudio is bundled with ComfyUI but is still declared explicitly: it
+# is this node's primary audio resampler/encoder backend and tests lock
+# it as a hard dependency.
+#
+# accelerate: required by the transformers 4-bit (BitsAndBytesConfig) path;
+#   not guaranteed by ComfyUI's own requirements at our floor (v0.28.0).
 accelerate
 torchaudio
-numpy
 huggingface_hub
-einops
-tokenizers
 soundfile
-s3tokenizer
-conformer
-safetensors
 transformers>=4.51.3
 diffusers
-tqdm
 bitsandbytes
+
 # Optional audio-resampling fallbacks (torchaudio is the primary resampler;
 # the node never requires librosa and degrades gracefully without it):
 # scipy

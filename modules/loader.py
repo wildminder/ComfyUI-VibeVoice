@@ -809,6 +809,81 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         return missing_keys, unexpected_keys
 
     @staticmethod
+    def _stream_apply_dense(model, tensor_pairs, known_missing=None):
+        """Assign a dense checkpoint per-tensor, severing file mappings.
+
+        Streaming twin of :meth:`_apply_state_dict` for checkpoints read
+        through the base-loader iterators (sharded or single-file). Two
+        differences from the batch path, both deliberate:
+
+        1. No merged state dict ever exists — peak host RAM is bounded by
+           the model plus one tensor in flight.
+        2. Every tensor is ``clone()``d before assign. ``safe_open`` /
+           ``load_torch_file`` hand back zero-copy views into the mapped
+           checkpoint file(s); assigning them directly keeps EVERY file
+           mapping alive for as long as the model holds a single tensor
+           from it. Under ComfyUI's partial load, offloaded CPU parameters
+           are scattered across all shards, so the process working set
+           balloons to ~full model size ON TOP of the VRAM copy, and
+           ``cudaHostRegister`` on file-backed pages is what produces the
+           "Pin error." flood. Cloning into private memory fixes both: the
+           mapping is released shard-by-shard during the pass, and pinned
+           offloaded weights sit in ordinary anonymous memory (the
+           reliable pinning class).
+
+        Shape checking, missing/unexpected reporting, and all post-assign
+        fixups (re-tie, meta stragglers, sentinel buffers, RoPE, streaming
+        conversion) match the batch path via ``_shape_mismatch_error`` and
+        :meth:`_post_assign_fixups`.
+
+        Args:
+            model: Instantiated model (meta- or eager-initialized).
+            tensor_pairs: Iterable of ``(key, tensor)`` — e.g.
+                ``BaseVibeVoiceLoader.iter_sharded_tensors``.
+            known_missing: Optional set of keys that are INTENTIONALLY
+                absent from the stream (see :meth:`_apply_state_dict`).
+
+        Returns:
+            Tuple of (missing_keys, unexpected_keys).
+        """
+        known_missing = known_missing or set()
+        params = dict(model.named_parameters())
+        buffers = dict(model.named_buffers())
+        assigned = set()
+        unexpected = []
+
+        for key, tensor in tensor_pairs:
+            target = params.get(key)
+            if target is not None:
+                if tuple(tensor.shape) != tuple(target.shape):
+                    raise _shape_mismatch_error(
+                        model, [(key, tuple(tensor.shape), tuple(target.shape))]
+                    )
+                comfy.utils.set_attr_param(model, key, tensor.clone())
+                assigned.add(key)
+                continue
+            target_buf = buffers.get(key)
+            if target_buf is not None:
+                if tuple(tensor.shape) != tuple(target_buf.shape):
+                    raise _shape_mismatch_error(
+                        model, [(key, tuple(tensor.shape), tuple(target_buf.shape))]
+                    )
+                comfy.utils.set_attr_buffer(model, key, tensor.clone())
+                assigned.add(key)
+                continue
+            unexpected.append(key)
+
+        # Missing keys = expected model keys the stream never delivered.
+        # Mirrors torch's own missing-key semantics (persistent state only;
+        # tied names appear individually and are filtered by the shared
+        # fixups' tied hint).
+        expected = set(model.state_dict().keys())
+        missing_keys = [k for k in expected if k not in assigned]
+        return VibeVoiceLoader._post_assign_fixups(
+            model, missing_keys, unexpected, known_missing
+        )
+
+    @staticmethod
     def _load_state_dict_into_model(
         model,
         model_path: str,
@@ -816,14 +891,19 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         model_info: dict,
         device,
     ):
-        """Load state dict into model using ComfyUI's loading utilities.
+        """Stream a dense checkpoint into the model (per-tensor assign).
 
         Resolves the checkpoint file path(s) from the model directory or
-        standalone path, then loads the state dict (handling sharded checkpoints)
-        and loads it into the model.
+        standalone path, then streams the tensors — sharded checkpoints
+        shard-by-shard, single files tensor-by-tensor — into the model via
+        :meth:`_stream_apply_dense`. No merged state dict ever exists, and
+        every tensor is cloned into private memory so the checkpoint's file
+        mapping is released incrementally instead of being pinned alive by
+        offloaded parameters (the sharded 7B ghost-RAM / "Pin error." fix,
+        plan 2026-08-28).
 
-        Device contract (DF-001/DF-002 fix): the state dict is ALWAYS loaded
-        onto CPU, regardless of the ``device`` argument. Loading it directly
+        Device contract (DF-001/DF-002 fix): weights are ALWAYS loaded onto
+        CPU, regardless of the ``device`` argument. Loading them directly
         onto CUDA caused a disk->VRAM->RAM->VRAM round-trip (full-model VRAM
         spike outside ComfyUI's arbitration, then a GPU->CPU copy into the
         CPU-resident parameters). The single host-to-device transfer is owned
@@ -835,10 +915,10 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             model_type: "official", "local_dir", or "standalone".
             model_info: Model info dict (for standalone path).
             device: Reserved for signature compatibility; NOT used for
-                placement — the state dict is always loaded onto CPU.
+                placement — weights are always loaded onto CPU.
 
         Returns:
-            The model with loaded state dict (on CPU).
+            The model with loaded weights (on CPU).
         """
         # Resolve checkpoint path (handles single-file and sharded checkpoints)
         ckpt_path, is_sharded = VibeVoiceLoader._resolve_checkpoint_path(
@@ -847,26 +927,24 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
         # DF-001/DF-002: always load weights onto CPU. The patcher performs
         # the single H2D transfer after ComfyUI's VRAM arbitration.
-        cpu_device = torch.device("cpu")
-
         if is_sharded:
-            # Load and merge sharded checkpoint (onto CPU)
+            # Stream shards per-tensor (no merged dict): peak RAM stays at
+            # model + one tensor, and each shard's file mapping is released
+            # as soon as its tensors have been materialized into the model.
             model_dir = model_path if model_type != "standalone" else os.path.dirname(ckpt_path)
-            state_dict = VibeVoiceLoader._load_sharded_state_dict(ckpt_path, model_dir, cpu_device)
+            tensor_pairs = BaseVibeVoiceLoader.iter_sharded_tensors(model_dir)
         else:
-            # Load single checkpoint file (onto CPU)
+            # Stream a single checkpoint file (onto CPU)
             logger.debug(f"Loading state dict from: {ckpt_path}")
-            state_dict = comfy.utils.load_torch_file(ckpt_path, device=cpu_device)
+            tensor_pairs = BaseVibeVoiceLoader.iter_checkpoint_tensors(ckpt_path)
 
-        # Assign-based load (D2/D3): checkpoint tensors replace the meta/random
-        # parameter objects directly (no copy pass), tied weights are re-tied,
-        # and any meta stragglers are zero-materialized. strict=False handles
+        # Streaming assign (D2/D3): checkpoint tensors are cloned into PRIVATE
+        # memory as they replace the meta/random parameter objects — the clone
+        # severs the checkpoint file mapping (see _stream_apply_dense). Tied
+        # weights are re-tied and meta stragglers zero-materialized by the
+        # shared post-assign fixups; strict=False semantics handle
         # missing/unexpected keys (e.g., tied weights, quantized layers).
-        VibeVoiceLoader._apply_state_dict(model, state_dict)
-
-        # Free the state dict immediately — the model now owns the tensors
-        # (assign semantics), so the dict is dead weight (plan D7/RC-4).
-        del state_dict
+        VibeVoiceLoader._stream_apply_dense(model, tensor_pairs)
 
         return model
 

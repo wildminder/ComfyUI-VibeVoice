@@ -11,7 +11,8 @@ import numpy as np
 from typing import Optional, Tuple, Any
 
 import comfy.model_management as model_management
-from comfy.utils import ProgressBar
+
+from .progress_utils import ProgressBarWithConsole
 
 from .loader import VibeVoiceModelHandler, VibeVoiceLoader, cleanup_old_models, LOADED_MODELS_CACHE
 from .patcher import VibeVoicePatcher
@@ -452,7 +453,8 @@ def generate_audio(
         # (diffusion steps); the vendored AR loop reports its real budget
         # (max_steps) through `progress_callback`, and `update_absolute(value,
         # total=...)` re-sets the bar's total dynamically on the first callback.
-        pbar = ProgressBar(inference_steps)
+        # Drives both the frontend bar and the standard tqdm console bar.
+        pbar = ProgressBarWithConsole(inference_steps)
 
         def _progress(current: int, total: int) -> None:
             # Responsive cancellation: raises InterruptProcessingException when
@@ -470,6 +472,7 @@ def generate_audio(
             # Guarantee the final 100% event even when the AR loop stopped
             # early (EOS before max_steps) or generation raised.
             pbar.update_absolute(pbar.total)
+            pbar.close()
 
     # Post-process output.
     # Guard: the vendored AR loop appends None for any sample that never emitted
@@ -660,8 +663,9 @@ def generate_streaming_audio(
         # Standard ComfyUI progress bar. The streaming loop's real total
         # (tts_lm max_length) is only known inside the vendored generate();
         # the initial total=1 placeholder is corrected on the first callback
-        # via update_absolute(value, total=...).
-        pbar = ProgressBar(1)
+        # via update_absolute(value, total=...). Drives both the frontend bar
+        # and the standard tqdm console bar.
+        pbar = ProgressBarWithConsole(1)
 
         def _progress(current: int, total: int) -> None:
             # Responsive cancellation: raises InterruptProcessingException when
@@ -678,6 +682,7 @@ def generate_streaming_audio(
             # Guarantee the final 100% event even when the loop stopped early
             # (EOS classifier) or generation raised.
             pbar.update_absolute(pbar.total)
+            pbar.close()
 
     speech_outputs = outputs.speech_outputs
     if not speech_outputs or speech_outputs[0] is None:

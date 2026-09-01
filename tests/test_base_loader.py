@@ -126,3 +126,86 @@ class TestLoadStateDictSharded:
         ):
             with pytest.raises(FileNotFoundError, match="Shard file not found"):
                 BaseVibeVoiceLoader.load_state_dict_sharded(str(tmp_path), device=torch.device("cpu"))
+
+
+class TestStreamingIterators:
+    """Streaming tensor iterators (plan 2026-08-28: sharded mmap-ghost fix).
+
+    Real safetensors files throughout — the iterators exist precisely to
+    control how file mappings are consumed, so mocking them away would
+    defeat the point.
+    """
+
+    @staticmethod
+    def _write_sharded(tmp_path):
+        from safetensors.torch import save_file
+
+        w1 = torch.ones(2)
+        w2 = torch.full((2,), 2.0)
+        save_file({"a": w1}, str(tmp_path / "model-00001-of-00002.safetensors"))
+        save_file({"b": w2}, str(tmp_path / "model-00002-of-00002.safetensors"))
+        index = {
+            "weight_map": {
+                "a": "model-00001-of-00002.safetensors",
+                "b": "model-00002-of-00002.safetensors",
+            }
+        }
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+        return w1, w2
+
+    def test_iter_sharded_tensors_yields_all_keys(self, tmp_path):
+        w1, w2 = self._write_sharded(tmp_path)
+        pairs = dict(BaseVibeVoiceLoader.iter_sharded_tensors(str(tmp_path)))
+        assert set(pairs) == {"a", "b"}
+        assert torch.equal(pairs["a"], w1)
+        assert torch.equal(pairs["b"], w2)
+
+    def test_iter_sharded_tensors_matches_merged_dict(self, tmp_path):
+        """Streaming and merged loads deliver identical tensors."""
+        self._write_sharded(tmp_path)
+        merged = BaseVibeVoiceLoader.load_state_dict_sharded(
+            str(tmp_path), device=torch.device("cpu")
+        )
+        streamed = dict(BaseVibeVoiceLoader.iter_sharded_tensors(str(tmp_path)))
+        assert set(merged) == set(streamed)
+        for key in merged:
+            assert torch.equal(merged[key], streamed[key]), key
+
+    def test_iter_sharded_tensors_single_file_delegates(self, tmp_path):
+        from safetensors.torch import save_file
+
+        w = torch.arange(3, dtype=torch.float32)
+        save_file({"only": w}, str(tmp_path / "model.safetensors"))
+        pairs = dict(BaseVibeVoiceLoader.iter_sharded_tensors(str(tmp_path)))
+        assert set(pairs) == {"only"}
+        assert torch.equal(pairs["only"], w)
+
+    def test_iter_sharded_tensors_empty_weight_map_raises(self, tmp_path):
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
+        with pytest.raises(ValueError, match="empty weight_map"):
+            list(BaseVibeVoiceLoader.iter_sharded_tensors(str(tmp_path)))
+
+    def test_iter_sharded_tensors_missing_shard_raises(self, tmp_path):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors"}})
+        )
+        with pytest.raises(FileNotFoundError, match="Shard file not found"):
+            list(BaseVibeVoiceLoader.iter_sharded_tensors(str(tmp_path)))
+
+    def test_iter_checkpoint_tensors_safetensors(self, tmp_path):
+        from safetensors.torch import save_file
+
+        w = torch.ones(2, 2)
+        path = tmp_path / "single.safetensors"
+        save_file({"w": w}, str(path))
+        pairs = dict(BaseVibeVoiceLoader.iter_checkpoint_tensors(str(path)))
+        assert set(pairs) == {"w"}
+        assert torch.equal(pairs["w"], w)
+
+    def test_iter_checkpoint_tensors_bin(self, tmp_path):
+        w = torch.ones(2, 2)
+        path = tmp_path / "single.bin"
+        torch.save({"w": w}, str(path))
+        pairs = dict(BaseVibeVoiceLoader.iter_checkpoint_tensors(str(path)))
+        assert set(pairs) == {"w"}
+        assert torch.equal(pairs["w"], w)

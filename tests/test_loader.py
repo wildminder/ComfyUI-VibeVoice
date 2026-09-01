@@ -431,71 +431,92 @@ class TestLoadShardedStateDict:
                 )
 
 
+class _TwoParam(torch.nn.Module):
+    """Tiny real module for streaming-assign tests (no mocks).
+
+    ``config`` carries the (untied) gate read by the post-assign fixups.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.layer1 = torch.nn.Linear(2, 2, bias=False)
+        self.layer2 = torch.nn.Linear(2, 2, bias=False)
+        self.config = MagicMock()
+        self.config.decoder_config.tie_word_embeddings = False
+        self.config.tie_word_embeddings = False
+
+
 class TestVibeVoiceLoaderLoadStateDict:
-    """Test VibeVoiceLoader._load_state_dict_into_model."""
+    """Test VibeVoiceLoader._load_state_dict_into_model (streaming assign).
+
+    Plan 2026-08-28: dense checkpoints (sharded or single-file) are applied
+    per-tensor via ``_stream_apply_dense`` — no merged state dict, and every
+    tensor is cloned into private memory, severing the checkpoint's file
+    mapping (the mmap ghost behind the sharded 7B RAM bloat + Pin errors).
+    These tests use REAL safetensors files so the mmap semantics are
+    exercised end-to-end.
+    """
 
     def test_load_state_dict_single_safetensors(self, tmp_path):
-        """Test loading state dict from a single safetensors file."""
+        """Single-file safetensors: streamed per-tensor into the model."""
+        from safetensors.torch import save_file
+
         model_dir = tmp_path / "TestModel"
         model_dir.mkdir()
-        (model_dir / "model.safetensors").write_text("dummy")
+        w1 = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        w2 = torch.full((2, 2), 7.0)
+        save_file(
+            {"layer1.weight": w1, "layer2.weight": w2},
+            str(model_dir / "model.safetensors"),
+        )
 
-        model = MagicMock()
-        model.load_state_dict.return_value = ([], [])
+        model = _TwoParam()
+        result = VibeVoiceLoader._load_state_dict_into_model(
+            model=model,
+            model_path=str(model_dir),
+            model_type="official",
+            model_info={},
+            device=torch.device("cpu"),
+        )
 
-        with patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_load:
-            mock_load.return_value = {"key": "value"}
-
-            result = VibeVoiceLoader._load_state_dict_into_model(
-                model=model,
-                model_path=str(model_dir),
-                model_type="official",
-                model_info={},
-                device=torch.device("cpu"),
-            )
-
-            mock_load.assert_called_once_with(
-                str(model_dir / "model.safetensors"), device=torch.device("cpu")
-            )
-            # Plan 2026-08-18 D2: assign semantics via _apply_state_dict
-            model.load_state_dict.assert_called_once_with(
-                {"key": "value"}, strict=False, assign=True
-            )
-            assert result == model
+        assert result is model
+        assert torch.equal(model.layer1.weight.data, w1)
+        assert torch.equal(model.layer2.weight.data, w2)
+        assert model.layer1.weight.device.type == "cpu"
 
     def test_load_state_dict_standalone(self, tmp_path):
-        """Test loading state dict for standalone model type."""
+        """Standalone safetensors file: streamed per-tensor into the model."""
+        from safetensors.torch import save_file
+
         ckpt_file = tmp_path / "checkpoint.safetensors"
-        ckpt_file.write_text("dummy")
+        w1 = torch.ones(2, 2)
+        w2 = torch.full((2, 2), 2.0)
+        save_file({"layer1.weight": w1, "layer2.weight": w2}, str(ckpt_file))
 
-        model = MagicMock()
-        model.load_state_dict.return_value = ([], [])
+        model = _TwoParam()
+        result = VibeVoiceLoader._load_state_dict_into_model(
+            model=model,
+            model_path=None,
+            model_type="standalone",
+            model_info={"path": str(ckpt_file)},
+            device=torch.device("cpu"),
+        )
 
-        model_info = {"path": str(ckpt_file)}
-
-        with patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file") as mock_load:
-            mock_load.return_value = {"key": "value"}
-
-            result = VibeVoiceLoader._load_state_dict_into_model(
-                model=model,
-                model_path=None,
-                model_type="standalone",
-                model_info=model_info,
-                device=torch.device("cpu"),
-            )
-
-            mock_load.assert_called_once_with(str(ckpt_file), device=torch.device("cpu"))
-            assert result == model
+        assert result is model
+        assert torch.equal(model.layer1.weight.data, w1)
+        assert torch.equal(model.layer2.weight.data, w2)
 
     def test_load_state_dict_sharded(self, tmp_path):
-        """Test loading state dict from sharded safetensors checkpoint."""
+        """Sharded safetensors: every shard streams into the model."""
+        from safetensors.torch import save_file
+
         model_dir = tmp_path / "TestModel"
         model_dir.mkdir()
 
-        # Create shard files (dummy content)
-        (model_dir / "model-00001-of-00002.safetensors").write_text("dummy1")
-        (model_dir / "model-00002-of-00002.safetensors").write_text("dummy2")
-
+        w1 = torch.ones(2, 2)
+        w2 = torch.full((2, 2), 2.0)
+        save_file({"layer1.weight": w1}, str(model_dir / "model-00001-of-00002.safetensors"))
+        save_file({"layer2.weight": w2}, str(model_dir / "model-00002-of-00002.safetensors"))
         index_data = {
             "weight_map": {
                 "layer1.weight": "model-00001-of-00002.safetensors",
@@ -504,47 +525,30 @@ class TestVibeVoiceLoaderLoadStateDict:
         }
         (model_dir / "model.safetensors.index.json").write_text(json.dumps(index_data))
 
-        model = MagicMock()
-        model.load_state_dict.return_value = ([], [])
+        model = _TwoParam()
+        result = VibeVoiceLoader._load_state_dict_into_model(
+            model=model,
+            model_path=str(model_dir),
+            model_type="official",
+            model_info={},
+            device=torch.device("cpu"),
+        )
 
-        shard1_data = {"layer1.weight": "tensor1"}
-        shard2_data = {"layer2.weight": "tensor2"}
+        assert result is model
+        assert torch.equal(model.layer1.weight.data, w1)
+        assert torch.equal(model.layer2.weight.data, w2)
 
-        def mock_load(path, device=None):
-            if "00001" in path:
-                return shard1_data
-            elif "00002" in path:
-                return shard2_data
-            return {}
+    def test_load_state_dict_logs_missing_keys(self, tmp_path, caplog):
+        """Keys the checkpoint omits are reported as missing."""
+        import logging
+        from safetensors.torch import save_file
 
-        with patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file", side_effect=mock_load):
-            result = VibeVoiceLoader._load_state_dict_into_model(
-                model=model,
-                model_path=str(model_dir),
-                model_type="official",
-                model_info={},
-                device=torch.device("cpu"),
-            )
-
-            # Verify model.load_state_dict was called with merged dict
-            called_state_dict = model.load_state_dict.call_args[0][0]
-            assert "layer1.weight" in called_state_dict
-            assert "layer2.weight" in called_state_dict
-            assert called_state_dict["layer1.weight"] == "tensor1"
-            assert called_state_dict["layer2.weight"] == "tensor2"
-            assert result == model
-
-    def test_load_state_dict_logs_missing_keys(self, tmp_path):
-        """Test that missing keys are logged."""
         model_dir = tmp_path / "TestModel"
         model_dir.mkdir()
-        (model_dir / "model.safetensors").write_text("dummy")
+        save_file({"layer1.weight": torch.ones(2, 2)}, str(model_dir / "model.safetensors"))
 
-        model = MagicMock()
-        model.load_state_dict.return_value = (["missing_key1", "missing_key2"], [])
-
-        mock_state_dict = {"key": "value"}
-        with patch("ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file", return_value=mock_state_dict):
+        model = _TwoParam()
+        with caplog.at_level(logging.WARNING):
             VibeVoiceLoader._load_state_dict_into_model(
                 model=model,
                 model_path=str(model_dir),
@@ -553,59 +557,79 @@ class TestVibeVoiceLoaderLoadStateDict:
                 device=torch.device("cpu"),
             )
 
-            # Plan 2026-08-18 D2: assign semantics via _apply_state_dict
-            model.load_state_dict.assert_called_once_with(
-                mock_state_dict, strict=False, assign=True
-            )
+        assert any("Missing keys" in r.message for r in caplog.records)
 
-    def test_state_dict_released_after_load(self, tmp_path):
-        """Plan 2026-08-18 D7/RC-4: the state dict container is freed after load.
+    def test_assigned_weights_own_private_storage(self, tmp_path):
+        """mmap severing: assigned params are private clones, not file views.
 
-        With assign semantics the model owns the checkpoint tensors; the dict
-        that held them is dead weight and must be collectable once
-        ``_load_state_dict_into_model`` returns (no lingering reference).
+        safetensors tensors are zero-copy views into the mapped file; a view
+        retained by an offloaded parameter would pin the whole file mapping
+        in the process working set (ghost RAM + unstable cudaHostRegister
+        pins). A private clone's storage covers exactly its own bytes, while
+        a view's storage covers the file's entire data section.
         """
-        import gc
-        import weakref
+        from safetensors.torch import save_file
 
         model_dir = tmp_path / "TestModel"
         model_dir.mkdir()
-        (model_dir / "model.safetensors").write_text("dummy")
+        w1 = torch.ones(2, 2)
+        w2 = torch.full((2, 2), 2.0)
+        save_file(
+            {"layer1.weight": w1, "layer2.weight": w2},
+            str(model_dir / "model.safetensors"),
+        )
 
-        # A real module so assign=True genuinely takes ownership of the tensor.
-        class _OneParam(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.w = torch.nn.Parameter(torch.empty(2, 2))
+        model = _TwoParam()
+        VibeVoiceLoader._load_state_dict_into_model(
+            model=model,
+            model_path=str(model_dir),
+            model_type="official",
+            model_info={},
+            device=torch.device("cpu"),
+        )
 
-        # Plain dict cannot be weakref'd; a subclass with __weakref__ can.
-        class _WeakDict(dict):
-            __slots__ = ("__weakref__",)
-
-        model = _OneParam()
-        loaded_tensor = torch.ones(2, 2)
-        state_dict = _WeakDict({"w": loaded_tensor})
-        ref = weakref.ref(state_dict)
-
-        with patch(
-            "ComfyUI_VibeVoice.modules.loader.comfy.utils.load_torch_file",
-            return_value=state_dict,
-        ):
-            VibeVoiceLoader._load_state_dict_into_model(
-                model=model,
-                model_path=str(model_dir),
-                model_type="official",
-                model_info={},
-                device=torch.device("cpu"),
+        for param in (model.layer1.weight, model.layer2.weight):
+            own_bytes = param.numel() * param.element_size()
+            assert param.untyped_storage().nbytes() == own_bytes, (
+                "assigned parameter still sits in the checkpoint's file "
+                "mapping — the streaming assign must clone into private memory"
             )
 
-        # Drop the test's own handle and collect.
-        del state_dict
-        gc.collect()
 
-        assert ref() is None, "state dict container must be freed after load"
-        # The model now owns the checkpoint tensor (assign semantics).
-        assert torch.equal(model.w.data, loaded_tensor)
+class TestStreamApplyDense:
+    """Direct unit tests for VibeVoiceLoader._stream_apply_dense."""
+
+    def test_assigns_params_and_buffers_as_clones(self):
+        model = _TwoParam()
+        model.register_buffer("pos", torch.zeros(3))
+        w = torch.ones(2, 2)
+        pairs = [
+            ("layer1.weight", w),
+            ("layer2.weight", torch.full((2, 2), 2.0)),
+            ("pos", torch.ones(3)),
+        ]
+        missing, unexpected = VibeVoiceLoader._stream_apply_dense(model, iter(pairs))
+
+        assert unexpected == []
+        assert missing == []
+        assert torch.equal(model.layer1.weight.data, w)
+        # Clone semantics: the model owns private storage, not the source.
+        assert model.layer1.weight.data_ptr() != w.data_ptr()
+        assert torch.equal(model.pos, torch.ones(3))
+
+    def test_shape_mismatch_raises_friendly_error(self):
+        model = _TwoParam()
+        pairs = [("layer1.weight", torch.ones(3, 3))]
+        with pytest.raises(ValueError, match="shapes do not match"):
+            VibeVoiceLoader._stream_apply_dense(model, iter(pairs))
+
+    def test_unexpected_and_missing_reported(self):
+        model = _TwoParam()
+        pairs = [("layer1.weight", torch.ones(2, 2)), ("bogus.key", torch.zeros(1))]
+        missing, unexpected = VibeVoiceLoader._stream_apply_dense(model, iter(pairs))
+
+        assert unexpected == ["bogus.key"]
+        assert "layer2.weight" in missing
 
 
 class TestCleanupOldModels:

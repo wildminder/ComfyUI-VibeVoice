@@ -313,10 +313,19 @@ class GGUFTensor:
         import numpy as np
 
         data = reader_tensor.data
-        if data.dtype == np.uint8:
-            raw = torch.from_numpy(np.ascontiguousarray(data)).clone()
+        # Reader data is an mmap-backed READ-ONLY buffer; torch.from_numpy
+        # warns on non-writable arrays even when the tensor is immediately
+        # cloned afterwards. Materialize owned writable storage up front
+        # instead — this single copy IS the final residency.
+        arr = np.ascontiguousarray(data)
+        if arr.flags.writeable:
+            # Writable but still reader-owned (test doubles): clone on the
+            # torch side so the tensor never aliases the reader buffer.
+            raw = torch.from_numpy(arr).clone()
         else:
-            raw = torch.from_numpy(np.ascontiguousarray(data)).view(torch.uint8).clone()
+            raw = torch.from_numpy(arr.copy())
+        if data.dtype != np.uint8:
+            raw = raw.view(torch.uint8)
         shape = tuple(int(s) for s in reversed(reader_tensor.shape))
         return cls(raw=raw, ggml_type=reader_tensor.tensor_type, shape=shape)
 

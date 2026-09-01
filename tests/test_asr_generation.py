@@ -519,7 +519,7 @@ class TestASRProgressReporting:
 
     def _transcribe(self, mock_model, mock_processor, **kwargs):
         with patch("ComfyUI_VibeVoice.modules.asr_generation.extract_audio_tensor") as mock_extract, \
-             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBar") as mock_pbar_cls, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBarWithConsole") as mock_pbar_cls, \
              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.throw_exception_if_processing_interrupted") as mock_interrupt:
             mock_extract.return_value = (torch.randn(24000), 24000)
             mock_pbar = MagicMock()

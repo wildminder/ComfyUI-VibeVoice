@@ -12,8 +12,9 @@ import logging
 from typing import Optional, Tuple, List, Dict, Any
 
 import comfy.model_management as model_management
-from comfy.utils import ProgressBar
 from transformers.generation import BaseStreamer
+
+from .progress_utils import ProgressBarWithConsole
 
 from .asr_loader import VibeVoiceASRLoader, VibeVoiceASRModelHandler, LOADED_ASR_MODELS_CACHE, cleanup_asr_models
 from .patcher import VibeVoiceASRPatcher
@@ -40,7 +41,7 @@ class _ASRProgressStreamer(BaseStreamer):
     single 0->100% bar.
     """
 
-    def __init__(self, pbar: "ProgressBar", total: int):
+    def __init__(self, pbar: "ProgressBarWithConsole", total: int):
         self.pbar = pbar
         self.total = max(1, int(total))
         self.count = 0
@@ -442,7 +443,8 @@ def transcribe_audio(
     # Standard ComfyUI progress bar. HF generate() reports per-token progress
     # through a streamer (greedy/sampling only; beam search falls back to a
     # single 0->100% bar because plain token streamers are beam-incompatible).
-    pbar = ProgressBar(max_new_tokens)
+    # Drives both the frontend bar and the standard tqdm console bar.
+    pbar = ProgressBarWithConsole(max_new_tokens)
     use_streamer = generation_config.get("num_beams", 1) <= 1
     streamer = _ASRProgressStreamer(pbar, total=max_new_tokens) if use_streamer else None
 
@@ -489,6 +491,7 @@ def transcribe_audio(
         # Guarantee the final 100% event even when generation stopped early
         # (EOS before max_new_tokens) or raised.
         pbar.update_absolute(pbar.total)
+        pbar.close()
 
 
 def force_offload_asr_model(model_name: str, patcher=None) -> None:
