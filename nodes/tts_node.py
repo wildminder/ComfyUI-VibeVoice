@@ -66,7 +66,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
     - Independent diffusion steps and generated-length controls
     """
 
-    CATEGORY = "audio/tts"
+    CATEGORY = "WMNodes/sound/tts"
 
     @classmethod
     def define_schema(cls) -> io.Schema:

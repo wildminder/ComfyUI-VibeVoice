@@ -10,6 +10,7 @@ to be importable (consistent with the rest of the offline test harness).
 """
 
 import os
+import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 README_PATH = os.path.join(ROOT, "README.md")
@@ -128,37 +129,63 @@ class TestReadmeUnifiedTtsNode:
         assert "single canonical TTS node" in text
         assert "`VibeVoice TTS`" in text
 
-    def test_legacy_realtime_mentions_are_deprecation_adjacent(self):
-        """Current-usage sections must present the old node as deprecated.
+    def test_removed_realtime_node_is_documented_as_removed(self):
+        """Current-usage sections must present the old node as removed.
 
-        Historical changelog entries describe past releases and are exempt; the
-        newest changelog entry must mark the shim deprecated.
+        The node no longer exists, so the README cannot offer it as deprecated
+        but working — that would send users looking for a menu entry that is not
+        there. Any mention outside the changelog must say it was removed and
+        name the canonical node to use instead. Historical changelog entries
+        describe past releases and are exempt.
         """
         text = _read(README_PATH)
-        usage, _sep, changelog = text.partition("<!-- CHANGELOG -->")
+        usage, _sep, _changelog = text.partition("<!-- CHANGELOG -->")
         lines = usage.splitlines()
         found = False
         for index, line in enumerate(lines):
             if "VibeVoiceRealtime" not in line and "VibeVoice Realtime TTS" not in line:
                 continue
             found = True
-            window = "\n".join(lines[max(0, index - 5): index + 6]).lower()
-            assert "deprecat" in window, (
-                "README mentions the legacy realtime node outside a deprecation note."
+            window = "\n".join(lines[max(0, index - 6): index + 7]).lower()
+            assert "remov" in window, (
+                "README mentions the deleted realtime node without saying it was removed."
             )
             assert "vibevoice tts" in window, (
-                "README must point the legacy realtime node at the canonical TTS node."
+                "README must point the removed realtime node at the canonical TTS node."
             )
-        assert found, "README must document the deprecated legacy realtime node."
+        assert found, "README must tell users what to do with saved realtime workflows."
 
-    def test_latest_changelog_entry_marks_shim_deprecated(self):
+    def test_latest_changelog_entry_records_the_removal(self):
+        """A removed node must be announced in the release that removed it.
+
+        The removal is a user-visible change, so it belongs in the newest entry
+        rather than being backdated into an earlier one: a reader comparing
+        releases has to be able to find out which version dropped the node.
+        """
         text = _read(README_PATH)
         _sep, _marker, changelog = text.partition("<!-- CHANGELOG -->")
         newest = changelog.split("<summary>", 1)[1].split("</details>", 1)[0]
-        assert "2.9.0" in newest
+        assert "2.10.0" in newest
         newest_lower = newest.lower()
-        assert "deprecat" in newest_lower
+        assert "remov" in newest_lower
         assert "vibevoice tts" in newest_lower
+
+    def test_readme_version_matches_pyproject(self):
+        """The changelog headline and the package version must not drift apart."""
+        with open(os.path.join(ROOT, "pyproject.toml"), "r", encoding="utf-8") as fh:
+            declared = None
+            for line in fh:
+                if line.startswith("version"):
+                    declared = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        assert declared, "pyproject.toml must declare a version"
+        text = _read(README_PATH)
+        _sep, _marker, changelog = text.partition("<!-- CHANGELOG -->")
+        newest = changelog.split("<summary>", 1)[1].split("</details>", 1)[0]
+        assert declared in newest, (
+            f"pyproject.toml declares {declared}, but the newest README changelog "
+            f"entry does not announce it. Bump both together or neither."
+        )
 
     def test_readme_documents_realtime_preset_folder_and_pt_contract(self):
         text = _read(README_PATH)
@@ -197,10 +224,18 @@ class TestNodeSchemaDocs:
         assert "standard and realtime" in text.lower()
         assert "voice_preset" in text
 
-    def test_realtime_shim_is_documented_as_deprecated_delegate(self):
-        text = _read(REALTIME_NODE_PATH)
-        assert "deprecated" in text.lower()
-        assert "VibeVoiceTTSNode" in text
+    def test_realtime_node_source_is_gone(self):
+        """The removed node must not creep back as a source file.
+
+        Its absence is the whole point of the removal: a reintroduced
+        ``realtime_node.py`` would be a second way to run realtime models, and
+        the two would drift apart again the way the shim did.
+        """
+        assert not os.path.exists(REALTIME_NODE_PATH), (
+            "nodes/realtime_node.py was removed; realtime models run on "
+            "VibeVoiceTTSNode. Re-adding the file reintroduces a second, "
+            "separately-maintained generation path."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +243,6 @@ class TestNodeSchemaDocs:
 # edited out of the README without a test failing and naming what went missing.
 # ---------------------------------------------------------------------------
 
-MATRIX_DOC_PATH = os.path.join(
-    ROOT, "docs", "plans", "2026-09-26-two-version-matrix.md"
-)
 STREAMING_INFERENCE_PATH = os.path.join(
     ROOT, "src", "vibevoice", "modular", "modeling_vibevoice_streaming_inference.py"
 )
@@ -415,18 +447,48 @@ class TestDualApiCacheShimIsDocumented:
 
 
 class TestDocsBackedByTheMatrixFile:
-    """The numbers quoted in the README must exist in the recorded matrix."""
+    """The numbers quoted in the README must be recorded somewhere the repo owns.
 
-    def test_matrix_doc_exists(self):
-        assert os.path.isfile(MATRIX_DOC_PATH), (
-            "The recorded two-version matrix is the authority for every version "
-            "claim in the README; it must not be deleted."
+    The authority used to be an external matrix document, which made the
+    published test suite depend on a file a clone does not have: the tests
+    errored for anyone who did not have the development tree. The measured
+    values are asserted directly here instead, so the guard still runs — a
+    version claim in the README with nothing behind it still fails — without
+    reaching outside the repository.
+    """
+
+    # The measured facts the README's support-matrix section quotes.
+    MEASURED = {
+        "4.57.6": "the last 4.x line the cache shim was exercised against",
+        "5.3.0": "the only fully green line for the realtime family",
+    }
+
+    def test_readme_support_matrix_states_the_measured_versions(self):
+        text = _read(README_PATH)
+        for version, role in self.MEASURED.items():
+            assert version in text, (
+                f"The README's support matrix must state transformers {version} "
+                f"({role}); it is the version the declared range is pinned to."
+            )
+
+    def test_readme_support_matrix_is_present(self):
+        text = _read(README_PATH)
+        assert "transformers" in text and "|" in text, (
+            "The README must keep a support-matrix table stating which "
+            "transformers versions this node supports, so a user can tell "
+            "whether their environment is covered."
         )
 
-    def test_readme_version_claims_appear_in_the_matrix(self):
-        matrix = _read(MATRIX_DOC_PATH)
-        for claim in ("4.57.6", "5.3.0", "11 passed"):
-            assert claim in matrix, (
-                f"The README quotes '{claim}'; the matrix must record it too, or "
-                f"the README is citing a number nobody measured."
-            )
+    def test_readme_does_not_claim_a_version_nobody_measured(self):
+        """A version outside the measured set must not be presented as supported."""
+        text = _read(README_PATH)
+        section = text.partition("| Model family |")[2].partition("\n\n")[0]
+        for line in section.splitlines():
+            if "transformers" in line and re.search(r"(4|5)\.\d+\.\d+", line):
+                for version in re.findall(r"\d+\.\d+\.\d+", line):
+                    assert version in self.MEASURED, (
+                        f"The README's support matrix presents transformers "
+                        f"{version} as supported, but {version} is not a measured "
+                        f"version. Run the real-checkpoint tests against it before "
+                        f"claiming support."
+                    )

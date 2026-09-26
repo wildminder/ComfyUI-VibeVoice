@@ -3,6 +3,7 @@
 import os
 import pytest
 
+
 try:
     import tomllib
 except ImportError:
@@ -217,16 +218,21 @@ class TestTransformersRangeHonesty:
     silent: a wrong cache shim conditions the model on nothing and produces
     plausible-looking audio.
 
-    The authority for "validated" is
-    ``docs/plans/2026-09-26-two-version-matrix.md`` — the recorded two-version
-    matrix. These tests keep the declaration and that record in step, so a future
-    5.x bump fails loudly in the default suite instead of at a user's machine.
+    These tests keep the declaration and the set of measured versions in step, so
+    a future 5.x bump fails loudly in the default suite instead of at a user's
+    machine.
+
+    The measured set is recorded here as a literal rather than read from a
+    development document: it is a fact about the shipped code, and the published
+    suite must not depend on files a clone does not have. The two-generation
+    record itself, the exact commands and the reproduction steps live in the
+    support-matrix section of the README.
     """
 
-    MATRIX_PATH = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "docs", "plans", "2026-09-26-two-version-matrix.md",
-    )
+    # The ``transformers`` major lines this node has actually been exercised on.
+    # Widen MEASURED_MAJORS only after running the real-checkpoint generation
+    # tests against the new major; the declared range is then widened to match.
+    MEASURED_MAJORS = ("4", "5")
 
     @classmethod
     def _spec(cls) -> str:
@@ -237,11 +243,6 @@ class TestTransformersRangeHonesty:
         )
         return specs[0]
 
-    @classmethod
-    def _matrix_text(cls) -> str:
-        with open(cls.MATRIX_PATH, "r", encoding="utf-8") as fh:
-            return fh.read()
-
     def test_transformers_range_is_upper_bounded(self):
         """An unbounded range is exactly the F12 defect; it must not come back."""
         spec = self._spec()
@@ -249,8 +250,8 @@ class TestTransformersRangeHonesty:
             f"pyproject.toml declares '{spec}' with no upper bound, so a future "
             f"transformers 5.x/6.x install is accepted without validation. The "
             f"checkpoint targets the 4.5x generation and the dual-API cache shim "
-            f"was measured against 4.57.6 and 5.3.0 only. Cap the range, or extend "
-            f"docs/plans/2026-09-26-two-version-matrix.md with a green row first."
+            f"was measured against 4.57.6 and 5.3.0 only. Cap the range, or add the "
+            f"new major to MEASURED_MAJORS after running the real-checkpoint tests."
         )
 
     def test_requirements_txt_bound_matches_pyproject(self):
@@ -270,10 +271,10 @@ class TestTransformersRangeHonesty:
     def test_range_matches_the_version_the_suite_runs_against(self):
         """The installed transformers must satisfy the declared range.
 
-        This is the drift guard the plan asks for. It is allowed to be *outside*
-        the range only when the matrix explicitly records that version as
-        measured but not admitted — a development machine is allowed to run ahead
-        of what the package declares, an installable version is not.
+        This is the drift guard. It is allowed to be *outside* the range only when
+        that major is recorded here as measured but not admitted — a development
+        machine is allowed to run ahead of what the package declares, an
+        installable version is not.
         """
         spec = self._spec()
         installed = _installed_transformers_version()
@@ -286,19 +287,16 @@ class TestTransformersRangeHonesty:
             return
 
         major = installed.split(".")[0]
-        matrix = self._matrix_text()
-        assert f"| **4.{major}" in matrix or f"| **{major}." in matrix, (
+        assert major in self.MEASURED_MAJORS, (
             f"The suite is running transformers {installed}, which the declared "
-            f"range '{spec}' does not admit, and "
-            f"docs/plans/2026-09-26-two-version-matrix.md has no row for the "
-            f"{major}.x line. Either the range is wrong or the matrix is stale — "
-            f"an unrecorded major is exactly how F12 happened."
+            f"range '{spec}' does not admit, and {major}.x is not recorded in "
+            f"MEASURED_MAJORS. Either the range is wrong or the measured set is "
+            f"stale — an unrecorded major is exactly how F12 happened."
         )
 
-    def test_every_admitted_major_has_a_matrix_row(self):
-        """A version the range admits must appear in the matrix as a measured row."""
+    def test_every_admitted_major_has_been_measured(self):
+        """A version the range admits must be recorded as measured."""
         spec = self._spec()
-        matrix = self._matrix_text()
         majors = set()
         for part in spec.split(",", 1)[1:]:
             part = part.strip()
@@ -308,9 +306,9 @@ class TestTransformersRangeHonesty:
             f"'{spec}' has no upper bound to check; see "
             f"test_transformers_range_is_upper_bounded."
         )
-        for major in majors:
-            assert f"| **4.{major}" in matrix or f"| **{major}." in matrix, (
+        for major in sorted(majors):
+            assert major in self.MEASURED_MAJORS, (
                 f"The declared range admits transformers {major}.x, but "
-                f"docs/plans/2026-09-26-two-version-matrix.md records no {major}.x "
-                f"row. Widening the range without a measured row is the F12 defect."
+                f"{major}.x is not in MEASURED_MAJORS. Widening the range without "
+                f"measuring the new major first is the F12 defect."
             )

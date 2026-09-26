@@ -43,7 +43,7 @@ class VibeVoiceASRNode(io.ComfyNode):
     - Handles up to 60 minutes of audio in a single pass
     """
 
-    CATEGORY = "audio/asr"
+    CATEGORY = "WMNodes/sound/asr"
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -221,7 +221,7 @@ class VibeVoiceASRNode(io.ComfyNode):
             if external_model.get("is_streaming"):
                 raise ValueError(
                     "The provided external model is a streaming (realtime) model. "
-                    "Use the 'VibeVoice Realtime TTS' node for streaming models; "
+                    "Use the 'VibeVoice TTS' node for TTS models, including realtime; "
                     "the ASR node requires a VibeVoice ASR model."
                 )
             # Guard: TTS models cannot transcribe audio. Bundles explicitly

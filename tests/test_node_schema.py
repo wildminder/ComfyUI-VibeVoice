@@ -4,7 +4,6 @@ import pytest
 from unittest.mock import patch
 
 from ComfyUI_VibeVoice.nodes.tts_node import VibeVoiceTTSNode
-from ComfyUI_VibeVoice.nodes.realtime_node import VibeVoiceRealtimeNode
 from ComfyUI_VibeVoice.nodes.asr_node import VibeVoiceASRNode
 from ComfyUI_VibeVoice.modules.device_utils import get_device_options
 
@@ -104,7 +103,7 @@ class TestVibeVoiceTTSNodeSchema:
 
     def test_schema_category(self):
         schema = self._get_schema()
-        assert schema.category == "audio/tts"
+        assert schema.category == "WMNodes/sound/tts"
 
     def test_schema_has_model_name_input(self):
         assert "model_name" in self._get_input_ids()
@@ -160,18 +159,6 @@ class TestVibeVoiceTTSNodeSchema:
         schema = self._get_schema()
         assert len(schema.outputs) >= 1
 
-
-class TestLegacyRealtimeInputOrder:
-    """The legacy realtime schema order is an executable compatibility lock."""
-
-    def test_realtime_input_order_matches_legacy_snapshot(self):
-        schema = VibeVoiceRealtimeNode.define_schema()
-        input_ids = tuple(inp.id for inp in schema.inputs)
-        assert input_ids[:len(LEGACY_REALTIME_INPUT_IDS)] == LEGACY_REALTIME_INPUT_IDS
-        assert input_ids[len(LEGACY_REALTIME_INPUT_IDS):] == (
-            "max_new_tokens",
-            "voice_preset",
-        )
 
 
 class TestVibeVoiceTTSNodeValidate:

@@ -108,7 +108,7 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
     selected by the ``config_name`` dropdown.
     """
 
-    CATEGORY = "audio/tts"
+    CATEGORY = "WMNodes/sound/tts"
 
     @classmethod
     def define_schema(cls) -> io.Schema:

@@ -39,7 +39,7 @@ import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DIAG_PATH = REPO_ROOT / "diag_realtime_quality.py"
+DIAG_PATH = REPO_ROOT / ".dev" / "tools" / "diag_realtime_quality.py"
 
 OPT_IN_ENV = "RUN_VIBEVOICE_E2E"
 MODEL_DIR_ENV = "VIBEVOICE_REALTIME_MODEL_DIR"
@@ -209,7 +209,15 @@ def diag():
     the test asserts the number the diagnostic prints, not a reimplementation
     of it. Loading by path keeps ``import diag_realtime_quality`` out of the
     default suite's collection.
+
+    The script is a local development tool and is not part of the published
+    repository, so a clone without it must skip rather than fail. Opting in is
+    checked first: these measurements need a real checkpoint and a GPU, so a
+    developer running them is by definition the person who has the tool.
     """
+    require_opt_in()
+    if not DIAG_PATH.is_file():
+        pytest.skip(f"diagnostic script not present: {DIAG_PATH}")
     spec = importlib.util.spec_from_file_location("diag_realtime_quality", DIAG_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
