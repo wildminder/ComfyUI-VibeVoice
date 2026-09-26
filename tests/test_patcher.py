@@ -94,7 +94,7 @@ class TestVibeVoicePatcherPatchModel:
         mock_inner_model = MagicMock()
         handler.load_model = MagicMock()
 
-        def side_effect_load(device, attn):
+        def side_effect_load(device, attention_mode="sdpa"):
             handler.model = mock_inner_model
         handler.load_model.side_effect = side_effect_load
 

@@ -60,12 +60,21 @@ class BaseVibeVoiceLoader:
     def _resolve_official_model_dir(model_name: str) -> str:
         """Return ``<tts_folder>/VibeVoice/<model_name>`` for an official model.
 
-        Uses ComfyUI's ``folder_paths`` so the result follows the same layout
-        the TTS and ASR loaders previously computed by hand.
+        Registered tts roots are searched in order and the first candidate
+        directory that already exists wins, so an official model placed
+        manually under a secondary root (extra_model_paths.yaml) is picked up
+        instead of re-downloaded into the primary root. When no candidate
+        exists anywhere, the first tts folder's path is returned as the
+        download target.
         """
         tts_paths = folder_paths.get_folder_paths("tts")
-        base_path = tts_paths[0] if tts_paths else os.path.join(folder_paths.models_dir, "tts")
-        return os.path.join(base_path, "VibeVoice", model_name)
+        if not tts_paths:
+            tts_paths = [os.path.join(folder_paths.models_dir, "tts")]
+        candidates = [os.path.join(p, "VibeVoice", model_name) for p in tts_paths]
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                return candidate
+        return candidates[0]
 
     # ------------------------------------------------------------------
     # Download

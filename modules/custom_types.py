@@ -6,8 +6,10 @@ between nodes in a modular architecture.
 Types:
 - VibeVoiceModel: A pre-loaded VibeVoice model bundle (state dict + config +
   processor + instantiated model) produced by the "Load VibeVoice Model" node
-  and consumed by the TTS / Realtime / ASR nodes via their optional
-  ``external_model`` input.
+  and consumed by the canonical TTS node and the ASR node via their optional
+  ``external_model`` input. The bundle carries both standard and realtime TTS
+  checkpoints as well as ASR checkpoints; the consuming node dispatches on the
+  ``is_streaming`` / ``is_asr`` flags.
 
 The runtime value passed through the wire is a dict containing:
 
@@ -18,7 +20,8 @@ The runtime value passed through the wire is a dict containing:
         "model": torch.nn.Module,                 # instantiated model (CPU)
         "model_name": str,                        # display name / cache key seed
         "source_path": str,                       # original file path (for logging)
-        "is_streaming": bool,                     # streaming model flag
+        "is_streaming": bool,                     # realtime (streaming TTS) flag
+        "is_asr": bool,                           # ASR flag
     }
 
 This follows the same pattern as VoxCPM's ``VoiceCloningConfig`` custom type

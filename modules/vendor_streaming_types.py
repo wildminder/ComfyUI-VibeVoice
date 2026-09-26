@@ -47,6 +47,23 @@ def register_vendored_types(register) -> None:
     except Exception as e:  # pragma: no cover
         _log_skip("Qwen2RMSNorm", e)
 
+    # transformers-native VibeVoice-ASR norm classes (checkpoint
+    # microsoft/VibeVoice-ASR-HF). Both are T5-style RMSNorm — fp32 stats,
+    # scale AFTER cast-back, `variance_epsilon` attr — identical math to
+    # Qwen2RMSNorm.
+    import importlib
+
+    for mod_path, cls_name in (
+        ("transformers.models.vibevoice_asr.modeling_vibevoice_asr", "VibeVoiceAsrRMSNorm"),
+        ("transformers.models.vibevoice_acoustic_tokenizer.modeling_vibevoice_acoustic_tokenizer",
+         "VibeVoiceAcousticTokenizerRMSNorm"),
+    ):
+        try:
+            entries.append((getattr(importlib.import_module(mod_path), cls_name),
+                            _compute_qwen2rmsnorm))
+        except Exception as e:  # pragma: no cover - older transformers lack these
+            _log_skip(cls_name, e)
+
     import logging
 
     log = logging.getLogger(__name__)

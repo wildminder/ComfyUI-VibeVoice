@@ -288,7 +288,7 @@ def craft_kquant_blocks(qtype_name: str, n_elements: int, seed: int = 0):
     return b
 
 
-def write_synthetic_gguf(path, spec, seed: int = 0):
+def write_synthetic_gguf(path, spec, seed: int = 0, flat_pool: set = None):
     """Write a .gguf file from ``spec`` and return ``path``.
 
     Args:
@@ -298,6 +298,10 @@ def write_synthetic_gguf(path, spec, seed: int = 0):
             Float types: 'F32' / 'F16' / 'BF16'. Quant types: 'Q8_0' /
             'Q4_K' / 'Q5_K' / 'Q6_K'.
         seed: Deterministic content seed.
+        flat_pool: Optional set of tensor names to lay out as a quantui-rs
+            style FLAT block pool (whole-block C-order bytes, header rows
+            below the block size). Mimics third-party converters that
+            quantize small-kernel conv weights.
 
     Returns:
         The written path (as given).
@@ -306,6 +310,7 @@ def write_synthetic_gguf(path, spec, seed: int = 0):
     import gguf as _gguf
     from gguf.constants import GGMLQuantizationType as T
 
+    flat_pool = flat_pool or set()
     writer = _gguf.GGUFWriter(str(path), "vibevoice")
     try:
         for i, (name, kind, shape) in enumerate(spec):
@@ -327,15 +332,45 @@ def write_synthetic_gguf(path, spec, seed: int = 0):
                                   raw_dtype=T.BF16)
             elif kind in _GGUF_BLOCK_SHAPES:
                 block_size, type_size = _GGUF_BLOCK_SHAPES[kind]
-                if n_elem % block_size != 0 or shape[-1] % block_size != 0:
+                if name in flat_pool:
+                    # quantui-rs layout: header keeps the LOGICAL ggml dims
+                    # (ne[0] = kernel size, possibly < block size) while the
+                    # payload is a flat pool of whole blocks. gguf-py's writer
+                    # cannot express sub-block rows (it derives logical dims
+                    # from the byte shape), so bypass its byte-shape
+                    # conversion for this one tensor exactly like quantui-rs
+                    # writes raw headers.
+                    if n_elem % block_size != 0:
+                        raise ValueError(
+                            f"{kind} flat pool requires a whole-block "
+                            f"element count, got {shape}"
+                        )
+                    bytes_flat = craft_kquant_blocks(kind, n_elem, seed=seed * 1000 + i)
+                    import gguf.gguf_writer as _gw
+
+                    _orig_conv = _gw.quant_shape_from_byte_shape
+                    _gw.quant_shape_from_byte_shape = (
+                        lambda shp, qtype: tuple(shp)
+                    )
+                    try:
+                        # raw_shape = torch-logical shape; the writer stores
+                        # header dims REVERSED, giving ggml ne order with
+                        # ne[0] = last torch dim (the kernel size).
+                        writer.add_tensor(name, bytes_flat.reshape(-1),
+                                          raw_shape=shape,
+                                          raw_dtype=getattr(T, kind))
+                    finally:
+                        _gw.quant_shape_from_byte_shape = _orig_conv
+                elif n_elem % block_size != 0 or shape[-1] % block_size != 0:
                     raise ValueError(
                         f"{kind} requires last dim multiple of {block_size}: {shape}"
-                        )
-                bytes_flat = craft_kquant_blocks(kind, n_elem, seed=seed * 1000 + i)
-                rows = shape[0]
-                bytes_per_row = shape[-1] // block_size * type_size
-                writer.add_tensor(name, bytes_flat.reshape(rows, bytes_per_row),
-                                  raw_dtype=getattr(T, kind))
+                    )
+                else:
+                    bytes_flat = craft_kquant_blocks(kind, n_elem, seed=seed * 1000 + i)
+                    rows = shape[0]
+                    bytes_per_row = shape[-1] // block_size * type_size
+                    writer.add_tensor(name, bytes_flat.reshape(rows, bytes_per_row),
+                                      raw_dtype=getattr(T, kind))
             else:
                 raise ValueError(f"write_synthetic_gguf: unknown kind {kind!r}")
         writer.write_header_to_file()

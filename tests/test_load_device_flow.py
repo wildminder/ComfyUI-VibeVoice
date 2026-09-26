@@ -877,18 +877,29 @@ class TestP42GpuPeakVram:
         patcher.load_device = CUDA
         patcher.pinned = set()
 
+        # ``max_memory_allocated`` is a *process-wide* peak, and
+        # ``reset_peak_memory_stats`` only resets the counter to whatever is
+        # already resident — it does not free anything. A real checkpoint left
+        # on the device by an earlier test (the opt-in RUN_VIBEVOICE_E2E suite
+        # keeps one) therefore lands in the peak and this 4 MB model is measured
+        # as 2.7 GB. Subtract the resident baseline so the number is this
+        # model's own peak, which is what the assertion is about.
+        torch.cuda.synchronize()
+        resident_before = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
         with patch("comfy.model_patcher.ModelPatcher.patch_model"):
             patcher.patch_model(device_to=CUDA)
+        torch.cuda.synchronize()
 
         model_bytes = sum(
             p.numel() * p.element_size() for p in handler.model.parameters()
         )
-        peak = torch.cuda.max_memory_allocated()
+        peak = torch.cuda.max_memory_allocated() - resident_before
         # Peak must be bounded by ~1.5× model size (single transfer + slack),
         # never ~2× (state-dict + model simultaneously on GPU).
         assert peak <= int(model_bytes * 1.5), (
-            f"peak VRAM {peak} exceeds 1.5x model size {model_bytes}"
+            f"peak VRAM {peak} exceeds 1.5x model size {model_bytes} "
+            f"(resident baseline {resident_before} subtracted)"
         )
         # Cleanup
         handler.model.to(CPU)

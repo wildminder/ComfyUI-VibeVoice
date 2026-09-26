@@ -1,13 +1,12 @@
 #!/usr/bin/env python
-"""End-to-end intelligibility smoke test for the (fixed) non-streaming TTS node.
+"""End-to-end intelligibility smoke test for the canonical VibeVoice TTS node.
 
 BUG-006 acceptance gate (Step 6 of the fix plan). The unit tests only prove the
 *algorithm* is correct; the real question — "is the spoken content still gibberish?" —
-can only be answered on the actual checkpoint + GPU. This script runs the same code path
-the ComfyUI node uses (`modules.generation.generate_audio`) and writes `.wav` files for
-you to LISTEN to.
+can only be answered on the actual checkpoint + GPU. This script runs the same code paths
+the ComfyUI node uses and writes `.wav` files for you to LISTEN to.
 
-Run it from the ComfyUI embedded Python (the same one that runs the node), e.g.:
+Standard (reference-audio) branch, using ``modules.generation.generate_audio``::
 
     C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe e2e_smoke_test.py \
         --model VibeVoice-1.5B --voice C:/path/voice1.wav --voice C:/path/voice2.wav
@@ -15,6 +14,16 @@ Run it from the ComfyUI embedded Python (the same one that runs the node), e.g.:
 If you have no reference wavs handy, the script falls back to a synthetic tone so the
 pipeline still executes — but for a real intelligibility check, pass real voice clips
 (3–10 s of clean speech per speaker).
+
+Realtime branch, using the official cached-prompt adapter. The realtime checkpoint is a
+separate single-speaker architecture: it needs an official ``.pt`` voice prompt and does
+NOT accept reference wavs::
+
+    C:/_Dev/ComfyUI_dev/ComfyUI_t211c130p313/python_embeded/python.exe e2e_smoke_test.py \
+        --realtime-model VibeVoice-Realtime-0.5B \
+        --voice-preset models/tts/VibeVoice/voices/en-Carter_man.pt
+
+``--realtime-model`` and ``--voice-preset`` must be supplied together.
 
 What it checks automatically (and prints):
   * generation completes without error,
@@ -138,6 +147,68 @@ def _report(name: str, waveform: np.ndarray, sample_rate: int) -> dict:
     return {"duration": dur, "rms": rms, "finite": finite, "numel": len(w)}
 
 
+def _run_realtime(args) -> int:
+    """Generate one realtime sample from an official cached .pt voice prompt.
+
+    The realtime branch uses the same cached-prompt adapter as the canonical
+    ``VibeVoice TTS`` node. It never falls back to standard reference-audio
+    generation: a realtime checkpoint with raw reference wavs is not a valid
+    input.
+    """
+    # Imported only in the realtime branch so --help and the standard path keep
+    # their lightweight import behavior.
+    try:
+        from ComfyUI_VibeVoice.modules.generation import load_vibevoice_model
+        from ComfyUI_VibeVoice.modules.realtime_generation import generate_realtime_audio
+        from ComfyUI_VibeVoice.modules.voice_presets import load_voice_preset
+    except Exception as e:  # pragma: no cover
+        print("ERROR: could not import the realtime modules. Run this from the "
+              "ComfyUI embedded Python with the custom-node folder on PYTHONPATH.", file=sys.stderr)
+        print(f"  ({e})", file=sys.stderr)
+        return 2
+
+    preset_path = Path(args.voice_preset)
+    if not preset_path.is_file():
+        print(f"ERROR: voice preset not found: {preset_path}", file=sys.stderr)
+        return 2
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading realtime model '{args.realtime_model}' on device={args.device} "
+          f"dtype={args.dtype} ...")
+    patcher, model, processor = load_vibevoice_model(
+        model_name=args.realtime_model, device=args.device, dtype=args.dtype
+    )
+
+    import comfy.model_management as model_management
+
+    print(f"Loading voice preset '{preset_path.name}' ...")
+    preset = load_voice_preset(str(preset_path.resolve()), model_management.get_torch_device())
+
+    print("\nGenerating realtime sample ...")
+    wav, rate = generate_realtime_audio(
+        model=model,
+        processor=processor,
+        text=args.realtime_script,
+        voice_preset=preset,
+        cfg_scale=args.cfg_scale,
+        diffusion_steps=args.inference_steps,
+        max_new_tokens=args.max_new_tokens or None,
+        seed=args.seed,
+    )
+    report = _report("realtime", wav, rate)
+    _save_wav(str(outdir / "e2e_realtime.wav"), wav, rate)
+
+    print("\n=== VERDICT (manual) ===")
+    print(f"  Wrote wav to: {(outdir / 'e2e_realtime.wav').resolve()}")
+    print("  Listen to it and confirm the spoken words match the realtime script")
+    print("  in the timbre of the selected voice preset.")
+    print(f"  duration={report['duration']:.2f}s rms={report['rms']:.4f} "
+          f"finite={report['finite']}")
+    return 0 if report["finite"] and report["rms"] > 1e-4 else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="BUG-006 e2e intelligibility smoke test")
     ap.add_argument("--model", default="VibeVoice-1.5B", help="TTS model name from MODEL_CONFIGS")
@@ -150,6 +221,27 @@ def main():
     ap.add_argument("--voice", action="append", default=[], help="reference wav (repeat per speaker)")
     ap.add_argument("--outdir", default="e2e_output")
     ap.add_argument(
+        "--realtime-model",
+        default=None,
+        help=(
+            "Realtime checkpoint name (e.g. VibeVoice-Realtime-0.5B). Enables the "
+            "cached-voice-prompt branch and requires --voice-preset."
+        ),
+    )
+    ap.add_argument(
+        "--voice-preset",
+        default=None,
+        help=(
+            "Official cached .pt voice prompt for the realtime branch. "
+            "Requires --realtime-model."
+        ),
+    )
+    ap.add_argument(
+        "--realtime-script",
+        default="This is a realtime acceptance test for the VibeVoice realtime model.",
+        help="Single-speaker script used by the realtime branch.",
+    )
+    ap.add_argument(
         "--script1",
         default="Speaker 1: Hello, this is a test of the text to speech system.",
     )
@@ -159,6 +251,16 @@ def main():
         "Speaker 2: And I am the second speaker, confirming the cloning works.",
     )
     args = ap.parse_args()
+
+    if bool(args.realtime_model) != bool(args.voice_preset):
+        print(
+            "ERROR: --realtime-model and --voice-preset must be supplied together.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.realtime_model:
+        return _run_realtime(args)
 
     # Late imports so the script fails with a helpful message outside ComfyUI.
     try:
@@ -230,9 +332,10 @@ def main():
     if r1 and r2:
         ratio = r2["duration"] / r1["duration"] if r1["duration"] else 0
         print(f"  2-speaker/1-speaker duration ratio = {ratio:.2f}x (expect > 1.5x if target-length).")
-    print("  If output is STILL gibberish, the fallback is Option B: point the node at the")
-    print("  streaming checkpoint 'VibeVoice-Realtime-0.5B' (which has tts_language_model).")
+    print("  If the standard output is still wrong, verify the reference wavs and")
+    print("  script first. The realtime checkpoint is a separate architecture: run it")
+    print("  through --realtime-model with --voice-preset, never as a standard fallback.")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

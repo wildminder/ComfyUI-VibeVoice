@@ -5,17 +5,49 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from ComfyUI_VibeVoice.modules.device_utils import (
+    DEVICE_AUTO,
     DEVICE_CPU,
     DEVICE_CUDA,
     DEVICE_MPS,
     DEVICE_XPU,
     DEVICE_NPU,
     get_available_devices,
+    get_device_options,
+    get_device_option_labels,
     get_torch_device,
     get_offload_device,
     is_gpu_device,
     get_device_display_name,
 )
+
+
+class TestGetDeviceOptions:
+    """The device combo must offer every value get_torch_device() accepts.
+
+    ComfyUI validates a Combo input against its ``options`` list and raises
+    "Value not in list" *before* ``execute()`` runs, so a supported runtime
+    value missing from the options makes every saved workflow using it fail
+    validation. ``"auto"`` is accepted by get_torch_device(), so it must be
+    listed.
+    """
+
+    def test_includes_auto(self):
+        assert DEVICE_AUTO in get_device_options()
+
+    def test_auto_is_last_so_widget_indices_are_stable(self):
+        options = get_device_options()
+        assert options[-1] == DEVICE_AUTO
+        # Everything before it keeps its historical index, so existing saved
+        # widgets_values still line up.
+        assert options[:-1] == get_available_devices()
+
+    def test_every_offered_value_resolves_to_a_device(self):
+        for option in get_device_options():
+            assert isinstance(get_torch_device(option), torch.device)
+
+    def test_option_labels_cover_every_option(self):
+        assert set(get_device_option_labels()) == set(get_device_options())
+
 
 
 class TestGetAvailableDevices:

@@ -1,62 +1,70 @@
-"""VibeVoice Realtime TTS Node - Streaming TTS for VibeVoice-Realtime-0.5B (V3 Schema).
+"""Deprecated VibeVoice Realtime TTS node - forwarding compatibility shim.
 
-Exposes the ``streaming_tts``-type model (``VibeVoice-Realtime-0.5B``) through the
-same patcher / attention / VRAM machinery as the standard TTS node, but routes
-generation through the streaming inference path (``model.generate`` with
-``tts_text_ids`` / ``all_prefilled_outputs``).
+The canonical implementation is :class:`~nodes.tts_node.VibeVoiceTTSNode`. This
+class exists only so saved workflows that reference the old ``VibeVoiceRealtime``
+node ID keep loading and running. It contains no model loading, preprocessing,
+or generation logic; every call is delegated to the canonical node.
 
-Voice cloning via reference audio (at least one reference is required), mirroring
-the non-streaming node. A ``stream`` toggle is provided for forward-compatible
-incremental streaming output.
+The class is targeted for removal in the next major release.
 """
 
-import torch
 import logging
 from typing import Optional
 
-import comfy.model_management as model_management
-from comfy_api.latest import io, ui
+from comfy_api.latest import io
 
-from ..modules.model_info import (
-    AVAILABLE_VIBEVOICE_MODELS,
-    get_streaming_tts_models,
-    is_model_type,
-    MODEL_CONFIGS,
-)
-from ..modules.generation import (
-    load_vibevoice_model,
-    load_vibevoice_from_external,
-    generate_streaming_audio,
-    force_offload_model,
-)
-from ..modules.attention_utils import ATTENTION_MODES, get_available_attention_modes
-from ..modules.device_utils import get_available_devices
+from ..modules.attention_utils import get_available_attention_modes
+from ..modules.device_utils import get_device_options
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 from ..modules.custom_types import VibeVoiceModel
+from ..modules.voice_presets import PRESET_NONE, list_voice_presets
+from .tts_node import VibeVoiceTTSNode, _EXTERNAL_UNSET
 
 logger = logging.getLogger(__name__)
 
+_DEPRECATION_LOGGED = False
+
+
+def _log_deprecation_once() -> None:
+    """Emit one process-level deprecation warning for the legacy node."""
+    global _DEPRECATION_LOGGED
+    if _DEPRECATION_LOGGED:
+        return
+    _DEPRECATION_LOGGED = True
+    logger.warning(
+        "The 'VibeVoiceRealtime' node is deprecated and forwards to "
+        "'VibeVoice TTS'. It will be removed in the next major release; "
+        "please rebuild the workflow with the canonical VibeVoice TTS node."
+    )
+
 
 class VibeVoiceRealtimeNode(io.ComfyNode):
-    """VibeVoice realtime / streaming TTS node.
+    """Deprecated delegate for the canonical ``VibeVoice TTS`` node.
 
-    Features:
-    - Streaming multi-speaker TTS via ``VibeVoice-Realtime-0.5B``
-    - Voice cloning via reference audio inputs (at least one reference required)
-    - Same attention modes and 4-bit LLM quantization as the standard TTS node
-    - ``stream`` toggle for forward-compatible incremental streaming output
+    The old input prefix, including the legacy no-op ``stream`` widget, is
+    preserved so saved workflow widget values keep their positions. The
+    ``max_new_tokens`` and ``voice_preset`` controls are appended at the end.
     """
 
     CATEGORY = "audio/tts"
 
     @classmethod
     def define_schema(cls) -> io.Schema:
-        # Only expose streaming TTS models here (non-streaming live in VibeVoiceTTSNode).
+        # Only expose streaming TTS models here (non-streaming live in the
+        # canonical VibeVoice TTS node).
+        from ..modules.model_info import get_streaming_tts_models
+
         model_names = list(get_streaming_tts_models().keys())
         if not model_names:
             model_names.append("No streaming models found in models/tts/VibeVoice")
 
-        available_devices = get_available_devices()
+        try:
+            voice_preset_options = [PRESET_NONE, *list_voice_presets().keys()]
+        except Exception as exc:  # Asset discovery must not break schema creation.
+            logger.warning("Could not discover realtime voice presets: %s", exc)
+            voice_preset_options = [PRESET_NONE]
+
+        available_devices = get_device_options()
         default_device = available_devices[0]
 
         dtype_options = get_dtype_options()
@@ -64,13 +72,13 @@ class VibeVoiceRealtimeNode(io.ComfyNode):
 
         return io.Schema(
             node_id="VibeVoiceRealtime",
-            display_name="VibeVoice Realtime TTS",
+            display_name="VibeVoice Realtime TTS (deprecated - use VibeVoice TTS)",
             category=cls.CATEGORY,
             description=(
-                "Generate expressive, low-latency, multi-speaker conversational audio "
-                "using the VibeVoice streaming model (e.g. VibeVoice-Realtime-0.5B). "
-                "Supports voice cloning via reference audio."
+                "Deprecated compatibility node. Use the canonical 'VibeVoice TTS' "
+                "node with a realtime model and an official cached .pt voice preset."
             ),
+            is_deprecated=True,
             inputs=[
                 io.Combo.Input(
                     "model_name",
@@ -162,7 +170,7 @@ class VibeVoiceRealtimeNode(io.ComfyNode):
                     default=False,
                     label_on="Streaming",
                     label_off="Full generation",
-                    tooltip="Reserved for incremental streaming output. Currently returns the assembled waveform; kept for forward compatibility.",
+                    tooltip="Deprecated no-op kept for saved-workflow compatibility. The node always returns a completed AUDIO object.",
                 ),
                 io.Boolean.Input(
                     "force_offload",
@@ -175,7 +183,7 @@ class VibeVoiceRealtimeNode(io.ComfyNode):
                     "device",
                     options=available_devices,
                     default=default_device,
-                    tooltip="Device to run inference on.",
+                    tooltip="Device to run inference on. 'auto' follows ComfyUI's default compute device.",
                 ),
                 io.Combo.Input(
                     "dtype",
@@ -197,6 +205,20 @@ class VibeVoiceRealtimeNode(io.ComfyNode):
                 io.Audio.Input("speaker_2_voice", optional=True, tooltip="Reference audio for 'Speaker 2' or '[2]' in the script."),
                 io.Audio.Input("speaker_3_voice", optional=True, tooltip="Reference audio for 'Speaker 3' or '[3]' in the script."),
                 io.Audio.Input("speaker_4_voice", optional=True, tooltip="Reference audio for 'Speaker 4' or '[4]' in the script."),
+                io.Int.Input(
+                    "max_new_tokens",
+                    default=0,
+                    min=0,
+                    max=8192,
+                    step=1,
+                    tooltip="Maximum generated realtime sequence length. 0 = model default.",
+                ),
+                io.Combo.Input(
+                    "voice_preset",
+                    options=voice_preset_options,
+                    default=PRESET_NONE,
+                    tooltip="Official cached .pt voice prompt for realtime generation.",
+                ),
             ],
             outputs=[
                 io.Audio.Output(display_name="Audio"),
@@ -204,139 +226,44 @@ class VibeVoiceRealtimeNode(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, **kwargs) -> bool | str:
-        """Validate inputs; only ``streaming_tts`` models are accepted here."""
-        # An externally-loaded model bypasses the model_name dropdown entirely.
-        # NOTE: During prompt validation ComfyUI resolves *linked* inputs to
-        # None (no execution cache exists yet — see execution.get_input_data /
-        # mark_missing), so the value cannot be inspected here. We therefore
-        # detect that the external_model input is *connected* by its presence
-        # in kwargs: a linked input is always present (resolved to None), while
-        # an unconnected optional input is absent from the prompt entirely.
-        if "external_model" in kwargs:
-            return True
+    def validate_inputs(
+        cls,
+        model_name: Optional[str] = None,
+        voice_preset: str = PRESET_NONE,
+        external_model=_EXTERNAL_UNSET,
+    ) -> bool | str:
+        """Delegate validation to the canonical VibeVoice TTS node.
 
-        model_name = kwargs.get("model_name")
-        if model_name is not None:
-            if model_name not in AVAILABLE_VIBEVOICE_MODELS:
-                available = list(AVAILABLE_VIBEVOICE_MODELS.keys())
-                return f"Model '{model_name}' not found. Available models: {available}"
-            if not is_model_type(model_name, "streaming_tts"):
-                cfg_type = MODEL_CONFIGS.get(model_name, {}).get("model_type")
-                return (
-                    f"Model '{model_name}' is type '{cfg_type}'; "
-                    f"this node only supports streaming TTS models "
-                    f"(use the VibeVoice TTS or ASR node for other types)."
+        The signature is as narrow as the canonical node's: ComfyUI core
+        splats only the declared inputs into the validator, so the legacy
+        ``stream`` widget can never reach it and the error fan-out is bounded
+        to the inspected inputs.
+        """
+        forwarded: dict = {"model_name": model_name}
+        if voice_preset != PRESET_NONE:
+            forwarded["voice_preset"] = voice_preset
+        if external_model is not _EXTERNAL_UNSET:
+            forwarded["external_model"] = external_model
+        result = VibeVoiceTTSNode.validate_inputs(**forwarded)
+        if result is True and external_model is _EXTERNAL_UNSET:
+            from ..modules.model_info import is_model_type
+
+            if model_name and not is_model_type(model_name, "streaming_tts"):
+                logger.warning(
+                    "The deprecated 'VibeVoiceRealtime' node received the "
+                    "standard model '%s'. It will be generated by the canonical "
+                    "standard TTS path; rebuild the workflow with the "
+                    "'VibeVoice TTS' node.",
+                    model_name,
                 )
-        return True
+        return result
 
     @classmethod
-    def execute(
-        cls,
-        model_name: str,
-        text: str,
-        quantize_llm_4bit: bool,
-        attention_mode: str,
-        cfg_scale: float,
-        inference_steps: int,
-        seed: int,
-        do_sample: bool,
-        temperature: float,
-        top_p: float,
-        top_k: int,
-        stream: bool,
-        force_offload: bool,
-        device: str,
-        dtype: str,
-        speaker_1_voice: Optional[dict] = None,
-        speaker_2_voice: Optional[dict] = None,
-        speaker_3_voice: Optional[dict] = None,
-        speaker_4_voice: Optional[dict] = None,
-        external_model: Optional[dict] = None,
-    ) -> io.NodeOutput:
-        """Execute VibeVoice streaming TTS generation."""
+    def execute(cls, **kwargs) -> io.NodeOutput:
+        """Strip the legacy ``stream`` key and delegate to the canonical node."""
+        _log_deprecation_once()
+        kwargs.pop("stream", None)
+        return VibeVoiceTTSNode.execute(**kwargs)
 
-        # Load model — external bundle overrides the model_name dropdown.
-        if external_model is not None:
-            # Guard: this node requires a streaming (realtime) model.
-            if not external_model.get("is_streaming"):
-                raise ValueError(
-                    "The provided external model is not a streaming model. "
-                    "The 'VibeVoice Realtime TTS' node requires a streaming "
-                    "(realtime) model; use the 'VibeVoice TTS' node for "
-                    "non-streaming models."
-                )
-            patcher, model, processor = load_vibevoice_from_external(
-                external_model,
-                device=device,
-                dtype=dtype,
-                attention_mode=attention_mode,
-            )
-            # Use the bundle's model name for offload cache keying.
-            model_name = external_model.get("model_name", model_name)
-        else:
-            # Load model through the shared patcher / VRAM system.
-            patcher, model, processor = load_vibevoice_model(
-                model_name=model_name,
-                device=device,
-                dtype=dtype,
-                attention_mode=attention_mode,
-                quantize_4bit=quantize_llm_4bit,
-            )
 
-        # Collect speaker voice samples.
-        speaker_inputs = {
-            1: speaker_1_voice,
-            2: speaker_2_voice,
-            3: speaker_3_voice,
-            4: speaker_4_voice,
-        }
-
-        from ..modules.audio_utils import parse_script_1_based
-        _, speaker_ids_1_based = parse_script_1_based(text)
-        voice_samples = [speaker_inputs.get(sid) for sid in speaker_ids_1_based]
-
-        try:
-            output_waveform, sample_rate = generate_streaming_audio(
-                model=model,
-                processor=processor,
-                text=text,
-                voice_samples=voice_samples,
-                speaker_ids=speaker_ids_1_based,
-                cfg_scale=cfg_scale,
-                inference_steps=inference_steps,
-                seed=seed,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                stream=stream,
-            )
-
-            output_audio = {
-                "waveform": output_waveform,
-                "sample_rate": sample_rate,
-            }
-
-            logger.info(f"Realtime TTS generation complete. Sample rate: {sample_rate}Hz")
-
-            if force_offload:
-                # NTH-004 warm re-attach: keep tensors on the intermediate device.
-                force_offload_model(patcher, model_name, warm=True)
-
-            return io.NodeOutput(output_audio, ui=ui.PreviewAudio(output_audio, cls=cls))
-
-        except model_management.InterruptProcessingException:
-            logger.info("VibeVoice Realtime TTS generation was cancelled")
-            return io.NodeOutput(
-                {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000}
-            )
-
-        except Exception as e:
-            logger.error(f"Error during VibeVoice Realtime generation with {attention_mode} attention: {e}")
-            if "interrupt" in str(e).lower() or "cancel" in str(e).lower():
-                logger.info("Generation was interrupted")
-                return io.NodeOutput(
-                    {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000}
-                )
-            raise
+__all__ = ["VibeVoiceRealtimeNode"]

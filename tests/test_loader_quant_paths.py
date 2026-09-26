@@ -209,7 +209,10 @@ class TestGGUFInstallUnitLevel:
         model = build_stub_vv()
         from ComfyUI_VibeVoice.modules.quant_common import QuantTargetMismatch
 
-        with pytest.raises(QuantTargetMismatch, match="does.not.exist"):
+        # Either layer of the pipeline reports the offending key: the
+        # key-mapper (UnmappedKeyError, a ValueError) or the module
+        #-resolution check (QuantTargetMismatch).
+        with pytest.raises((QuantTargetMismatch, ValueError), match="does.not.exist"):
             _install_gguf_weights(model, reader)
 
     def test_shape_mismatch_raises(self, make_gguf_file):
@@ -839,3 +842,68 @@ class TestBlockwiseLoading:
         assert n_rowwise == 1 and plan == {}
         assert sd["emb.weight"].dtype == torch.bfloat16
         assert torch.isfinite(sd["emb.weight"].float()).all()
+
+
+class TestOptionalAbsentPrefixes:
+    """A released checkpoint may omit a whole subtree; that is not a failure.
+
+    VibeVoice-Realtime-0.5B ships an acoustic-tokenizer decoder only, and
+    vanilla ``from_pretrained`` reports the same 276 encoder keys as MISSING.
+    Our loader must not print an alarming warning for that, while still
+    reporting genuinely missing keys.
+    """
+
+    def test_prefix_is_declared(self):
+        from ComfyUI_VibeVoice.modules.loader import OPTIONAL_ABSENT_PREFIXES
+
+        assert "acoustic_tokenizer.encoder." in OPTIONAL_ABSENT_PREFIXES
+
+    def test_wholly_omitted_prefix_is_suppressed(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        missing = [
+            "acoustic_tokenizer.encoder.stages.0.0.weight",
+            "acoustic_tokenizer.encoder.head.conv.bias",
+        ]
+        assigned = {"acoustic_tokenizer.decoder.head.weight", "model.language_model.x"}
+
+        known = mark_optional_absent(missing, assigned)
+
+        assert known == set(missing)
+
+    def test_partially_supplied_prefix_is_still_reported(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        missing = ["acoustic_tokenizer.encoder.stages.9.9.weight"]
+        assigned = {"acoustic_tokenizer.encoder.stages.0.0.weight"}
+
+        known = mark_optional_absent(missing, assigned)
+
+        assert known == set()
+
+    def test_unrelated_missing_keys_are_untouched(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        missing = ["model.language_model.layers.0.weight", "tts_eos_classifier.fc1.bias"]
+        assigned = set()
+
+        known = mark_optional_absent(missing, assigned)
+
+        assert known == set()
+
+    def test_existing_known_missing_is_preserved(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        missing = ["acoustic_tokenizer.encoder.head.conv.bias"]
+        known = mark_optional_absent(missing, set(), {"lm_head.weight"})
+
+        assert "lm_head.weight" in known
+        assert "acoustic_tokenizer.encoder.head.conv.bias" in known
+
+    def test_caller_set_is_not_mutated(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        original = {"lm_head.weight"}
+        mark_optional_absent(["acoustic_tokenizer.encoder.head.bias"], set(), original)
+
+        assert original == {"lm_head.weight"}

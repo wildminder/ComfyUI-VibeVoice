@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 _EMBEDDING_KEY_CANDIDATES = (
     "model.language_model.embed_tokens.weight",
     "tok_embeddings.weight",
+    # modern llama.cpp / quantui-rs name for the input embedding
+    "token_embd.weight",
 )
 
 # config_name -> (hidden_size, vocab_size) of the LLM embedding. Extend this
@@ -180,12 +182,12 @@ def fingerprint_weights(weight_path: str, gguf_reader=None) -> Optional[WeightsF
         if gguf_reader is not None:
             return fingerprint_gguf_reader(gguf_reader)
         try:
-            import gguf
+            from .gguf_quant import open_gguf_reader
 
-            # GGUFReader mmaps the file and has no close() in current
-            # gguf versions; leaving it to GC matches the loader's own
-            # usage pattern.
-            reader = gguf.GGUFReader(weight_path)
+            # Tolerant open: quantui-rs files with sub-block-row conv
+            # tensors crash the stock reader; auto-detect must still see
+            # the embedding fingerprint (header-only either way).
+            reader = open_gguf_reader(weight_path)
             return fingerprint_gguf_reader(reader)
         except Exception as e:
             logger.debug("GGUF reader open failed for '%s': %s", weight_path, e)

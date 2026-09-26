@@ -176,6 +176,19 @@ class TestFingerprintGgufReader:
         reader = gguf.GGUFReader(path)
         assert fingerprint_gguf_reader(reader) is None
 
+    def test_modern_llamacpp_token_embd_detected(self, tmp_path, toy_signatures):
+        """Modern llama.cpp 'token_embd.weight' name fingerprints too
+        (quantui-rs 'new' exports name the LM this way)."""
+        path = _write_gguf(
+            tmp_path, {"token_embd.weight": np.zeros((5, 4), dtype=np.float32)}
+        )
+        import gguf
+
+        reader = gguf.GGUFReader(path)
+        fp = fingerprint_gguf_reader(reader)
+        assert fp is not None and fp.config_name == "Toy-1.5B"
+        assert fp.source_key == "token_embd.weight"
+
     def test_foreign_embedding_shape_returns_none(self, tmp_path, toy_signatures):
         path = _write_gguf(
             tmp_path, {"tok_embeddings.weight": np.zeros((9, 9), dtype=np.float32)}

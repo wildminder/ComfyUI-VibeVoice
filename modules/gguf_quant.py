@@ -28,6 +28,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Files already announced with the flat-pool recovery warning this session
+# (the loader opens one GGUF several times; warn once per file, not per open).
+_FLAT_POOL_WARNED = set()
+
 # ====================================================================
 # 0. Type matrix
 # ====================================================================
@@ -281,8 +285,132 @@ def dequantize_dense(raw_or_view: torch.Tensor, ggml_type) -> torch.Tensor:
 
 
 # ====================================================================
-# 2. Raw-block tensor container
+# 1b. Tolerant reader open (flat-block recovery)
 # ====================================================================
+
+# Files seen in the wild (e.g. quantui-rs conversions) quantize small-kernel
+# conv weights — whose row (kernel-size) is BELOW the block size — as a flat
+# C-order pool of whole blocks. The bytes are self-consistent, but gguf-py's
+# GGUFReader validates each row against the block size at OPEN time and
+# refuses the whole file. This fallback maps the byte shape as one flat row
+# (n_blocks * type_size) so every tensor, quantized or not, still opens; the
+# flat pool is dequantized and reshaped to the logical shape by the caller.
+def _flat_byte_shape(shape, quant_type) -> tuple:
+    """``quant_shape_to_byte_shape`` without the per-row block-size check.
+
+    Returns a FLAT (n_bytes,) shape whenever the last row is smaller than
+    the block size; otherwise delegates to the stock mapping (row-safe
+    files keep their native per-row byte shape).
+    """
+    from gguf.constants import GGML_QUANT_SIZES
+
+    block_size, type_size = GGML_QUANT_SIZES[quant_type]
+    if shape and shape[-1] % block_size == 0:
+        return (*shape[:-1], shape[-1] // block_size * type_size)
+    n_elements = 1
+    for d in shape:
+        n_elements *= int(d)
+    return (n_elements // block_size * type_size,) if shape else ()
+
+
+def open_gguf_reader(weight_path):
+    """Open a GGUF file, recovering flat-block (sub-block-row) tensors.
+
+    Tries the stock :class:`gguf.GGUFReader` first; every spec-conformant
+    file takes that path unchanged. When the stock reader rejects the file
+    because a quantized tensor's row is below its block size (quantui-rs
+    writes conv kernels as a flat pool of whole blocks), re-opens with a
+    byte-shape mapping that flattens ONLY those tensors. Tensor ``.shape``
+    still reports the header dims, so key mapping / logical shapes / config
+    detection are unaffected; ``.data`` for the affected tensors is a flat
+    uint8 block pool.
+
+    The flat-pool warning fires at most once per file per session — the
+    loader opens the same file several times (fingerprint, inspection,
+    install) and each open would otherwise re-announce the recovery.
+
+    Raises the ORIGINAL error when the open fails for any other reason.
+    """
+    import os
+
+    import gguf
+    import gguf.gguf_reader as _gr
+
+    try:
+        return gguf.GGUFReader(weight_path)
+    except ValueError as e:
+        if "block size" not in str(e):
+            raise
+        if weight_path not in _FLAT_POOL_WARNED:
+            _FLAT_POOL_WARNED.add(weight_path)
+            logger.warning(
+                "GGUF file '%s' was written by a converter that stores "
+                "some data in a nonstandard layout; loading it anyway "
+                "with automatic recovery (this file keeps working, but "
+                "re-converting it without the conv layers would make it "
+                "fully standard).",
+                os.path.basename(weight_path),
+            )
+        # gguf_reader imports quant_shape_to_byte_shape into its own
+        # namespace at module load; the fallback must replace it there.
+        _orig = _gr.quant_shape_to_byte_shape
+        _gr.quant_shape_to_byte_shape = _flat_byte_shape
+        try:
+            return _gr.GGUFReader(weight_path)
+        finally:
+            _gr.quant_shape_to_byte_shape = _orig
+
+
+# ====================================================================
+# 1c. Dequantize a reader tensor (dense fallback for non-Linear targets)
+# ====================================================================
+
+def dequantize_reader_tensor(reader_tensor) -> torch.Tensor:
+    """Dequantize one reader tensor to a LOGICAL-shaped fp32 torch tensor.
+
+    Used for quantized GGUF tensors that cannot become quant-resident
+    ``GGUFLinear`` weights (embeddings, conv heads): they are materialized
+    once at load into the dense state dict instead — same philosophy as the
+    fp8 path's dequant-at-load fallback for non-Linear modules.
+
+    Handles BOTH byte layouts the reader may hand back:
+    * row-mapped (spec-conformant): blocks shaped ``(..., n_blocks*ts)``;
+    * flat pool (quantui-rs recovery): a single ``(n_bytes,)`` row whose
+      block count follows from the logical element count.
+
+    Returns an owned CPU tensor (the mmap view is copied), fp32.
+    """
+    import numpy as np
+
+    from gguf.constants import GGML_QUANT_SIZES
+
+    t = reader_tensor
+    if t.tensor_type in FLOAT_GGML_TYPES:
+        data = np.ascontiguousarray(t.data)
+        tensor = torch.from_numpy(data.copy())
+        if t.tensor_type == _T.BF16 and tensor.dtype == torch.uint8:
+            tensor = tensor.view(torch.bfloat16)
+        shape = tuple(int(s) for s in reversed(t.shape))
+        return tensor.reshape(shape).clone().to(torch.float32)
+
+    if t.tensor_type not in SUPPORTED_GGML_TYPES:
+        raise UnsupportedGGMLType(t.tensor_type, f"{t.name}")
+
+    block_size, type_size = GGML_QUANT_SIZES[t.tensor_type]
+    n_elements = 1
+    for s in t.shape:
+        n_elements *= int(s)
+    if n_elements % block_size != 0:
+        raise ValueError(
+            f"GGUF tensor '{t.name}': element count {n_elements} is not a "
+            f"multiple of the {t.tensor_type.name} block size {block_size}; "
+            f"the flat-block pool is truncated and cannot be recovered."
+        )
+    raw = torch.from_numpy(np.ascontiguousarray(t.data).copy())
+    if raw.dtype != torch.uint8:
+        raw = raw.view(torch.uint8)
+    shape = tuple(int(s) for s in reversed(t.shape))
+    return dequantize_blocks(raw, t.tensor_type, torch.float32, shape)
 
 
 @dataclass
@@ -313,10 +441,11 @@ class GGUFTensor:
         import numpy as np
 
         data = reader_tensor.data
-        # Reader data is an mmap-backed READ-ONLY buffer; torch.from_numpy
-        # warns on non-writable arrays even when the tensor is immediately
-        # cloned afterwards. Materialize owned writable storage up front
-        # instead — this single copy IS the final residency.
+        # Flat-block recovery (quantui-rs files): a tensor whose rows are
+        # below the block size was opened with a FLAT byte shape; the raw
+        # pool is exactly what the resident Linear stores either way, and
+        # dequantize_blocks() reshapes by element count, so nothing here
+        # depends on the byte-shape layout.
         arr = np.ascontiguousarray(data)
         if arr.flags.writeable:
             # Writable but still reader-owned (test doubles): clone on the
@@ -510,6 +639,8 @@ class UnmappedKeyError(ValueError):
 
 _LLAMACPP_TO_HF = {
     "tok_embeddings.weight": "model.language_model.embed_tokens.weight",
+    # modern llama.cpp / quantui-rs name for the input embedding
+    "token_embd.weight": "model.language_model.embed_tokens.weight",
     "output.weight": "lm_head.weight",
     "output_norm.weight": "model.language_model.norm.weight",
 }
@@ -540,9 +671,15 @@ def detect_key_scheme(keys) -> str:
     ('model.'/'lm_head.' prefixes, proj/norm suffixes).
     'llamacpp': names follow llama.cpp conversion conventions
     ('blk.N.', 'tok_embeddings.', 'output.').
+    'mixed': both conventions appear. Real converters do produce these
+    (quantui-rs keeps HF names for everything but the lm_head, which it
+    renames llama.cpp-style to 'output.weight'); map_keys resolves such
+    files with a majority vote instead of rejecting them.
     """
     hf_re = _re.compile(r"^(model\.|lm_head\.|transformer\.)")
-    llamacpp_re = _re.compile(r"^(blk\.\d+\.|tok_embeddings\.|output\.|output_norm\.)")
+    llamacpp_re = _re.compile(
+        r"^(blk\.\d+\.|tok_embeddings\.|token_embd\.|output\.|output_norm\.)"
+    )
     votes = {"hf": 0, "llamacpp": 0}
     for k in keys:
         if hf_re.match(k):
@@ -582,21 +719,52 @@ def map_keys(keys, scheme: str = None) -> dict:
 
     Args:
         keys: Iterable of GGUF tensor names.
-        scheme: Force a scheme; auto-detected when omitted. 'mixed' raises.
+        scheme: Force a scheme; auto-detected when omitted. A 'mixed'
+            census is resolved by majority vote — the dominant convention
+            is kept and the minority keys are mapped through the other
+            convention's alias table (quantui-rs 7B exports are 1204 HF
+            keys + llamacpp 'output.weight'). An ambiguous 50/50 mix or
+            an unknown minority key still raises.
 
     Returns:
         dict mapping ORIGINAL key -> module parameter path (identity for hf).
 
     Raises:
-        UnmappedKeyError: On unmapped llamacpp keys or a mixed census.
+        UnmappedKeyError: On unmapped llamacpp keys or a 50/50 mixed census.
     """
     scheme = scheme or detect_key_scheme(keys)
     if scheme == "mixed":
-        raise UnmappedKeyError(sorted(keys)[:10], scheme)
+        # Majority vote resolves genuine converter output (a file that is
+        # overwhelmingly one convention plus a handful of aliased names).
+        # Only an exact tie stays unmappable.
+        n = len(list(keys)) if not isinstance(keys, list) else len(keys)
+        hf_keys = [k for k in keys if _re.match(r"^(model\.|lm_head\.|transformer\.)", k)]
+        n_hf = len(hf_keys)
+        if n_hf * 2 == n:
+            raise UnmappedKeyError(sorted(keys)[:10], scheme)
+        scheme = "hf" if n_hf * 2 > n else "llamacpp"
+        logger.info(
+            "GGUF file mixes tensor naming conventions (%d HF / %d llamacpp); "
+            "resolving with the %s convention and aliasing the rest.",
+            n_hf, n - n_hf, scheme,
+        )
     mapping = {}
     unknown = []
     for k in keys:
         if scheme == "hf":
+            # HF-majority files may still carry a handful of llamacpp-style
+            # aliases (quantui-rs writes the lm_head as 'output.weight').
+            if _re.match(r"^(model\.|lm_head\.|transformer\.)", k):
+                mapping[k] = k
+                continue
+            try:
+                mapping[k] = _map_llamacpp_key(k)
+            except KeyError:
+                unknown.append(k)
+            continue
+        # llamacpp-majority (or forced-llamacpp): HF-shaped keys are passed
+        # through so a single stray HF tensor doesn't poison the whole map.
+        if _re.match(r"^(model\.|lm_head\.|transformer\.)", k):
             mapping[k] = k
             continue
         try:

@@ -329,6 +329,31 @@ class TestConvertTree:
         assert out.shape == (2, 3)
         assert t.custom.scale.device == x.device
 
+    def test_container_forward_passes_kwargs_through(self):
+        """Regression (native ASR): the container wrapper must keep the base
+        forward's full signature. VibeVoiceAcousticTokenizerConvNext1dLayer
+        takes padding_cache= and the ASR model passes it — a bare
+        ``(self, x)`` wrapper raised "unexpected keyword argument
+        'padding_cache'" mid-transcription."""
+
+        class _KwargsModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = nn.Parameter(torch.ones(3))
+
+            def forward(self, x, padding_cache=None, use_cache=False):
+                if padding_cache is not None:
+                    x = x + 1  # visible marker that the kwarg arrived
+                return x * self.scale
+
+        t = nn.Module()
+        t.mod = _KwargsModule()
+        CS.convert_tree_for_streaming(t)
+        x = torch.zeros(2, 3)
+        out = t.mod(x, padding_cache="sentinel", use_cache=True)
+        # kwarg reached the base forward (the +1 branch fired)
+        assert torch.equal(out, torch.ones(2, 3))
+
     @pytest.mark.skipif(not torch.cuda.is_available(),
                         reason="relocation cross-device needs CUDA")
     def test_container_relocation_cross_device(self):

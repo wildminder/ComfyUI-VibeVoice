@@ -30,64 +30,352 @@ TTS_TEXT_WINDOW_SIZE = 5
 TTS_SPEECH_WINDOW_SIZE = 6
 
 
+def _generation_config_accepts_positional_flag() -> bool:
+    """Return whether ``_prepare_generation_config`` takes a positional flag.
+
+    transformers 4.x signature: ``(self, generation_config, is_init, **kwargs)``
+    where ``is_init`` is positional-or-keyword. transformers 5.x signature:
+    ``(self, generation_config, **kwargs)`` where every extra parameter is
+    var-keyword. Detect the flag by looking for a positional parameter that is
+    not var-keyword and is not ``self``/``generation_config``.
+    """
+    from transformers.generation.utils import GenerationMixin
+
+    try:
+        parameters = list(
+            inspect.signature(
+                GenerationMixin._prepare_generation_config
+            ).parameters.values()
+        )
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+        and parameter.name not in ("self", "generation_config")
+    ]
+    return bool(positional)
+
+
 # ============================================================================
-# Transformers >= 4.57 Compatibility Layer
+# Transformers >= 4.57 / 5.x Compatibility Layer
 # The cache system was refactored in transformers 4.57, requiring these helpers.
+#
+# WHY THIS SHIM EXISTS -- do not "simplify" it away
+# -------------------------------------------------
+# The official ``.pt`` voice prompts that ship with VibeVoice-Realtime are pickled
+# with a **legacy ``DynamicCache``**: their KV lives in two plain Python lists,
+# ``cache.key_cache[i]`` / ``cache.value_cache[i]``. From transformers 4.57
+# onwards a cache is instead a *container* (``cache.layers``) holding one *layer
+# object* per attention head, and 5.x reads ``layer.keys`` / ``layer.values``.
+# A legacy pickle therefore arrives with no ``layers`` list at all.
+#
+# That gap fails **silently, not loudly**, which is the whole reason the shim
+# carries both spellings:
+#
+#   * Container level. ``DynamicCache.get_mask_sizes()`` answers
+#     ``(cache_position.shape[0], 0)`` -- kv_length == query_length -- whenever
+#     the requested ``layer_idx`` is beyond ``len(self.layers)``. The attention
+#     mask is then built as if the 316-token voice prefill did not exist. No
+#     exception, no warning, no missing-key report: the model conditions on
+#     nothing and emits a fraction of a second of noise. ``_ensure_cache_has_layers``
+#     must therefore run *before* the first forward pass.
+#   * Layer level. A wrapper implementing *only* the 4.x names
+#     (``key_cache`` / ``value_cache``) would still answer
+#     ``get_seq_length() == 0`` to 5.x, so the prefill would be invisible in
+#     exactly the same silent way. Every modern accessor on ``MockCacheLayer``
+#     is therefore backed by the same tensors as the legacy ones.
+#
+# Measured on the installed 5.3: with the shim, ``kv_length == 321`` for a
+# 316-token prefill plus a 5-token query, and the mask delivered to attention is
+# ``(1, 1, 5, 321)`` with no prefill position masked out. See
+# docs/plans/evidence/2026-09-26-s1.2-decision.md and
+# docs/plans/2026-09-26-two-version-matrix.md for the full record.
 # ============================================================================
+
+def _tensor_device_and_dtype(*tensors):
+    """Device and dtype of the first real tensor among ``tensors``.
+
+    The 5.x layer API carries ``device`` / ``dtype`` attributes (set by
+    ``DynamicLayer.lazy_initialization``) because ``offload`` / ``prefetch``
+    need to know where the layer is supposed to live. A legacy cache is already
+    populated when we wrap it, so those attributes are derived here instead.
+    """
+    for tensor in tensors:
+        if torch.is_tensor(tensor):
+            return tensor.device, tensor.dtype
+    return torch.device("cpu"), torch.get_default_dtype()
+
 
 class MockCacheLayer:
     """
-    Mock cache layer for transformers >= 4.57 compatibility.
-    Provides the `layers` interface expected by DynamicCache in newer versions.
+    Mock cache layer bridging the pre-4.57 and 5.x ``CacheLayer`` APIs.
+
+    The released ``.pt`` voice prompts are pickled with a ``DynamicCache`` that
+    stores its tensors in ``key_cache`` / ``value_cache`` lists. Since
+    transformers 5.x a cache is a list of layer objects instead, so a cache
+    loaded from those files has to be wrapped to expose the modern interface.
+
+    Both spellings are supported because the two transformers generations read
+    different attributes: 4.x reads ``layer.key_cache`` / ``layer.value_cache``,
+    while 5.x reads ``layer.keys`` / ``layer.values`` and, crucially, calls
+    ``get_seq_length()`` to size the attention mask. A wrapper providing only
+    the 4.x names does not fail loudly on 5.x -- the voice prefill is simply
+    invisible, the model conditions on nothing, and the output is garbled
+    syllables, or an immediate end-of-speech. Every modern accessor below is
+    therefore backed by the same tensors as the legacy ones.
     """
-    
+
     def __init__(self, key_cache, value_cache, parent_cache=None, layer_idx=0):
-        self.key_cache = key_cache
-        self.value_cache = value_cache
+        self._key_cache = key_cache
+        self._value_cache = value_cache
         self._parent_cache = parent_cache
         self._layer_idx = layer_idx
-    
+        # ``CacheLayerMixin.prefetch`` (and ``Cache.prefetch``) read
+        # ``self.device``; on 5.x it is normally set by
+        # ``DynamicLayer.lazy_initialization``, which this cache has already
+        # been through by the time we wrap it. Derive it from the tensor we
+        # were handed, and refresh it in ``update`` so a cache that migrates
+        # devices mid-generation still prefetches onto the right one.
+        self.device, self.dtype = _tensor_device_and_dtype(key_cache, value_cache)
+
+    # --- legacy (pre-4.57) attribute names ---------------------------------
+    @property
+    def key_cache(self):
+        return self._key_cache
+
+    @key_cache.setter
+    def key_cache(self, value):
+        self._key_cache = value
+
+    @property
+    def value_cache(self):
+        return self._value_cache
+
+    @value_cache.setter
+    def value_cache(self, value):
+        self._value_cache = value
+
+    # --- transformers 5.x attribute names -----------------------------------
+    @property
+    def keys(self):
+        return self._key_cache
+
+    @keys.setter
+    def keys(self, value):
+        self._key_cache = value
+
+    @property
+    def values(self):
+        return self._value_cache
+
+    @values.setter
+    def values(self, value):
+        self._value_cache = value
+
+    def _store(self, keys, values):
+        """Publish new tensors on both APIs, the parent list included.
+
+        Every mutating 5.x accessor (``offload``, ``prefetch``,
+        ``reorder_cache``, ``crop``, the batch helpers) assigns through
+        ``self.keys`` / ``self.values``. Those setters only rebind the layer's
+        own fields, so a parent-backed layer would silently go out of sync
+        with ``key_cache`` / ``value_cache`` - and ``update`` reads the parent
+        lists, so the next forward would resurrect the stale tensors. Writing
+        both keeps the two spellings pointing at one object at all times.
+
+        ``device`` / ``dtype`` are deliberately *not* refreshed here: they
+        describe where the layer belongs, which ``offload`` must not redefine
+        by moving the data to CPU. ``update`` refreshes them from the freshly
+        concatenated states instead.
+        """
+        self._key_cache = keys
+        self._value_cache = values
+        parent = self._parent_cache
+        if parent is not None and 0 <= self._layer_idx < len(parent.key_cache):
+            parent.key_cache[self._layer_idx] = keys
+            parent.value_cache[self._layer_idx] = values
+        return keys, values
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._key_cache is not None and self._key_cache.numel() > 0
+
+    @property
+    def is_sliding(self) -> bool:
+        return False
+
+    @property
+    def is_compileable(self) -> bool:
+        return False
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if not self.is_initialized:
+            return 0
+        return self._key_cache.shape[-2]
+
+    def get_max_cache_shape(self) -> int:
+        return -1
+
     def get_mask_sizes(self, cache_position):
         """Return KV length and offset for mask creation."""
-        seq_length = self.key_cache.shape[2] if self.key_cache is not None else 0
+        seq_length = self.get_seq_length()
         query_length = cache_position.shape[0]
         return seq_length + query_length, 0
-    
+
+    def lazy_initialization(self, key_states, value_states) -> None:
+        """5.x initialization hook; this cache is already populated."""
+        return None
+
     def update(self, key_states, value_states, cache_kwargs=None):
         """Update the cache with new key/value states."""
         if self._parent_cache is None:
-            return self.key_cache, self.value_cache
-        
+            return self._key_cache, self._value_cache
+
         parent = self._parent_cache
         idx = self._layer_idx
-        
+
         # Extend cache lists if needed
         while len(parent.key_cache) <= idx:
             parent.key_cache.append(None)
             parent.value_cache.append(None)
-        
+
         # Concatenate or initialize cache
         if parent.key_cache[idx] is not None:
-            parent.key_cache[idx] = torch.cat([parent.key_cache[idx], key_states], dim=2)
-            parent.value_cache[idx] = torch.cat([parent.value_cache[idx], value_states], dim=2)
+            parent.key_cache[idx] = torch.cat([parent.key_cache[idx], key_states], dim=-2)
+            parent.value_cache[idx] = torch.cat([parent.value_cache[idx], value_states], dim=-2)
         else:
             parent.key_cache[idx] = key_states
             parent.value_cache[idx] = value_states
-        
+
         # Update local references
-        self.key_cache = parent.key_cache[idx]
-        self.value_cache = parent.value_cache[idx]
-        return self.key_cache, self.value_cache
+        self._key_cache = parent.key_cache[idx]
+        self._value_cache = parent.value_cache[idx]
+        self.device, self.dtype = _tensor_device_and_dtype(
+            self._key_cache, self._value_cache
+        )
+        return self._key_cache, self._value_cache
+
+    def offload(self) -> None:
+        """Move this layer's tensors to CPU (mirrors ``CacheLayerMixin.offload``)."""
+        if self.is_initialized:
+            self._store(
+                self._key_cache.to("cpu", non_blocking=True),
+                self._value_cache.to("cpu", non_blocking=True),
+            )
+
+    def prefetch(self) -> None:
+        """Move this layer's tensors back to ``self.device``.
+
+        ``self.device`` is the device the layer was last seen on, derived from
+        the key tensor in ``__init__`` and refreshed by every mutation, exactly
+        as ``DynamicLayer.lazy_initialization`` would have set it.
+        """
+        if self.is_initialized and self._key_cache.device != self.device:
+            self._store(
+                self._key_cache.to(self.device, non_blocking=True),
+                self._value_cache.to(self.device, non_blocking=True),
+            )
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        """Reorder this layer's batch dimension for beam search."""
+        if self.get_seq_length() > 0:
+            beam_idx = beam_idx.to(self._key_cache.device)
+            self._store(
+                self._key_cache.index_select(0, beam_idx),
+                self._value_cache.index_select(0, beam_idx),
+            )
+
+    def crop(self, max_length: int) -> None:
+        if max_length < 0:
+            max_length = self.get_seq_length() - abs(max_length)
+        if self.is_initialized and 0 <= max_length < self.get_seq_length():
+            self._store(
+                self._key_cache[..., :max_length, :],
+                self._value_cache[..., :max_length, :],
+            )
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        if self.get_seq_length() > 0:
+            self._store(
+                self._key_cache.repeat_interleave(repeats, dim=0),
+                self._value_cache.repeat_interleave(repeats, dim=0),
+            )
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        if self.get_seq_length() > 0:
+            indices = indices.to(self._key_cache.device)
+            self._store(self._key_cache[indices, ...], self._value_cache[indices, ...])
+
+    def reset(self) -> None:
+        self._store(None, None)
+
+
+class _LazyPrefetchStream:
+    """Copyable stand-in for ``Cache.prefetch_stream``.
+
+    ``Cache.offload``, ``Cache.prefetch`` and ``Cache.update`` use the stream as
+    a context manager, and nothing else reads it. A real ``torch.Stream`` cannot
+    be deep-copied (it raises ``TypeError: cannot pickle 'torch.Stream' object``)
+    and a cached voice prompt is deep-copied once per generation, so a stream
+    attached at wrap time would make an otherwise copyable cache uncopyable.
+    Materialising on first use keeps the surface identical while leaving a plain
+    Python object behind until something actually offloads.
+    """
+
+    def __init__(self):
+        self._stream = None
+
+    def _materialize(self):
+        if self._stream is None:
+            self._stream = torch.Stream()
+        return self._stream
+
+    def __enter__(self):
+        self._materialize().__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._materialize().__exit__(*exc_info)
+
+    def __deepcopy__(self, memo):
+        # The stream is recreated on demand, so a copy starts unmaterialized
+        # rather than failing outright.
+        return _LazyPrefetchStream()
 
 
 def _ensure_cache_has_layers(cache):
     """
     Ensure the cache has all required attributes for transformers >= 4.57.
     Creates MockCacheLayer wrappers to provide the expected `layers` interface.
+
+    ``Cache.get_mask_sizes`` answers ``(query_length, 0)`` whenever
+    ``layer_idx >= len(self.layers)`` (transformers 5.3 ``cache_utils``), i.e. an
+    unpopulated ``layers`` list silently tells the mask builder that no voice
+    prefill exists. ``layers`` therefore has to be filled *before* the first
+    forward, which is what this function is for: it is called from
+    ``_update_model_kwargs_for_generation`` ahead of every step, including the
+    first.
+
+    The 5.x container also has two stateful requirements that a cache pickled
+    by an older transformers does not satisfy:
+
+    * ``Cache.update`` touches ``self.prefetch_stream`` on every step while
+      ``self.offloading`` is truthy, but that stream is only ever created when
+      ``Cache.__init__`` was called with ``offloading=True``. A legacy pickle
+      that carries the flag without the stream raises ``AttributeError`` inside
+      the model's first forward, so the flag is cleared when the stream it
+      implies is missing.
+    * ``Cache.offload`` / ``Cache.prefetch`` are part of the public container
+      API and read ``self.prefetch_stream`` unconditionally, so the stream is
+      provided for adapted legacy caches even when offloading stays off.
     """
     if cache is None:
         return cache
-    
+
     # Add required attributes (skip if read-only)
     for attr, default in [('layer_class_to_replicate', None), ('offloading', False), ('is_compileable', False)]:
         if not hasattr(cache, attr):
@@ -95,7 +383,30 @@ def _ensure_cache_has_layers(cache):
                 setattr(cache, attr, default)
             except AttributeError:
                 pass
-    
+
+    # ``offloading`` is only honoured by 5.x when the prefetch stream that
+    # ``Cache.__init__`` would have created alongside it also exists. Keeping a
+    # stale ``True`` from an older pickle turns the very first ``Cache.update``
+    # into an AttributeError, and the adapted layers carry no per-layer device
+    # bookkeeping that would make CPU offloading meaningful anyway.
+    if getattr(cache, 'offloading', False) and not hasattr(cache, 'prefetch_stream'):
+        logger.warning(
+            "VibeVoice realtime: dropping `offloading=True` from a cached voice prompt - "
+            "the pickled cache has no prefetch stream, and Cache.update would raise on it."
+        )
+        try:
+            cache.offloading = False
+        except AttributeError:
+            pass
+
+    # ``Cache.offload``/``Cache.prefetch`` are reachable from the container API
+    # regardless of ``offloading``, and both open ``prefetch_stream``.
+    if not hasattr(cache, 'prefetch_stream'):
+        try:
+            cache.prefetch_stream = _LazyPrefetchStream()
+        except AttributeError:
+            pass
+
     # Build layers list from key_cache/value_cache
     if hasattr(cache, 'key_cache') and hasattr(cache, 'value_cache'):
         try:
@@ -311,6 +622,35 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         model_kwargs = super()._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder=is_encoder_decoder, num_new_tokens=num_new_tokens
         )
+        # ``cache_position`` is the *input* to the next forward: the positions of
+        # the tokens about to be fed, nothing else. 4.57.6 honoured that contract
+        # (``cache_position[-1:] + num_new_tokens``, i.e. a tensor of exactly
+        # ``num_new_tokens`` entries). 5.3.0 changed it to append the new
+        # positions to the whole history (``torch.cat((cache_position,
+        # next_cache_position))``, transformers/generation/utils.py:938), so the
+        # tensor grows by one entry per step and starts at position 0.
+        #
+        # That is not cosmetic. ``prepare_inputs_for_generation`` below slices
+        # the inputs with ``input_ids[:, -cache_position.shape[0]:]``, so the
+        # query window silently widens to the entire history: step one re-feeds
+        # 6 tokens, step two 7, and so on. The already-cached positions are
+        # recomputed and appended again, the KV cache grows super-linearly
+        # (measured: 316 -> 321 -> 327 -> 334 -> 342 -> 351 -> 361 -> 372 for
+        # the 0.5B checkpoint) and every position after the first window is
+        # served a sequence that no longer matches its index. The mask is built
+        # correctly for the wrong query, so nothing raises: the model simply
+        # never reaches its own end-of-speech and the clip runs to the length
+        # budget. S1.1's single-forward mask probe cannot see this, because the
+        # first forward is correct on both versions.
+        #
+        # The base implementation's last ``num_new_tokens`` entries are exactly
+        # the 4.x answer, so keeping only those restores the old contract
+        # without branching on a version number, and is a no-op on 4.5x. The
+        # ``0 <`` guard matters: ``tensor[-0:]`` is the whole tensor, not an
+        # empty tail.
+        cache_position = model_kwargs.get("cache_position")
+        if cache_position is not None and 0 < num_new_tokens < cache_position.numel():
+            model_kwargs["cache_position"] = cache_position[-num_new_tokens:]
         if "past_key_values" in model_kwargs:
             model_kwargs["past_key_values"] = _ensure_cache_has_layers(model_kwargs["past_key_values"])
         return model_kwargs
@@ -513,12 +853,20 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
                 pad_token_id = tokenizer.pad_token_id
             )
 
+        # transformers 4.x accepted a positional "is_init" flag here; 5.x
+        # narrowed the signature to (generation_config, **kwargs). Inspect the
+        # live signature so one vendored file supports both APIs. The custom
+        # speech token ids are assigned to the returned config below rather
+        # than passed through kwargs, because GenerationConfig no longer
+        # tolerates unknown keyword attributes.
+        _prepare_args = (
+            (generation_config, True)
+            if _generation_config_accepts_positional_flag()
+            else (generation_config,)
+        )
+
         generation_config, model_kwargs = self._prepare_generation_config(
-            generation_config, 
-            True, 
-            speech_start_id=tokenizer.speech_start_id, 
-            speech_end_id=tokenizer.speech_end_id, 
-            speech_diffusion_id=tokenizer.speech_diffusion_id, 
+            *_prepare_args,
             **kwargs
         )
         generation_config.speech_start_id = tokenizer.speech_start_id

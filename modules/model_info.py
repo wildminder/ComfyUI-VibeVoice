@@ -33,12 +33,86 @@ MODEL_CONFIGS = {
         "size_gb": 1.5,
         "model_type": "streaming_tts",
     },
-    "VibeVoice-ASR": {
-        "repo_id": "microsoft/VibeVoice-ASR",
-        "size_gb": 15.0,
+    # Native transformers-5.3 checkpoint (model_type "vibevoice_asr"): the
+    # same ASR-7B model as microsoft/VibeVoice-ASR, in HF-native form. The
+    # streaming checkpoints (VibeVoice-ASR-Streaming-*) are chunked-protocol
+    # models meant for live/streaming use; ComfyUI's batch pipeline semantics
+    # fit the single-pass ASR-HF checkpoint instead.
+    "VibeVoice-ASR-HF": {
+        "repo_id": "microsoft/VibeVoice-ASR-HF",
+        "size_gb": 17.4,
         "model_type": "asr",
     },
 }
+
+# Retired ASR dropdown options (repos microsoft/VibeVoice-ASR and the
+# VibeVoice-ASR-Streaming-* family). Old saved workflows keep working by
+# resolving these names onto the native ASR-HF checkpoint, unless a locally
+# discovered checkpoint of the exact same name exists.
+LEGACY_ASR_MODEL_NAMES = ("VibeVoice-ASR", "VibeVoice-ASR-Streaming-1.5B", "VibeVoice-ASR-Streaming-7B")
+LEGACY_ASR_MODEL_TARGET = "VibeVoice-ASR-HF"
+
+
+def normalize_asr_model_name(model_name: str, available: dict = None) -> str:
+    """Map retired ASR model_names onto the canonical ASR-HF option.
+
+    Exact options and locally discovered checkpoints of a retired name pass
+    through unchanged; retired names map onto VibeVoice-ASR-HF (the same ASR
+    model in its native transformers form).
+
+    Args:
+        model_name: Raw model_name value (may come from a saved workflow).
+        available: Registry to check against (defaults to the live
+            AVAILABLE_VIBEVOICE_MODELS; overridable for tests).
+
+    Returns:
+        Canonical model_name when a legacy alias applies, else the input.
+    """
+    if not model_name or model_name not in LEGACY_ASR_MODEL_NAMES:
+        return model_name
+    registry = AVAILABLE_VIBEVOICE_MODELS if available is None else available
+    info = registry.get(model_name) or {}
+    if info.get("type") in ("local_dir", "standalone"):
+        return model_name
+    if LEGACY_ASR_MODEL_TARGET in registry:
+        return LEGACY_ASR_MODEL_TARGET
+    return model_name
+
+
+def _infer_model_type(name: str) -> str:
+    """Resolve a model's family: MODEL_CONFIGS entry, else name-based.
+
+    Locally discovered checkpoints are only in MODEL_CONFIGS when their
+    directory name matches an official model; anything with "asr" in the
+    name belongs to the ASR family (mirrors get_tokenizer_repo's heuristic).
+    """
+    config_type = MODEL_CONFIGS.get(name, {}).get("model_type")
+    if config_type:
+        return config_type
+    name_lower = name.lower()
+    if "asr" in name_lower:
+        return "asr"
+    if "realtime" in name_lower or "stream" in name_lower:
+        return "streaming_tts"
+    return "tts"
+
+VOICE_PRESET_DIRECTORY_NAME = "voices"
+
+# Exact extensions accepted for official-model weight files. ``.pt`` is
+# intentionally excluded: in the official VibeVoice tree it denotes a realtime
+# cached voice prompt, not a checkpoint. External checkpoint loading retains its
+# independent ComfyUI-supported extension set, including ``.pt``.
+MODEL_WEIGHT_EXTENSIONS = {
+    ".safetensors",
+    ".bin",
+    ".gguf",
+    ".ckpt",
+    ".pth",
+    ".pt2",
+    ".pkl",
+    ".sft",
+}
+
 
 # Runtime registry of all available models (official + local).
 # Populated at startup by __init__.py.
@@ -74,8 +148,7 @@ def get_models_by_type(model_type: str) -> dict:
     """
     result = {}
     for name, info in AVAILABLE_VIBEVOICE_MODELS.items():
-        config = MODEL_CONFIGS.get(name, {})
-        if config.get("model_type", "tts") == model_type:
+        if _infer_model_type(name) == model_type:
             result[name] = info
     return result
 
@@ -95,13 +168,28 @@ def get_asr_models() -> dict:
     return get_models_by_type("asr")
 
 
-def is_model_type(model_name: str, *types: str) -> bool:
-    """Return True if model_name's configured model_type is one of `types`.
+def get_tts_family_models() -> dict:
+    """Return standard TTS models first, then realtime TTS models.
 
-    Unknown model names default to "tts" (consistent with get_models_by_type).
+    Registry order is preserved within each family. ASR models are excluded.
     """
-    cfg = MODEL_CONFIGS.get(model_name, {})
-    return cfg.get("model_type", "tts") in types
+    result = get_tts_models()
+    result.update(get_streaming_tts_models())
+    return result
+
+
+# Descriptive alias for callers that treat the selector as the complete TTS
+# registry rather than one family.
+get_all_tts_models = get_tts_family_models
+
+
+def is_model_type(model_name: str, *types: str) -> bool:
+    """Return True if model_name's family is one of `types`.
+
+    Families come from MODEL_CONFIGS when the name matches an official model,
+    otherwise from the name itself ("asr" substring → asr, else tts).
+    """
+    return _infer_model_type(model_name) in types
 
 
 def scan_vibevoice_models(search_path: str) -> list[dict]:
@@ -130,25 +218,25 @@ def scan_vibevoice_models(search_path: str) -> list[dict]:
         logger.warning(f"Cannot read directory {search_path}: {e}")
         return results
 
-    # Import supported extensions from folder_paths if available,
-    # otherwise use a sensible default set.
-    try:
-        import folder_paths
-        supported_exts = folder_paths.supported_pt_extensions
-    except ImportError:
-        supported_exts = {".safetensors", ".bin", ".pt", ".ckpt", ".gguf"}
-
-    for item in items:
+    for item in sorted(items, key=str.casefold):
         item_path = os.path.join(search_path, item)
 
-        # Case 1: HF directory with config + weights
+        # Case 1: HF directory with config + weights. A direct ``voices``
+        # directory is an asset tree, never a model directory.
         if os.path.isdir(item_path):
+            if item.casefold() == VOICE_PRESET_DIRECTORY_NAME:
+                continue
             config_exists = os.path.exists(os.path.join(item_path, "config.json"))
+            try:
+                child_files = os.listdir(item_path)
+            except OSError as exc:
+                logger.warning(f"Cannot read model directory {item_path}: {exc}")
+                continue
             weights_exist = (
                 os.path.exists(os.path.join(item_path, "model.safetensors.index.json"))
                 or any(
-                    f.endswith((".safetensors", ".bin"))
-                    for f in os.listdir(item_path)
+                    os.path.splitext(filename)[1].casefold() in MODEL_WEIGHT_EXTENSIONS
+                    for filename in child_files
                 )
             )
 
@@ -160,9 +248,11 @@ def scan_vibevoice_models(search_path: str) -> list[dict]:
                     "tokenizer_repo": get_tokenizer_repo(item),
                 })
 
-        # Case 2: Standalone weight file
+        # Case 2: Standalone official-model weight file. ``.pt`` is reserved
+        # for realtime voice prompts in this tree and is not scanned here.
         elif os.path.isfile(item_path):
-            if any(item.endswith(ext) for ext in supported_exts):
+            extension = os.path.splitext(item)[1].casefold()
+            if extension in MODEL_WEIGHT_EXTENSIONS:
                 model_name = os.path.splitext(item)[0]
                 results.append({
                     "name": model_name,

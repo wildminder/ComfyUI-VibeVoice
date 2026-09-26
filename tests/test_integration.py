@@ -274,46 +274,27 @@ class TestNodeProgressIntegration:
             assert 1 in values and 2 in values and 3 in values
             assert values == sorted(values), f"progress must be monotonic, got {values}"
 
-    def test_realtime_node_reports_increasing_progress(self):
-        from ComfyUI_VibeVoice.nodes.realtime_node import VibeVoiceRealtimeNode
+    def test_canonical_node_routes_realtime_to_realtime_adapter(self):
+        from ComfyUI_VibeVoice.nodes.tts_node import VibeVoiceTTSNode
 
-        mock_model = MagicMock()
-        mock_model.device = torch.device("cpu")
-        mock_output = MagicMock()
-        mock_output.speech_outputs = [torch.randn(24000)]
-
-        def _generate(**kwargs):
-            cb = kwargs.get("progress_callback")
-            if cb is not None:
-                for i in (1, 2, 3):
-                    cb(i, 512)
-            return mock_output
-
-        mock_model.generate.side_effect = _generate
-        mock_processor = MagicMock()
-        mock_processor.tokenizer = MagicMock()
-        mock_processor.tokenizer.encode = MagicMock(return_value=[10, 11, 12])
-        mock_processor.prepare_speech_inputs = MagicMock(return_value={
-            "padded_speeches": torch.randn(1, 100),
-            "speech_masks": torch.ones(1, 100, dtype=torch.bool),
-        })
-        mock_patcher = MagicMock()
-
-        with patch("ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_model",
-                   return_value=(mock_patcher, mock_model, mock_processor)), \
-             patch("ComfyUI_VibeVoice.nodes.realtime_node.ui.PreviewAudio", MagicMock()), \
-             patch("ComfyUI_VibeVoice.modules.generation.ProgressBarWithConsole") as mock_pbar_cls, \
-             patch("ComfyUI_VibeVoice.modules.generation.model_management.throw_exception_if_processing_interrupted"), \
-             patch("ComfyUI_VibeVoice.modules.generation.prefill_voice_prompt",
-                   return_value={"lm": MagicMock()}), \
-             patch("ComfyUI_VibeVoice.modules.generation.preprocess_comfy_audio",
-                   return_value=_mock_voice_sample()):
-            mock_pbar = MagicMock()
-            mock_pbar.total = 1
-            mock_pbar_cls.return_value = mock_pbar
-
-            VibeVoiceRealtimeNode.execute(
-                model_name="TestStreamingModel",
+        realtime_model = type("VibeVoiceStreamingForConditionalGenerationInference", (), {})()
+        realtime_processor = type("VibeVoiceStreamingProcessor", (), {})()
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_model",
+            return_value=(MagicMock(), realtime_model, realtime_processor),
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.get_cached_voice_preset",
+            return_value={"lm": MagicMock()},
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_realtime_audio",
+            return_value=(torch.ones(1, 1, 24), 24000),
+        ) as generate, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_audio"
+        ) as generate_standard, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
+        ):
+            VibeVoiceTTSNode.execute(
+                model_name="VibeVoice-Realtime-0.5B",
                 text="[1] Hello world",
                 quantize_llm_4bit=False,
                 attention_mode="sdpa",
@@ -324,20 +305,116 @@ class TestNodeProgressIntegration:
                 temperature=0.95,
                 top_p=0.95,
                 top_k=0,
-                stream=False,
                 force_offload=False,
                 device="cpu",
                 dtype="fp32",
-                speaker_1_voice=_mock_audio_dict(),
+                voice_preset="en-Carter_man",
+            )
+        generate.assert_called_once()
+        generate_standard.assert_not_called()
+
+    def test_realtime_progress_callbacks_reach_comfyui_progress_bar(self):
+        """The realtime adapter drives the ComfyUI progress bar and closes it."""
+        from ComfyUI_VibeVoice.modules.realtime_generation import generate_realtime_audio
+        from ComfyUI_VibeVoice.modules.voice_presets import PRESET_CACHE_KEYS
+
+        class VibeVoiceStreamingForConditionalGenerationInference:
+            def __init__(self):
+                self.steps = None
+
+            def set_ddpm_inference_steps(self, num_steps):
+                self.steps = num_steps
+
+            def generate(self, **kwargs):
+                callback = kwargs.get("progress_callback")
+                for index in (1, 2, 3):
+                    callback(index, 10)
+                output = MagicMock()
+                output.speech_outputs = [torch.ones(1, 1, 24)]
+                return output
+
+        class VibeVoiceStreamingProcessor:
+            tokenizer = MagicMock()
+
+            def process_input_with_cached_prompt(self, **kwargs):
+                # The realtime adapter sizes its auto length budget from the
+                # script tokens and the TTS-LM prompt length, so both must be
+                # present alongside the generic input_ids.
+                return {
+                    "input_ids": torch.zeros(1, 2, dtype=torch.long),
+                    "tts_text_ids": torch.ones(1, 4, dtype=torch.long),
+                    "tts_lm_input_ids": torch.ones(1, 6, dtype=torch.long),
+                }
+
+        preset = {
+            key: MagicMock(last_hidden_state=torch.zeros(1, 2, 8))
+            for key in PRESET_CACHE_KEYS
+        }
+        with patch(
+            "ComfyUI_VibeVoice.modules.realtime_generation.ProgressBarWithConsole"
+        ) as mock_pbar_cls, patch(
+            "ComfyUI_VibeVoice.modules.realtime_generation.model_management.get_torch_device",
+            return_value=torch.device("cpu"),
+        ), patch(
+            "ComfyUI_VibeVoice.modules.realtime_generation.model_management.throw_exception_if_processing_interrupted"
+        ):
+            mock_pbar = MagicMock()
+            mock_pbar.total = 10
+            mock_pbar_cls.return_value = mock_pbar
+
+            waveform, sample_rate = generate_realtime_audio(
+                model=VibeVoiceStreamingForConditionalGenerationInference(),
+                processor=VibeVoiceStreamingProcessor(),
+                text="[1] Hello world",
+                voice_preset=preset,
+                diffusion_steps=10,
             )
 
-            values = [c.args[0] for c in mock_pbar.update_absolute.call_args_list if c.args]
-            # Loop updates (all but the final guaranteed event) must be monotonic.
-            loop_values = values[:-1]
-            assert 1 in loop_values and 2 in loop_values and 3 in loop_values
-            assert loop_values == sorted(loop_values), f"progress must be monotonic, got {loop_values}"
-            # The final event must always be present (guaranteed 100%).
-            assert values[-1] == mock_pbar.total
+        assert sample_rate == 24000
+        assert waveform.shape == (1, 1, 24)
+        mock_pbar_cls.assert_called_once_with(1)
+        values = [c.args[0] for c in mock_pbar.update_absolute.call_args_list if c.args]
+        assert 1 in values and 2 in values and 3 in values
+        assert values == sorted(values)
+        mock_pbar.close.assert_called_once()
+
+    def test_realtime_cancellation_reaches_comfyui_interrupt_handling(self):
+        import comfy.model_management as model_management
+
+        from ComfyUI_VibeVoice.nodes.tts_node import VibeVoiceTTSNode
+
+        realtime_model = type("VibeVoiceStreamingForConditionalGenerationInference", (), {})()
+        realtime_processor = type("VibeVoiceStreamingProcessor", (), {})()
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_model",
+            return_value=(MagicMock(), realtime_model, realtime_processor),
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.get_cached_voice_preset",
+            return_value={"lm": MagicMock()},
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_realtime_audio",
+            side_effect=model_management.InterruptProcessingException(),
+        ):
+            result = VibeVoiceTTSNode.execute(
+                model_name="VibeVoice-Realtime-0.5B",
+                text="[1] Hello world",
+                quantize_llm_4bit=False,
+                attention_mode="sdpa",
+                cfg_scale=1.3,
+                inference_steps=10,
+                seed=42,
+                do_sample=True,
+                temperature=0.95,
+                top_p=0.95,
+                top_k=0,
+                force_offload=False,
+                device="cpu",
+                dtype="fp32",
+                voice_preset="en-Carter_man",
+            )
+
+        assert result[0]["waveform"].abs().sum().item() == 0.0
+        assert result[0]["sample_rate"] == 24000
 
     def test_asr_node_reports_increasing_progress(self):
         from ComfyUI_VibeVoice.nodes.asr_node import VibeVoiceASRNode

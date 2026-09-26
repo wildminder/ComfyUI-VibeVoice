@@ -15,6 +15,7 @@ from ..modules.model_info import (
     AVAILABLE_VIBEVOICE_MODELS,
     get_asr_models,
     is_model_type,
+    normalize_asr_model_name,
     MODEL_CONFIGS,
 )
 from ..modules.asr_generation import (
@@ -178,6 +179,11 @@ class VibeVoiceASRNode(io.ComfyNode):
 
         model_name = kwargs.get("model_name")
         if model_name is not None and model_name != "No ASR models found":
+            # Legacy "VibeVoice-ASR" resolves to its streaming successor
+            # unless a local checkpoint of that name was discovered.
+            model_name = normalize_asr_model_name(
+                model_name, available=AVAILABLE_VIBEVOICE_MODELS
+            )
             if model_name not in AVAILABLE_VIBEVOICE_MODELS:
                 available = list(AVAILABLE_VIBEVOICE_MODELS.keys())
                 return f"Model '{model_name}' not found. Available models: {available}"
@@ -236,6 +242,11 @@ class VibeVoiceASRNode(io.ComfyNode):
             # Use the bundle's model name for offload cache keying.
             model_name = external_model.get("model_name", model_name)
         else:
+            # Legacy "VibeVoice-ASR" workflows resolve to the streaming
+            # successor (see validate_inputs).
+            model_name = normalize_asr_model_name(
+                model_name, available=AVAILABLE_VIBEVOICE_MODELS
+            )
             # Load ASR model via the patcher/VRAM system (CRIT-001 fix).
             patcher, model, processor = load_asr_model_patched(
                 model_name=model_name,

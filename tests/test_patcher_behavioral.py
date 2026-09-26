@@ -153,9 +153,9 @@ class TestWarmOffload:
         calls = {"n": 0}
         original_load = tiny_patcher.model.load_model
 
-        def counting_load(device, attn="sdpa"):
+        def counting_load(device, attention_mode="sdpa"):
             calls["n"] += 1
-            return original_load(device, attn)
+            return original_load(device, attention_mode=attention_mode)
 
         tiny_patcher.model.load_model = counting_load
 
@@ -184,7 +184,7 @@ class TestPatchSkipsLoadWhenModelPreloaded:
 
         calls = {"n": 0}
 
-        def counting_load(device, attn="sdpa"):
+        def counting_load(device, attention_mode="sdpa"):
             calls["n"] += 1
 
         tiny_handler.load_model = counting_load

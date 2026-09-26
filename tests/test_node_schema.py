@@ -4,7 +4,59 @@ import pytest
 from unittest.mock import patch
 
 from ComfyUI_VibeVoice.nodes.tts_node import VibeVoiceTTSNode
+from ComfyUI_VibeVoice.nodes.realtime_node import VibeVoiceRealtimeNode
 from ComfyUI_VibeVoice.nodes.asr_node import VibeVoiceASRNode
+from ComfyUI_VibeVoice.modules.device_utils import get_device_options
+
+
+# Compatibility snapshots captured before unified-node schema changes. These
+# immutable orderings protect saved workflows that bind widget values by input
+# position. New inputs may only be appended after the corresponding prefix.
+LEGACY_MAIN_TTS_INPUT_IDS = (
+    "model_name",
+    "text",
+    "quantize_llm_4bit",
+    "attention_mode",
+    "cfg_scale",
+    "inference_steps",
+    "seed",
+    "do_sample",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_new_tokens",
+    "force_offload",
+    "device",
+    "dtype",
+    "external_model",
+    "speaker_1_voice",
+    "speaker_2_voice",
+    "speaker_3_voice",
+    "speaker_4_voice",
+)
+
+LEGACY_REALTIME_INPUT_IDS = (
+    "model_name",
+    "text",
+    "quantize_llm_4bit",
+    "attention_mode",
+    "cfg_scale",
+    "inference_steps",
+    "seed",
+    "do_sample",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stream",
+    "force_offload",
+    "device",
+    "dtype",
+    "external_model",
+    "speaker_1_voice",
+    "speaker_2_voice",
+    "speaker_3_voice",
+    "speaker_4_voice",
+)
 
 
 class TestVibeVoiceTTSNodeSchema:
@@ -21,6 +73,30 @@ class TestVibeVoiceTTSNodeSchema:
     def test_schema_node_id(self):
         schema = self._get_schema()
         assert schema.node_id == "VibeVoiceTTS"
+
+    def test_device_combo_accepts_every_supported_device_value(self):
+        """ComfyUI range-checks a Combo against its options and raises
+        "Value not in list" before execute() runs, so a runtime value that
+        get_torch_device() accepts must be offered here. "auto" is such a
+        value; omitting it broke every saved workflow using device="auto"."""
+        schema = self._get_schema()
+        device_input = next(i for i in schema.inputs if i.id == "device")
+        assert "auto" in device_input.options
+        for supported in get_device_options():
+            assert supported in device_input.options
+
+    def test_main_input_order_matches_legacy_snapshot(self):
+        input_ids = tuple(self._get_input_ids())
+        assert input_ids[:len(LEGACY_MAIN_TTS_INPUT_IDS)] == LEGACY_MAIN_TTS_INPUT_IDS
+        assert input_ids[len(LEGACY_MAIN_TTS_INPUT_IDS):] == ("voice_preset",)
+
+    def test_canonical_node_has_no_stream_widget(self):
+        assert "stream" not in self._get_input_ids()
+
+    def test_schema_has_voice_preset_input(self):
+        schema = self._get_schema()
+        preset_input = next(inp for inp in schema.inputs if inp.id == "voice_preset")
+        assert list(preset_input.options)[0] == "None"
 
     def test_schema_display_name(self):
         schema = self._get_schema()
@@ -85,6 +161,19 @@ class TestVibeVoiceTTSNodeSchema:
         assert len(schema.outputs) >= 1
 
 
+class TestLegacyRealtimeInputOrder:
+    """The legacy realtime schema order is an executable compatibility lock."""
+
+    def test_realtime_input_order_matches_legacy_snapshot(self):
+        schema = VibeVoiceRealtimeNode.define_schema()
+        input_ids = tuple(inp.id for inp in schema.inputs)
+        assert input_ids[:len(LEGACY_REALTIME_INPUT_IDS)] == LEGACY_REALTIME_INPUT_IDS
+        assert input_ids[len(LEGACY_REALTIME_INPUT_IDS):] == (
+            "max_new_tokens",
+            "voice_preset",
+        )
+
+
 class TestVibeVoiceTTSNodeValidate:
     """Test VibeVoiceTTSNode.validate_inputs."""
 
@@ -105,13 +194,11 @@ class TestVibeVoiceTTSNodeValidate:
 
 
 class TestVibeVoiceTTSNodeSchemaModelFiltering:
-    """CRIT-002: TTS dropdown must only expose non-streaming TTS models.
+    """The canonical TTS dropdown lists standard then realtime models only.
 
-    Streaming (realtime) models are excluded: they require the streaming
-    generation path (generate_streaming_audio) exposed by the dedicated
-    VibeVoice Realtime TTS node. Routing them through this node raised
-    ``VibeVoiceStreamingProcessor.__call__() got an unexpected keyword
-    argument 'text'``.
+    Streaming (realtime) models are handled by the same node through the
+    official cached-voice-prompt path, so they must be listed. ASR models stay
+    on the ASR node and remain excluded.
     """
 
     def _get_model_options(self):
@@ -131,23 +218,21 @@ class TestVibeVoiceTTSNodeSchemaModelFiltering:
         assert "VibeVoice-ASR" not in options
         assert "VibeVoice-1.5B" in options
 
-    def test_tts_options_exclude_streaming(self):
+    def test_tts_options_include_streaming_after_standard(self):
         with patch(
             "ComfyUI_VibeVoice.modules.model_info.AVAILABLE_VIBEVOICE_MODELS",
             {
-                "VibeVoice-1.5B": {"type": "official"},
-                "VibeVoice-ASR": {"type": "official"},
                 "VibeVoice-Realtime-0.5B": {"type": "official"},
+                "VibeVoice-ASR": {"type": "official"},
+                "VibeVoice-1.5B": {"type": "official"},
             },
         ):
-            options = self._get_model_options()
-        assert "VibeVoice-Realtime-0.5B" not in options
-        assert "VibeVoice-ASR" not in options
-        assert "VibeVoice-1.5B" in options
+            options = list(self._get_model_options())
+        assert options == ["VibeVoice-1.5B", "VibeVoice-Realtime-0.5B"]
 
 
 class TestVibeVoiceTTSNodeValidateTypeGuard:
-    """CRIT-002: validate_inputs must reject non-TTS model types."""
+    """validate_inputs must route TTS families and reject ASR models."""
 
     def test_validate_accepts_tts_model(self):
         with patch(
@@ -166,17 +251,27 @@ class TestVibeVoiceTTSNodeValidateTypeGuard:
         assert isinstance(result, str)
         assert "ASR" in result
 
-    def test_validate_rejects_streaming_model(self):
-        """Streaming models must be rejected with a pointer to the Realtime node."""
+    def test_validate_accepts_streaming_model_with_preset(self):
         with patch(
             "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
             {"VibeVoice-Realtime-0.5B": {}},
         ):
             result = VibeVoiceTTSNode.validate_inputs(
-                model_name="VibeVoice-Realtime-0.5B"
+                model_name="VibeVoice-Realtime-0.5B", voice_preset="en-Carter_man"
+            )
+        assert result is True
+
+    def test_validate_rejects_streaming_model_without_preset(self):
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
+            {"VibeVoice-Realtime-0.5B": {}},
+        ):
+            result = VibeVoiceTTSNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B", voice_preset="None"
             )
         assert isinstance(result, str)
-        assert "Realtime" in result
+        assert "voice_preset" in result
+        assert "models/tts/VibeVoice/voices" in result
 
 
 class TestVibeVoiceTTSNodeValidateExternalModel:
@@ -207,26 +302,31 @@ class TestVibeVoiceTTSNodeValidateExternalModel:
         in kwargs, not on a non-None value. Previously this fell through and rejected
         the stale model_name widget (e.g. a streaming model on the TTS node)."""
         with patch(
-            "ComfyUI_VibeVoice.nodes.tts_node.is_model_type",
-            return_value=True,  # model_name would be flagged as streaming
+            "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
+            {},
         ):
             result = VibeVoiceTTSNode.validate_inputs(
                 external_model=None, model_name="VibeVoice-Realtime-0.5B"
             )
         assert result is True
 
-    def test_validate_rejects_streaming_model_when_external_absent(self):
-        """Without a connected external_model, a streaming model_name is still rejected."""
+    def test_validate_requires_preset_for_named_realtime_model(self):
+        """Without a connected external_model, a realtime model_name still needs
+        a non-None voice preset, and an old prompt without the key counts as
+        missing."""
         with patch(
             "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
             {"VibeVoice-Realtime-0.5B": {}},
-        ), patch(
-            "ComfyUI_VibeVoice.nodes.tts_node.is_model_type",
-            side_effect=lambda name, typ: typ == "streaming_tts",
         ):
-            result = VibeVoiceTTSNode.validate_inputs(model_name="VibeVoice-Realtime-0.5B")
-        assert isinstance(result, str)
-        assert "streaming" in result
+            missing_key = VibeVoiceTTSNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B"
+            )
+            none_value = VibeVoiceTTSNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B", voice_preset="None"
+            )
+        assert isinstance(missing_key, str)
+        assert "voice_preset" in missing_key
+        assert missing_key == none_value
 
 
 class TestVibeVoiceTTSNodeExecuteExternalModel:
@@ -370,13 +470,29 @@ class TestVibeVoiceTTSNodeExecuteExternalModel:
         call_args = mock_ext.call_args
         assert call_args[0][0] is bundle
 
-    def test_execute_rejects_streaming_external_model(self):
-        """A streaming external model on the TTS node raises ValueError."""
-        bundle = self._make_bundle(is_streaming=True)
+    def test_execute_routes_streaming_external_model_to_realtime(self):
+        """A streaming external bundle reaches the realtime adapter."""
+        from unittest.mock import MagicMock
 
-        with pytest.raises(ValueError, match="Realtime"):
+        bundle = self._make_bundle(is_streaming=True)
+        model = type("VibeVoiceStreamingForConditionalGenerationInference", (), {})()
+        processor = type("VibeVoiceStreamingProcessor", (), {})()
+        with patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.load_vibevoice_from_external",
+            return_value=(MagicMock(), model, processor),
+        ) as load_external, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.get_cached_voice_preset",
+            return_value={"lm": MagicMock()},
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_realtime_audio",
+            return_value=(MagicMock(), 24000),
+        ) as generate, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.generate_audio"
+        ) as generate_standard, patch(
+            "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
+        ):
             VibeVoiceTTSNode.execute(
-                model_name="VibeVoice-1.5B",
+                model_name="IgnoredModel",
                 text="[1] Hello",
                 quantize_llm_4bit=False,
                 attention_mode="sdpa",
@@ -391,7 +507,12 @@ class TestVibeVoiceTTSNodeExecuteExternalModel:
                 device="cpu",
                 dtype="fp32",
                 external_model=bundle,
+                voice_preset="en-Carter_man",
             )
+
+        load_external.assert_called_once()
+        generate.assert_called_once()
+        generate_standard.assert_not_called()
 
     def test_execute_rejects_asr_external_model(self):
         """An ASR external model on the TTS node raises ValueError."""

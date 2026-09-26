@@ -70,6 +70,22 @@ class VibeVoiceStreamingPreTrainedModel(PreTrainedModel):
     _supports_attention_backend = True
 
     def _init_weights(self, module):
+        # transformers 5.x builds the model on meta, loads the checkpoint, then
+        # walks the whole graph through _initialize_missing_keys ->
+        # initialize_weights() -> _init_weights(). PreTrainedModel._initialize_weights
+        # only honours the per-parameter ``_is_hf_initialized`` flag for remote
+        # code, so without this guard every checkpoint-loaded tensor is
+        # overwritten with the initializer distribution. Measured against
+        # VibeVoice-Realtime-0.5B that silently destroyed 8 tensors
+        # (acoustic_connector.{fc1,fc2} and tts_eos_classifier.{fc1,fc2},
+        # weight+bias) while reporting missing=276 unexpected=0. A module whose
+        # own parameters are all flagged is already loaded and must be left
+        # alone; a module with any unflagged parameter is genuinely new (e.g. the
+        # checkpoint-absent acoustic-tokenizer encoder) and is still initialised.
+        params = list(module.parameters(recurse=False))
+        if params and all(getattr(p, "_is_hf_initialized", False) for p in params):
+            return
+
         if isinstance(module, VibeVoiceDiffusionHead):
             module.initialize_weights()
             return

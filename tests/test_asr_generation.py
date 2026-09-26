@@ -2,6 +2,7 @@
 
 import torch
 import pytest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from ComfyUI_VibeVoice.modules.asr_generation import load_asr_model, load_asr_model_patched, transcribe_audio, force_offload_asr_model
@@ -599,3 +600,348 @@ class TestASRProgressReporting:
         mock_pbar_cls.assert_called_once_with(100)
         final_call = mock_pbar.update_absolute.call_args_list[-1]
         assert final_call.args == (100,)
+
+
+class TestASRHandlerReceivesAttentionMode:
+    """Regression: the patcher called the handler's load_model POSITIONALLY
+    with the attention mode; the ASR handler's signature is
+    (device, dtype_str, attention_mode), so "sdpa" landed in dtype_str and
+    resolve_dtype raised 'Unknown dtype: sdpa'."""
+
+    def test_real_asr_handler_gets_dtype_and_attention(self):
+        from ComfyUI_VibeVoice.modules.asr_loader import VibeVoiceASRModelHandler
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        received = {}
+
+        def fake_loader_load(model_name, device, dtype_str="auto", attention_mode="sdpa"):
+            received["dtype_str"] = dtype_str
+            received["attention_mode"] = attention_mode
+            return torch.nn.Linear(2, 2).eval(), object()
+
+        handler = VibeVoiceASRModelHandler("VibeVoice-ASR-Streaming-1.5B")
+
+        # Exercise the REAL handler.load_model with VibeVoiceASRLoader mocked.
+        with patch(
+            "ComfyUI_VibeVoice.modules.asr_loader.VibeVoiceASRLoader.load_model",
+            side_effect=fake_loader_load,
+        ):
+            handler.load_model(torch.device("cpu"), "auto", "flash_attention_2")
+
+        assert received["dtype_str"] == "auto"
+        assert received["attention_mode"] == "flash_attention_2"
+
+    def test_patcher_calls_handler_with_keyword_attention(self):
+        """The shared VibeVoicePatcher.patch_model must pass attention_mode
+        as a keyword so the ASR handler's (device, dtype_str, attention_mode)
+        signature receives it in the right slot."""
+        from ComfyUI_VibeVoice.modules.patcher import VibeVoicePatcher
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        tiny = torch.nn.Linear(8, 8)
+
+        class _ASRStyleHandler(torch.nn.Module):
+            """Handler with the ASR signature; records how it was called."""
+            def __init__(self):
+                super().__init__()
+                self.model = None
+                self.processor = object()
+                self.model_pack_name = "asr-style"
+                self.cache_key = "asr-style"
+                self.size = 1024
+                self.calls = []
+
+            def load_model(self, device, dtype_str="auto", attention_mode="sdpa"):
+                self.calls.append({"dtype_str": dtype_str, "attention_mode": attention_mode})
+                self.model = tiny
+
+        handler = _ASRStyleHandler()
+        with patch("comfy.model_patcher.ModelPatcher.__init__"):
+            patcher = VibeVoicePatcher(
+                handler,
+                attention_mode="flash_attention_2",
+                load_device=torch.device("cpu"),
+                offload_device=torch.device("cpu"),
+                size=1024,
+            )
+        patcher.load_device = torch.device("cpu")
+        patcher.offload_device = torch.device("cpu")
+        patcher.model = handler
+        patcher.pinned = set()
+        patcher.target_dtype = None
+
+        with patch("comfy.model_patcher.ModelPatcher.patch_model"):
+            patcher.patch_model()
+
+        assert handler.calls == [
+            {"dtype_str": "auto", "attention_mode": "flash_attention_2"}
+        ]
+
+
+class TestTranscribeNative:
+    """The HF-native path (microsoft/VibeVoice-ASR-HF): processors from the
+    transformers builtins route through apply_transcription_request -> generate
+    -> decode(return_format='parsed'), and segments map onto our schema."""
+
+    @staticmethod
+    def _make_native_processor(parsed):
+        """A processor stub whose class module marks it as transformers-native."""
+        class _BatchFeature(dict):
+            """Minimal BatchFeature stand-in with .to(device, dtype)."""
+            def to(self, *args, **kwargs):
+                return self
+
+        class _NativeProcessor:
+            def __init__(self):
+                self.tokenizer = MagicMock()
+                self.tokenizer.pad_token_id = 151655
+                self.tokenizer.eos_token_id = 151643
+                self._parsed = parsed
+                self.requests = []
+
+            def apply_transcription_request(self, audio, prompt=None, **kwargs):
+                self.requests.append({"audio": audio, "prompt": prompt, **kwargs})
+                return _BatchFeature(input_ids=torch.tensor([[1, 2, 3]]),
+                                     input_values=torch.zeros(1, 100),
+                                     padding_mask=torch.ones(1, 100, dtype=torch.bool),
+                                     attention_mask=torch.ones(1, 3, dtype=torch.bool))
+
+            def decode(self, ids, **kwargs):
+                if kwargs.get("return_format") == "parsed":
+                    return [self._parsed]
+                return ["raw text"]
+
+        _NativeProcessor.__module__ = "transformers.models.vibevoice_asr.processing_vibevoice_asr"
+        return _NativeProcessor()
+
+    def _transcribe(self, parsed, **kwargs):
+        mock_model = MagicMock()
+        mock_param = MagicMock()
+        mock_param.device = torch.device("cpu")
+        mock_param.dtype = torch.float32
+        mock_model.parameters.return_value = iter([mock_param])
+        mock_model.generate.return_value = torch.tensor([[1, 2, 3, 4, 5, 0]])
+        processor = self._make_native_processor(parsed)
+
+        with patch("ComfyUI_VibeVoice.modules.asr_generation.extract_audio_tensor") as mock_extract, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBarWithConsole") as mock_pbar_cls:
+            mock_extract.return_value = (torch.randn(24000), 24000)
+            mock_pbar = MagicMock()
+            mock_pbar.total = kwargs.get("max_new_tokens", 32768)
+            mock_pbar_cls.return_value = mock_pbar
+            result = transcribe_audio(
+                model=mock_model,
+                processor=processor,
+                audio_input={"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000},
+                **kwargs,
+            )
+        return result, mock_model, processor
+
+    def test_native_processor_routes_to_native_path(self):
+        """A transformers-native processor never hits the legacy JSON-prompt
+        processor call: apply_transcription_request builds the inputs."""
+        (raw_text, segments), mock_model, processor = self._transcribe(
+            parsed=[{"Start": 0.0, "End": 6.27, "Speaker": 0,
+                     "Content": "Hello from native."}]
+        )
+        # generate() received the chat-template inputs, not a legacy dict.
+        gen_kwargs = mock_model.generate.call_args.kwargs
+        assert "input_ids" in gen_kwargs
+        # streamer present for greedy/sampling
+        assert gen_kwargs.get("streamer") is not None
+        assert raw_text == "raw text"
+
+    def test_parsed_segments_map_to_node_schema(self):
+        """Start/End/Speaker/Content map onto speaker/text/start/end."""
+        (raw_text, segments), _, _ = self._transcribe(
+            parsed=[{"Start": 0.0, "End": 6.27, "Speaker": 1,
+                     "Content": "Hello from native."},
+                    {"Start": 6.27, "End": 12.5, "Speaker": 0,
+                     "Content": "Second segment."}]
+        )
+        assert segments == [
+            {"speaker": 1, "text": "Hello from native.", "start": 0.0, "end": 6.27},
+            {"speaker": 0, "text": "Second segment.", "start": 6.27, "end": 12.5},
+        ]
+
+    def test_parse_failure_returns_no_segments(self):
+        """decode(parsed) falling back to the raw string yields no segments
+        (and doesn't raise)."""
+        (raw_text, segments), _, _ = self._transcribe(parsed="not a list")
+        assert segments == []
+        assert raw_text == "raw text"
+
+    def test_non_native_rate_input_is_resampled(self):
+        """The native feature extractor refuses non-24k audio ("trained
+        using a sampling rate of 24000 ... not 44100") — the node resamples
+        to the extractor's declared rate before the request, like the main
+        VibeVoice routine."""
+        import numpy as np
+        from ComfyUI_VibeVoice.modules import asr_generation
+
+        processor = self._make_native_processor([])
+        # Real feature_extractor attribute so the target rate is 24000.
+        processor.feature_extractor = SimpleNamespace(sampling_rate=24000)
+
+        mock_model = MagicMock()
+        mock_param = MagicMock()
+        mock_param.device = torch.device("cpu")
+        mock_param.dtype = torch.float32
+        mock_model.parameters.return_value = iter([mock_param])
+        mock_model.generate.return_value = torch.tensor([[1, 2, 3, 4]])
+
+        resampled = {"called": False}
+
+        def fake_resample(arr, orig_sr, target_sr):
+            resampled["called"] = True
+            resampled["orig_sr"] = orig_sr
+            resampled["target_sr"] = target_sr
+            return arr
+
+        # 1 second of 44.1 kHz audio arriving from the ComfyUI audio input.
+        with patch("ComfyUI_VibeVoice.modules.asr_generation.extract_audio_tensor") as mock_extract, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBarWithConsole"), \
+             patch.object(asr_generation, "resample_audio", side_effect=fake_resample):
+            mock_extract.return_value = (torch.randn(44100), 44100)
+            transcribe_audio(
+                model=mock_model,
+                processor=processor,
+                audio_input={"waveform": torch.randn(1, 1, 44100), "sample_rate": 44100},
+            )
+
+        assert resampled["called"] is True
+        assert resampled["orig_sr"] == 44100
+        assert resampled["target_sr"] == 24000
+
+    def test_native_rate_input_skips_resample(self):
+        """24 kHz input goes straight into the request untouched."""
+        processor = self._make_native_processor([])
+        processor.feature_extractor = SimpleNamespace(sampling_rate=24000)
+
+        mock_model = MagicMock()
+        mock_param = MagicMock()
+        mock_param.device = torch.device("cpu")
+        mock_param.dtype = torch.float32
+        mock_model.parameters.return_value = iter([mock_param])
+        mock_model.generate.return_value = torch.tensor([[1, 2, 3, 4]])
+
+        with patch("ComfyUI_VibeVoice.modules.asr_generation.extract_audio_tensor") as mock_extract, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBarWithConsole"), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.resample_audio") as mock_resample:
+            mock_extract.return_value = (torch.randn(24000), 24000)
+            transcribe_audio(
+                model=mock_model,
+                processor=processor,
+                audio_input={"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000},
+            )
+        mock_resample.assert_not_called()
+
+    def test_context_info_passed_as_prompt(self):
+        """Hotword context flows into apply_transcription_request(prompt=)."""
+        processor = self._make_native_processor([])
+        mock_model = MagicMock()
+        mock_param = MagicMock()
+        mock_param.device = torch.device("cpu")
+        mock_param.dtype = torch.float32
+        mock_model.parameters.return_value = iter([mock_param])
+        mock_model.generate.return_value = torch.tensor([[1, 2, 3, 4]])
+
+        with patch("ComfyUI_VibeVoice.modules.asr_generation.extract_audio_tensor") as mock_extract, \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.ProgressBarWithConsole"):
+            mock_extract.return_value = (torch.randn(24000), 24000)
+            transcribe_audio(
+                model=mock_model,
+                processor=processor,
+                audio_input={"waveform": torch.randn(1, 1, 24000), "sample_rate": 24000},
+                context_info="Tea Brew, Aiden Host",
+            )
+        assert len(processor.requests) == 1
+        assert processor.requests[0]["prompt"] == "Tea Brew, Aiden Host"
+
+
+class TestASRAttentionSwitchNoLeak:
+    """Deterministic proof of the 2026-09-09 leak fix: switching attention
+    mode (sdpa -> sage) must FULLY release the previous model — exactly one
+    cache entry per active model, no stale third-format entries, the family
+    active key tracks the new model."""
+
+    def _run_patched_load(self, models_by_attn, attention_mode):
+        from ComfyUI_VibeVoice.modules.asr_loader import VibeVoiceASRModelHandler
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_model_patched
+
+        def fake_load(self, device, attention_mode="sdpa"):
+            self.model = models_by_attn[attention_mode]
+            self.processor = object()
+
+        with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load), \
+             patch("comfy.model_patcher.ModelPatcher.patch_model"), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
+                   side_effect=lambda p: p.patch_model()), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
+                   return_value=torch.device("cpu")), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device",
+                   return_value=torch.device("cpu")):
+            return load_asr_model_patched(
+                model_name="VibeVoice-ASR", device="cpu", dtype="fp32",
+                attention_mode=attention_mode,
+            )
+
+    def test_attention_switch_releases_everything(self):
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.model_registry import FAMILY_ASR, get_active, clear_active_keys
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        clear_active_keys()
+        sdpa_model, sage_model = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
+        models_by_attn = {"sdpa": sdpa_model, "sage": sage_model}
+
+        try:
+            # Run 1: sdpa — one patcher + one model entry, under ONE key format.
+            _, model1, _ = self._run_patched_load(models_by_attn, "sdpa")
+            assert model1 is sdpa_model
+            assert list(VIBEVOICE_ASR_PATCHER_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sdpa"]
+            assert list(LOADED_ASR_MODELS_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sdpa"]
+            assert get_active(FAMILY_ASR) == "asr_VibeVoice-ASR_attn_sdpa"
+
+            # Run 2: sage — the sdpa model must be FULLY released before the
+            # new one loads (this is where the old code leaked a stale
+            # static-format entry pinning the 17 GB tree).
+            _, model2, _ = self._run_patched_load(models_by_attn, "sage")
+            assert model2 is sage_model
+            assert list(VIBEVOICE_ASR_PATCHER_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sage"]
+            assert list(LOADED_ASR_MODELS_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sage"]
+            assert get_active(FAMILY_ASR) == "asr_VibeVoice-ASR_attn_sage"
+        finally:
+            LOADED_ASR_MODELS_CACHE.clear()
+            VIBEVOICE_ASR_PATCHER_CACHE.clear()
+            clear_active_keys()
+
+    def test_dtype_switch_keeps_single_entry(self):
+        """dtype is NOT part of the ASR patcher key (matching TTS): a dtype
+        change reuses the patcher and the DF-004 cast applies the new dtype —
+        no rebuild, no extra entries."""
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.model_registry import clear_active_keys
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        clear_active_keys()
+        one_model = torch.nn.Linear(4, 4)
+        models_by_attn = {"sdpa": one_model}
+
+        try:
+            _, model1, _ = self._run_patched_load(models_by_attn, "sdpa")
+            # Same key again (dtype not in key) -> same patcher, no rebuild.
+            _, model2, _ = self._run_patched_load(models_by_attn, "sdpa")
+            assert model1 is one_model and model2 is one_model
+            assert list(VIBEVOICE_ASR_PATCHER_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sdpa"]
+            assert list(LOADED_ASR_MODELS_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sdpa"]
+        finally:
+            LOADED_ASR_MODELS_CACHE.clear()
+            VIBEVOICE_ASR_PATCHER_CACHE.clear()
+            clear_active_keys()
