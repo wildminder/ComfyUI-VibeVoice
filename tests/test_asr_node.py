@@ -27,7 +27,7 @@ class TestVibeVoiceASRNodeSchema:
 
     def test_schema_category(self):
         schema = self._get_schema()
-        assert schema.category == "audio/asr"
+        assert schema.category == "WMNodes/sound/asr"
 
     def test_schema_has_model_name_input(self):
         assert "model_name" in self._get_input_ids()

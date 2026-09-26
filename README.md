@@ -81,7 +81,7 @@ Alternatively, to install manually:
 > `pip install scipy librosa` (or `pip install ComfyUI-VibeVoice[audio-extra]`).
 
 4.  **Start/Restart ComfyUI:**
-    Launch ComfyUI. The "VibeVoice TTS" node will appear under the `audio/tts` category. The first time you use the node, it will automatically download the selected model to your `ComfyUI/models/tts/VibeVoice/` folder.
+    Launch ComfyUI. The "VibeVoice TTS" node will appear under the `WMNodes/sound/tts` category. The first time you use the node, it will automatically download the selected model to your `ComfyUI/models/tts/VibeVoice/` folder.
 
 ## Models
 | Model | Context Length | Generation Length |  Weight |
@@ -180,10 +180,10 @@ Example realtime setup:
 4.  Write a single-speaker script, leave the `speaker_*_voice` inputs unconnected, and
     queue the prompt.
 
-> **Deprecated:** the old `VibeVoice Realtime TTS` node ID (`VibeVoiceRealtime`) still loads
-> and forwards to `VibeVoice TTS` so saved workflows keep working, but it is deprecated and
-> will be removed in the next major release. Build new realtime workflows with
-> `VibeVoice TTS`.
+> `VibeVoice TTS` is the only TTS node: it serves standard and realtime model
+> families alike. The former `VibeVoice Realtime TTS` node has been removed, so
+> workflows saved against it need the node swapped for `VibeVoice TTS` — the model
+> selection and the script carry over unchanged.
 
 ### Node Inputs
 
@@ -319,6 +319,38 @@ works, anything longer never terminates on its own.
 ## Changelog
 
 <details open>
+<summary><strong>v2.10.0 - One TTS node, WMNodes categories, self-contained tests</strong></summary>
+
+### ✨ Changes
+*   **The dedicated realtime TTS node is removed.** `VibeVoice TTS` loads realtime
+    models correctly, so `nodes/realtime_node.py` and the `VibeVoiceRealtime` node ID
+    are gone along with their shim tests and the legacy workflow fixture. This node
+    only ever existed in the unreleased 2.x line, so no published workflow referenced
+    it. Realtime models are unchanged: pick one in `model_name` on `VibeVoice TTS`.
+*   **All nodes move under `WMNodes`.** `VibeVoice TTS` and `VibeVoice External Loader`
+    are `WMNodes/sound/tts`; `VibeVoice ASR` is `WMNodes/sound/asr`. Node IDs are
+    unchanged, so saved workflows still load — only the menu location moves.
+
+### 🐞 Bug Fixes
+*   **The published test suite no longer depends on local-only files.** Tests that read
+    a development document or a local tool now either assert the same invariant against
+    something the repository owns, or skip cleanly when the tool is absent. Previously a
+    clone without that local tree reported 9 failures and 18 collection errors; it now
+    matches a full checkout exactly.
+*   **A shipped tool that could not run is withdrawn.** `audio_acceptance.py` depended
+    on a module that was never tracked, so it raised `ModuleNotFoundError` on first use
+    for anyone who cloned. It is a development harness with no consumer in the node
+    code and is no longer part of the package.
+
+### 🧪 Tests
+*   The `transformers` range guard keeps its teeth against a self-contained measured-version
+    set: removing the `<5.4` cap, or claiming a version nobody measured, still fails.
+*   The realtime GPU-audit fixtures skip instead of erroring when the local diagnostic
+    script is not present.
+
+</details>
+
+<details>
 <summary><strong>v2.9.0 - One canonical TTS node with correct realtime-model support</strong></summary>
 
 ### ✨ New Features
@@ -363,10 +395,9 @@ works, anything longer never terminates on its own.
 
 ### 🔧 Changes
 *   **Deprecated forwarding shim.** `nodes/realtime_node.py` keeps the `VibeVoiceRealtime`
-    node ID, its exact legacy input order (including the no-op `stream` widget), and one
-    `AUDIO` output, but now holds no loading or generation logic: validation and execution
-    delegate to `VibeVoiceTTSNode`, `stream` is stripped, and one process-level deprecation
-    warning is logged. The class is targeted for removal in the next major release.
+    node ID and its exact legacy input order, but holds no loading or generation logic:
+    validation and execution delegate to `VibeVoiceTTSNode` and one process-level
+    deprecation warning is logged. Removed in the next release.
 *   **Shared lifecycle.** Output dictionary, audio preview, force-offload (warm re-attach),
     and the cancellation fallback are implemented once and shared by both families.
 *   **Validation.** Named realtime models require a non-`None` `voice_preset` at queue time
@@ -387,9 +418,9 @@ works, anything longer never terminates on its own.
     fallback, the full validation truth table, mutually exclusive routing, external
     realtime/ASR handling, the loaded-pair safety net, independent steps/length, ignored-input
     warnings, and the shared output/offload/cancel paths.
-*   `tests/test_realtime_node.py` was rewritten as shim tests: legacy widget order, one-time
-    deprecation warning, `stream` stripping, delegation-only source assertions, unique node
-    IDs, and a `tests/fixtures/legacy_realtime_workflow.json` compatibility fixture.
+*   `tests/test_realtime_node.py` covers the shim: legacy widget order, the one-time
+    deprecation warning, `stream` stripping, delegation-only source assertions, unique
+    node IDs, and a `tests/fixtures/legacy_realtime_workflow.json` compatibility fixture.
 *   Both serialization `xfail`s are **resolved**: real `BaseModelOutputWithPast` /
     `DynamicCache` round trips and the real `en-Carter_man.pt` prompt now load on
     transformers 5.3 with safe loading retained.
@@ -983,7 +1014,7 @@ works, anything longer never terminates on its own.
 *   **V3 Extension API:** Migrated the custom-node entrypoint to the ComfyUI V3 `ComfyExtension` / `io.ComfyNode` schema — type-filtered model dropdowns and declarative inputs/outputs.
 *   **VRAM Parity (ASR) — CRIT-001:** The ASR path now runs under the same `VibeVoicePatcher` / `model_management.load_model_gpu` orchestration as TTS, clearing the dedicated ASR cache on unload.
 *   **Warm Re-attach — NTH-004:** `force_offload` can retain model tensors on the intermediate device for a fast re-attach on the next run instead of reloading from disk.
-*   **Streaming TTS Node — NTH-001:** `VibeVoice-Realtime-0.5B` is now reachable through a dedicated `VibeVoice Realtime TTS` node that shares the patcher / attention machinery.
+*   **Streaming TTS Node — NTH-001:** `VibeVoice-Realtime-0.5B` became reachable from the patcher / attention machinery (it now runs on the single `VibeVoice TTS` node).
 *   **Maintainability — IMP-004:** TTS/ASR download, discovery, and sharded-load logic is now shared via `BaseVibeVoiceLoader`.
 *   **Device &amp; Attention Honesty — IMP-003 / IMP-001:** MPS/XPU/NPU device selection is honored when available; `flash_attention_2` is only offered when `flash-attn` + CUDA are present.
 *   **Docs Consistency — CRIT-003:** README zero-shot wording now matches `generate_audio` (at least one reference voice is required).

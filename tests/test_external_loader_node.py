@@ -58,8 +58,8 @@ class TestExternalLoaderNodeSchema:
         assert schema.outputs[0].io_type == "VIBEVOICE_MODEL"
 
     def test_node_category(self):
-        """Node category is 'audio/tts'."""
-        assert VibeVoiceExternalLoaderNode.CATEGORY == "audio/tts"
+        """Node category is 'WMNodes/sound/tts'."""
+        assert VibeVoiceExternalLoaderNode.CATEGORY == "WMNodes/sound/tts"
 
 
 class TestExternalLoaderNodeExecute:

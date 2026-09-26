@@ -16,14 +16,12 @@ try:
     from .nodes import (
         VibeVoiceTTSNode,
         VibeVoiceASRNode,
-        VibeVoiceRealtimeNode,
         VibeVoiceExternalLoaderNode,
     )
 except ImportError:
     from nodes import (
         VibeVoiceTTSNode,
         VibeVoiceASRNode,
-        VibeVoiceRealtimeNode,
         VibeVoiceExternalLoaderNode,
     )
 
@@ -37,8 +35,7 @@ class VibeVoiceExtension(ComfyExtension):
         return [
             VibeVoiceTTSNode,
             VibeVoiceASRNode,
-            VibeVoiceRealtimeNode,
-            VibeVoiceExternalLoaderNode,
+                VibeVoiceExternalLoaderNode,
         ]
 
 

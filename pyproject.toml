@@ -1,39 +1,10 @@
 [project]
-# Name intentionally keeps the "ComfyUI-" prefix although the registry
-# naming guide says not to: the package is already published under this
-# exact ID (see .github/workflows/publish.yml), and renaming would orphan
-# the existing registry entry and break updates for installed users.
 name = "ComfyUI-VibeVoice"
 description = "VibeVoice TTS. Expressive, long-form, multi-speaker conversational audio"
-version = "2.9.0"
+version = "2.10.0"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
-# Keep in sync with requirements.txt (guarded by tests/test_pyproject.py).
-# bitsandbytes + accelerate serve the transformers 4-bit quantization path
-# (BitsAndBytesConfig), which imports them lazily at runtime.
-#
-# transformers is bounded to the ONE line this node has been measured on:
-# 5.3.x. That is the line the realtime checkpoint is developed, tested and
-# shipped against (the ComfyUI environment ships 5.3.0), and it is the only
-# green row in docs/plans/2026-09-26-two-version-matrix.md for the realtime
-# family (11/11). The two claims that used to justify a cap below 5.0 are gone:
-#  - the 5.x `from_pretrained` re-running `_init_weights` over loaded tensors
-#    is fixed in-tree (the `_init_weights` guard in
-#    src/vibevoice/modular/modeling_vibevoice_streaming.py, regression-tested by
-#    tests/test_realtime_load_health.py and tests/test_pretrained_init_weights.py);
-#  - the 4.57.6 row is NOT green (test_realtime_checkpoint_generation_and_controls
-#    fails its auto-length assertion), so 4.x is not the validated line and
-#    admitting it is what the previous `<5` cap did by accident.
-# The floor is 5.3.0 for a second, independent reason: this package also ships
-# the ASR node, and modules/asr_loader.py imports
-# `VibeVoiceAsrForConditionalGeneration`, which exists in no 4.x release
-# (README support matrix). Capping below 5.0 made requirements.txt ask
-# ComfyUI-Manager to downgrade a package ComfyUI itself declares
-# (ComfyUI requirements.txt: `transformers>=4.50.3`) and would have broken ASR.
-# The upper bound is not a guess: <5.4 admits 5.3.x only, which is the line the
-# matrix has a measured row for. tests/test_pyproject.py::
-# TestTransformersRangeHonesty fails if the range ever admits a major with no
-# row in that matrix.
+
 dependencies = ["torch", "torchaudio", "numpy", "huggingface_hub", "accelerate", "soundfile", "tqdm", "safetensors", "transformers>=5.3.0,<5.4", "diffusers", "bitsandbytes"]
 classifiers = [
     "Operating System :: OS Independent",
