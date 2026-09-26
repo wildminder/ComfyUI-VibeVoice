@@ -275,10 +275,14 @@ class VibeVoiceASRTextTokenizerFast(Qwen2TokenizerFast):
         self._speech_start_id = self.convert_tokens_to_ids("<|object_ref_start|>")
         self._speech_end_id = self.convert_tokens_to_ids("<|object_ref_end|>")
         self._speech_pad_id = self.convert_tokens_to_ids("<|box_start|>")
+        # Streaming checkpoints: read-only, never added to the vocabulary.
+        self._text_chunk_end_id = self.convert_tokens_to_ids("<|text_chunk_end|>")
+        if self._text_chunk_end_id == self.unk_token_id:
+            self._text_chunk_end_id = None
 
         self._eos_id = self.eos_token_id # qwen2 / qwen3
         self._pad_id = self.convert_tokens_to_ids('<|image_pad|>')
-        
+
         return num_added    
     
     @property
@@ -300,7 +304,12 @@ class VibeVoiceASRTextTokenizerFast(Qwen2TokenizerFast):
     def speech_pad_id(self) -> int:
         """ID of the speech diffusion token."""
         return self._speech_pad_id
-    
+
+    @property
+    def text_chunk_end_id(self) -> int:
+        """ID of the text chunk end token (streaming checkpoints only)."""
+        return self._text_chunk_end_id
+
     @property
     def pad_id(self) -> int:
         return self._pad_id

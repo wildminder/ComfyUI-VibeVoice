@@ -29,6 +29,21 @@ logger = logging.get_logger(__name__)
 SYSTEM_PROMPT = "You are a helpful assistant that transcribes audio input into text output in JSON format."
 
 
+def _ships_tokenizer(pretrained_model_name_or_path, **kwargs) -> bool:
+    """Whether a checkpoint carries its own tokenizer files."""
+    from transformers.utils import cached_file
+
+    if os.path.exists(os.path.join(str(pretrained_model_name_or_path),
+                                   "tokenizer_config.json")):
+        return True
+    try:
+        cached_file(pretrained_model_name_or_path, "tokenizer_config.json",
+                    **kwargs)
+        return True
+    except Exception:
+        return False
+
+
 class VibeVoiceASRProcessor: 
     """
     Processor for VibeVoice ASR (Automatic Speech Recognition) models.
@@ -51,6 +66,8 @@ class VibeVoiceASRProcessor:
         speech_tok_compress_ratio=3200,
         target_sample_rate=24000,
         normalize_audio=True,
+        chunk_frames=None,
+        lookahead_frames=None,
         **kwargs
     ):
         self.tokenizer = tokenizer
@@ -61,14 +78,39 @@ class VibeVoiceASRProcessor:
         self.speech_tok_compress_ratio = speech_tok_compress_ratio
         self.target_sample_rate = target_sample_rate
         self.normalize_audio = normalize_audio
-        
+        # Streaming frame config (from a streaming checkpoint's
+        # preprocessor_config.json). Both present => the checkpoint speaks the
+        # chunked streaming protocol and must be driven via
+        # model.streaming_generate (the JSON-prompt generate() path is for
+        # non-streaming ASR checkpoints and produces garbage here).
+        self.chunk_frames = chunk_frames
+        self.lookahead_frames = lookahead_frames
+
         if normalize_audio:
             self.audio_normalizer = AudioNormalizer()
         else:
             self.audio_normalizer = None
-        
+
         # Cache special token IDs
         self._cache_special_tokens()
+
+    @property
+    def streaming_frame_config(self):
+        """Chunk/lookahead timing the checkpoint was trained on, or None.
+
+        Mirrors the frame-config derivation in the upstream streaming demo:
+        chunk_duration = chunk_frames * frame_seconds,
+        text_audio_delay = lookahead_frames * frame_seconds, where
+        frame_seconds = speech_tok_compress_ratio / target_sample_rate.
+        """
+        if self.chunk_frames is None or self.lookahead_frames is None:
+            return None
+        frame_seconds = self.speech_tok_compress_ratio / self.target_sample_rate
+        return {
+            "chunk_duration": self.chunk_frames * frame_seconds,
+            "text_audio_delay": self.lookahead_frames * frame_seconds,
+            "sample_rate": self.target_sample_rate,
+        }
     
     def _cache_special_tokens(self):
         """Cache special token IDs for efficiency."""
@@ -109,7 +151,7 @@ class VibeVoiceASRProcessor:
         """
         import json
         from transformers.utils import cached_file
-        from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceASRTextTokenizerFast
+        from ..modular.modular_vibevoice_text_tokenizer import VibeVoiceASRTextTokenizerFast
         
         # Try to load configuration
         config_path = os.path.join(pretrained_model_name_or_path, "preprocessor_config.json")
@@ -136,11 +178,29 @@ class VibeVoiceASRProcessor:
         target_sample_rate = config.get("target_sample_rate", 24000)
         normalize_audio = config.get("normalize_audio", True)
         
-        # Load tokenizer
-        language_model_pretrained_name = config.get("language_model_pretrained_name", None) or kwargs.pop("language_model_pretrained_name", "Qwen/Qwen2.5-1.5B")
+        # Streaming checkpoints (VibeVoice-ASR-Streaming-*) ship their own
+        # tokenizer files; those win over any base-LM name because
+        # <|text_chunk_end|> lives in them and not in the base vocabulary.
+        explicit_name = kwargs.pop("language_model_pretrained_name", None)
+        own_tokenizer = _ships_tokenizer(pretrained_model_name_or_path, **kwargs)
+        if own_tokenizer:
+            language_model_pretrained_name = pretrained_model_name_or_path
+        else:
+            language_model_pretrained_name = (
+                config.get("language_model_pretrained_name", None)
+                or explicit_name
+                or "Qwen/Qwen2.5-1.5B")
+        if explicit_name and explicit_name != language_model_pretrained_name:
+            # Dropping it silently surfaces much later as a vocabulary
+            # mismatch, by which point the argument looks like it was honoured.
+            logger.warning(
+                f"ignoring language_model_pretrained_name={explicit_name!r}: "
+                f"loading the tokenizer from {language_model_pretrained_name}, "
+                + ("which ships its own tokenizer files" if own_tokenizer
+                   else "as named in preprocessor_config.json"))
         logger.info(f"Loading tokenizer from {language_model_pretrained_name}")
-        
-        if 'qwen' in language_model_pretrained_name.lower():
+
+        if own_tokenizer or 'qwen' in str(language_model_pretrained_name).lower():
             tokenizer = VibeVoiceASRTextTokenizerFast.from_pretrained(
                 language_model_pretrained_name,
                 **kwargs
@@ -162,6 +222,8 @@ class VibeVoiceASRProcessor:
             speech_tok_compress_ratio=speech_tok_compress_ratio,
             target_sample_rate=target_sample_rate,
             normalize_audio=normalize_audio,
+            chunk_frames=config.get("chunk_frames"),
+            lookahead_frames=config.get("lookahead_frames"),
         )
     
     def save_pretrained(self, save_directory: Union[str, os.PathLike], **kwargs):
@@ -185,6 +247,10 @@ class VibeVoiceASRProcessor:
             "target_dB_FS": -25,
             "eps": 1e-6,
         }
+        if self.chunk_frames is not None:
+            processor_config["chunk_frames"] = self.chunk_frames
+        if self.lookahead_frames is not None:
+            processor_config["lookahead_frames"] = self.lookahead_frames
         
         config_path = os.path.join(save_directory, "preprocessor_config.json")
         with open(config_path, 'w') as f:
@@ -308,7 +374,18 @@ class VibeVoiceASRProcessor:
             audio_array = np.array(audio, dtype=np.float32)
             if audio_array.ndim > 1:
                 audio_array = audio_array.squeeze()
-        
+
+        # In-memory inputs carry their rate via the ``sampling_rate`` arg (the
+        # ComfyUI node passes numpy + the audio dict's rate). Without this,
+        # e.g. 44.1 kHz audio is treated as 24 kHz — silently wrong timing.
+        if not isinstance(audio, str) and sampling_rate is not None \
+                and sampling_rate != self.target_sample_rate:
+            audio_array = resample_audio(
+                audio_array,
+                orig_sr=sampling_rate,
+                target_sr=self.target_sample_rate
+            )
+
         # Ensure float32
         audio_array = audio_array.astype(np.float32)
         
@@ -358,7 +435,10 @@ class VibeVoiceASRProcessor:
         
         user_tokens = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": user_input_string}],
-            tokenize=True
+            tokenize=True,
+            # transformers >= 4.44 defaults to return_dict=True, returning a
+            # BatchEncoding instead of a plain id list — force the list form.
+            return_dict=False,
         )
         
         # Combine tokens

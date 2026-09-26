@@ -68,6 +68,47 @@ _SENTINEL_BUFFER_VALUES = {
     "fix_std": 0.5,
 }
 
+# Subtrees a released checkpoint may omit without indicating a broken load.
+#
+# VibeVoice-Realtime-0.5B ships an acoustic-tokenizer DECODER only (605 keys,
+# 276 of them the decoder). Its encoder is not part of the released TTS weights
+# and the generate path never calls it — it exists so the tokenizer can encode
+# audio for voice-cloning / training pipelines. Vanilla
+# `from_pretrained` reports the same 276 keys as MISSING for that checkpoint,
+# which is the reference behaviour; we match it instead of printing an
+# alarming warning on every realtime load, where it could mask a genuinely
+# missing key.
+#
+# A prefix is only treated as optional when the checkpoint supplied NO key
+# under it. If any encoder key is present, the rest are reported normally.
+OPTIONAL_ABSENT_PREFIXES = ("acoustic_tokenizer.encoder.",)
+
+
+def mark_optional_absent(
+    missing_keys: list[str],
+    assigned: set[str],
+    known_missing: set[str] | None = None,
+) -> set[str]:
+    """Add deliberately-omitted keys to ``known_missing``.
+
+    A prefix is only treated as optional when the checkpoint supplied NO key
+    under it. If even one key arrived, the remaining gaps under that prefix are
+    a real finding and stay reported.
+    """
+    known = set(known_missing or ())
+    seen = {
+        prefix
+        for prefix in OPTIONAL_ABSENT_PREFIXES
+        if any(key.startswith(prefix) for key in assigned)
+    }
+    for key in missing_keys:
+        for prefix in OPTIONAL_ABSENT_PREFIXES:
+            if key.startswith(prefix) and prefix not in seen:
+                known.add(key)
+                break
+    return known
+
+
 
 def _recompute_rope_buffers(model) -> int:
     """Recompute RoPE ``inv_freq`` buffers destroyed by meta-init (v2.3.2 fix).
@@ -879,6 +920,8 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # fixups' tied hint).
         expected = set(model.state_dict().keys())
         missing_keys = [k for k in expected if k not in assigned]
+        known_missing = mark_optional_absent(missing_keys, assigned, known_missing)
+
         return VibeVoiceLoader._post_assign_fixups(
             model, missing_keys, unexpected, known_missing
         )

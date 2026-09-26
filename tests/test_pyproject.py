@@ -29,6 +29,52 @@ def _dep_name(spec):
     return spec.split(">=")[0].split("==")[0].split("[")[0].strip().lower()
 
 
+def _version_tuple(version: str):
+    """(major, minor, patch) as ints, tolerating a local tag like "4.57.6+cu126"."""
+    parts = version.split("+")[0].split(".")
+    numbers = []
+    for part in parts[:3]:
+        digits = "".join(c for c in part if c.isdigit())
+        if not digits:
+            break
+        numbers.append(int(digits))
+    while len(numbers) < 3:
+        numbers.append(0)
+    return tuple(numbers)
+
+
+def _installed_transformers_version():
+    """The transformers version the suite is actually running against, or None."""
+    try:
+        import transformers
+    except ImportError:
+        return None
+    return transformers.__version__
+
+
+def _version_in_range(version: str, spec: str) -> bool:
+    """Does ``version`` satisfy a ``>=floor,<cap`` style specifier?"""
+    current = _version_tuple(version)
+    for part in spec.split(",", 1)[1:]:
+        part = part.strip()
+        if part.startswith(">="):
+            if current < _version_tuple(part[2:].strip()):
+                return False
+        elif part.startswith(">"):
+            if current <= _version_tuple(part[1:].strip()):
+                return False
+        elif part.startswith("<="):
+            if current > _version_tuple(part[2:].strip()):
+                return False
+        elif part.startswith("<"):
+            if current >= _version_tuple(part[1:].strip()):
+                return False
+        elif part.startswith("=="):
+            if current[:len(_version_tuple(part[2:].strip()))] != _version_tuple(part[2:].strip()):
+                return False
+    return True
+
+
 class TestPyprojectCompliance:
     """Test pyproject.toml V3 compliance."""
 
@@ -159,3 +205,112 @@ class TestRequirementsPyprojectParity:
                     f"requirements.txt wants >= {req_floor}, "
                     f"pyproject.toml wants >= {py_floor}."
                 )
+
+
+class TestTransformersRangeHonesty:
+    """S5.1: the declared ``transformers`` range must not admit an unvalidated version.
+
+    ``transformers`` is the one dependency whose internal API this node adapts to
+    (the realtime path carries a legacy pickled ``DynamicCache`` across a 4.x ->
+    5.x cache refactor). An unbounded or wrongly-bounded declaration therefore
+    lets an installer land on a major version nobody ran, and the failure is
+    silent: a wrong cache shim conditions the model on nothing and produces
+    plausible-looking audio.
+
+    The authority for "validated" is
+    ``docs/plans/2026-09-26-two-version-matrix.md`` — the recorded two-version
+    matrix. These tests keep the declaration and that record in step, so a future
+    5.x bump fails loudly in the default suite instead of at a user's machine.
+    """
+
+    MATRIX_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "docs", "plans", "2026-09-26-two-version-matrix.md",
+    )
+
+    @classmethod
+    def _spec(cls) -> str:
+        data = _load_pyproject()
+        specs = [d for d in data["project"]["dependencies"] if _dep_name(d) == "transformers"]
+        assert len(specs) == 1, (
+            f"pyproject.toml must declare transformers exactly once, found {specs}"
+        )
+        return specs[0]
+
+    @classmethod
+    def _matrix_text(cls) -> str:
+        with open(cls.MATRIX_PATH, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_transformers_range_is_upper_bounded(self):
+        """An unbounded range is exactly the F12 defect; it must not come back."""
+        spec = self._spec()
+        assert "<" in spec, (
+            f"pyproject.toml declares '{spec}' with no upper bound, so a future "
+            f"transformers 5.x/6.x install is accepted without validation. The "
+            f"checkpoint targets the 4.5x generation and the dual-API cache shim "
+            f"was measured against 4.57.6 and 5.3.0 only. Cap the range, or extend "
+            f"docs/plans/2026-09-26-two-version-matrix.md with a green row first."
+        )
+
+    def test_requirements_txt_bound_matches_pyproject(self):
+        """requirements.txt serves Manager installs; the cap must travel with it."""
+        py_spec = self._spec()
+        py_cap = py_spec.split("<")[-1].strip() if "<" in py_spec else None
+        for entry in _requirements_entries():
+            if _dep_name(entry) != "transformers":
+                continue
+            req_cap = entry.split("<")[-1].strip() if "<" in entry else None
+            assert req_cap == py_cap, (
+                f"transformers upper bounds disagree: pyproject.toml has {py_cap!r}, "
+                f"requirements.txt has {req_cap!r}. A Manager/git-clone install "
+                f"would resolve a different major than a registry install."
+            )
+
+    def test_range_matches_the_version_the_suite_runs_against(self):
+        """The installed transformers must satisfy the declared range.
+
+        This is the drift guard the plan asks for. It is allowed to be *outside*
+        the range only when the matrix explicitly records that version as
+        measured but not admitted — a development machine is allowed to run ahead
+        of what the package declares, an installable version is not.
+        """
+        spec = self._spec()
+        installed = _installed_transformers_version()
+        assert installed is not None, (
+            "transformers is not importable here, so the declared range cannot be "
+            "checked against the version the suite actually runs against."
+        )
+
+        if _version_in_range(installed, spec):
+            return
+
+        major = installed.split(".")[0]
+        matrix = self._matrix_text()
+        assert f"| **4.{major}" in matrix or f"| **{major}." in matrix, (
+            f"The suite is running transformers {installed}, which the declared "
+            f"range '{spec}' does not admit, and "
+            f"docs/plans/2026-09-26-two-version-matrix.md has no row for the "
+            f"{major}.x line. Either the range is wrong or the matrix is stale — "
+            f"an unrecorded major is exactly how F12 happened."
+        )
+
+    def test_every_admitted_major_has_a_matrix_row(self):
+        """A version the range admits must appear in the matrix as a measured row."""
+        spec = self._spec()
+        matrix = self._matrix_text()
+        majors = set()
+        for part in spec.split(",", 1)[1:]:
+            part = part.strip()
+            if part.startswith("<"):
+                majors.add(part[1:].strip().split(".")[0])
+        assert majors, (
+            f"'{spec}' has no upper bound to check; see "
+            f"test_transformers_range_is_upper_bounded."
+        )
+        for major in majors:
+            assert f"| **4.{major}" in matrix or f"| **{major}." in matrix, (
+                f"The declared range admits transformers {major}.x, but "
+                f"docs/plans/2026-09-26-two-version-matrix.md records no {major}.x "
+                f"row. Widening the range without a measured row is the F12 defect."
+            )

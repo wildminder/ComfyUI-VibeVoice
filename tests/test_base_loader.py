@@ -28,6 +28,35 @@ class TestResolveOfficialModelDir:
             path = BaseVibeVoiceLoader._resolve_official_model_dir("VibeVoice-ASR")
         assert path == str(tmp_path / "tts" / "VibeVoice" / "VibeVoice-ASR")
 
+    def test_resolve_official_prefers_existing_dir_in_secondary_root(self, tmp_path):
+        """A model already downloaded under a secondary registered root
+        (extra_model_paths.yaml) is picked up instead of re-downloading
+        into the primary root."""
+        first, second = tmp_path / "root1", tmp_path / "root2"
+        model_dir = second / "VibeVoice" / "VibeVoice-ASR-Streaming-1.5B"
+        model_dir.mkdir(parents=True)
+        fake_fp = MagicMock()
+        fake_fp.get_folder_paths.return_value = [str(first), str(second)]
+        with patch("ComfyUI_VibeVoice.modules.base_loader.folder_paths", fake_fp):
+            path = BaseVibeVoiceLoader._resolve_official_model_dir(
+                "VibeVoice-ASR-Streaming-1.5B"
+            )
+        assert path == str(model_dir)
+
+    def test_resolve_official_skips_dir_without_config(self, tmp_path):
+        """An existing dir is preferred even when incomplete (no config.json):
+        a partial download resumes in place instead of being orphaned."""
+        first, second = tmp_path / "root1", tmp_path / "root2"
+        partial = second / "VibeVoice" / "VibeVoice-ASR-Streaming-7B"
+        partial.mkdir(parents=True)
+        fake_fp = MagicMock()
+        fake_fp.get_folder_paths.return_value = [str(first), str(second)]
+        with patch("ComfyUI_VibeVoice.modules.base_loader.folder_paths", fake_fp):
+            path = BaseVibeVoiceLoader._resolve_official_model_dir(
+                "VibeVoice-ASR-Streaming-7B"
+            )
+        assert path == str(partial)
+
 
 class TestEnsureDownloaded:
     def test_ensure_downloaded_triggers_snapshot(self, tmp_path):

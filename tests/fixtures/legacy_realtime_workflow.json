@@ -1,0 +1,63 @@
+{
+  "id": "legacy-realtime-workflow-fixture",
+  "revision": 0,
+  "last_node_id": 1,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VibeVoiceRealtime",
+      "pos": [
+        40,
+        40
+      ],
+      "size": [
+        420,
+        760
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "Audio",
+          "type": "AUDIO",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VibeVoiceRealtime"
+      },
+      "widgets_values": [
+        "VibeVoice-Realtime-0.5B",
+        "[1] Hello, this is a cloned voice.\n[2] And this is a generated voice, how cool is that?",
+        false,
+        "sdpa",
+        1.3,
+        10,
+        42,
+        true,
+        0.95,
+        0.95,
+        0,
+        false,
+        false,
+        "default",
+        "auto",
+        null,
+        null,
+        null,
+        null,
+        0,
+        "en-Carter_man"
+      ]
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

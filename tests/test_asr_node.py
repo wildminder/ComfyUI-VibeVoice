@@ -376,3 +376,88 @@ class TestVibeVoiceASRNodeExecuteExternal:
             )
 
         mock_offload.assert_called_once_with("ext-asr-custom", stub_patcher)
+
+
+class TestVibeVoiceASRNodeModelOptions:
+    """The ASR node's model_name dropdown exposes the native ASR-HF model,
+    and retired saved-workflow names resolve onto it."""
+
+    def _get_model_options(self):
+        schema = VibeVoiceASRNode.define_schema()
+        for inp in schema.inputs:
+            if inp.id == "model_name":
+                return inp.options
+        return None
+
+    def test_dropdown_lists_native_asr_model(self):
+        registry = {
+            "VibeVoice-1.5B": {"type": "official"},
+            "VibeVoice-ASR-HF": {"type": "official"},
+            "VibeVoice-Realtime-0.5B": {"type": "official"},
+        }
+        with patch(
+            "ComfyUI_VibeVoice.modules.model_info.AVAILABLE_VIBEVOICE_MODELS",
+            registry,
+        ):
+            options = self._get_model_options()
+        assert options == ["VibeVoice-ASR-HF"]
+
+    def test_dropdown_includes_locally_discovered_streaming_dirs(self):
+        """Streaming checkpoints discovered on disk stay selectable (they
+        remain transcribable through the streaming protocol)."""
+        registry = {
+            "VibeVoice-ASR-HF": {"type": "official"},
+            "VibeVoice-ASR-Streaming-1.5B": {"type": "local_dir", "path": "x"},
+        }
+        with patch(
+            "ComfyUI_VibeVoice.modules.model_info.AVAILABLE_VIBEVOICE_MODELS",
+            registry,
+        ):
+            options = self._get_model_options()
+        assert "VibeVoice-ASR-Streaming-1.5B" in options
+        assert "VibeVoice-ASR-HF" in options
+
+    def test_validate_resolves_retired_name_to_asr_hf(self):
+        registry = {
+            "VibeVoice-ASR-HF": {"type": "official"},
+        }
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.AVAILABLE_VIBEVOICE_MODELS", registry
+        ):
+            for retired in ("VibeVoice-ASR", "VibeVoice-ASR-Streaming-1.5B",
+                            "VibeVoice-ASR-Streaming-7B"):
+                result = VibeVoiceASRNode.validate_inputs(model_name=retired)
+                assert result is True
+
+    def test_execute_resolves_retired_name_before_load(self):
+        """A saved workflow with model_name='VibeVoice-ASR' loads ASR-HF (and
+        its cache keys use the resolved name)."""
+        audio = {"waveform": None, "sample_rate": 24000}
+        stub_patcher = MagicMock()
+        with patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.AVAILABLE_VIBEVOICE_MODELS",
+            {"VibeVoice-ASR-HF": {"type": "official"}},
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.load_asr_model_patched",
+            return_value=(stub_patcher, MagicMock(), MagicMock()),
+        ) as mock_load, patch(
+            "ComfyUI_VibeVoice.nodes.asr_node.transcribe_audio",
+            return_value=("hello world", []),
+        ):
+            VibeVoiceASRNode.execute(
+                model_name="VibeVoice-ASR",
+                audio=audio,
+                context_info="",
+                max_new_tokens=256,
+                temperature=0.0,
+                top_p=1.0,
+                do_sample=False,
+                num_beams=1,
+                device="cpu",
+                dtype="auto",
+                attention_mode="sdpa",
+                force_offload=False,
+            )
+
+        assert mock_load.call_args.kwargs.get("model_name") == \
+            "VibeVoice-ASR-HF"

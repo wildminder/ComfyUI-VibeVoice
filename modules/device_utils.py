@@ -24,6 +24,7 @@ def _get_model_management():
 
 
 # Device type constants
+DEVICE_AUTO = "auto"
 DEVICE_CPU = "cpu"
 DEVICE_CUDA = "cuda"
 DEVICE_MPS = "mps"
@@ -288,10 +289,17 @@ def get_device_memory_info(device_type: str = None) -> dict:
 def get_device_options() -> List[str]:
     """Get list of device options for node dropdown.
 
+    ``"auto"`` is a real, supported value: :func:`get_torch_device` maps it to
+    ComfyUI's default compute device. It has to appear in the combo options,
+    otherwise ComfyUI's "Value not in list" check rejects workflows saved with
+    ``device="auto"`` before ``execute()`` ever runs. It is appended last so the
+    existing option indices — and therefore saved ``widgets_values`` — are
+    unchanged.
+
     Returns:
         List of device type strings for UI dropdown.
     """
-    return get_available_devices()
+    return [*get_available_devices(), DEVICE_AUTO]
 
 
 def get_device_option_labels() -> dict:
@@ -300,4 +308,4 @@ def get_device_option_labels() -> dict:
     Returns:
         Dictionary mapping device types to display names.
     """
-    return {dev: get_device_display_name(dev) for dev in get_available_devices()}
+    return {dev: get_device_display_name(dev) for dev in get_device_options()}

@@ -63,6 +63,9 @@ else:
     from .modules.model_info import (
         AVAILABLE_VIBEVOICE_MODELS, MODEL_CONFIGS, scan_vibevoice_models,
     )
+    from .modules.folder_registration import (
+        register_vibevoice_folders, register_voice_preset_folder,
+    )
 
     # ── Logger Setup ──────────────────────────────────────────────────
     logger.setLevel(logging.INFO)
@@ -85,12 +88,12 @@ else:
         primary_vibevoice_models_path = os.path.join(folder_paths.models_dir, "tts", VIBEVOICE_SUBDIR_NAME)
         os.makedirs(primary_vibevoice_models_path, exist_ok=True)
 
-        tts_path = os.path.join(folder_paths.models_dir, "tts")
-        if "tts" not in folder_paths.folder_names_and_paths:
-            supported_exts = folder_paths.supported_pt_extensions.union({".safetensors", ".json"})
-            folder_paths.folder_names_and_paths["tts"] = ([tts_path], supported_exts)
-        elif tts_path not in folder_paths.folder_names_and_paths["tts"][0]:
-            folder_paths.folder_names_and_paths["tts"][0].append(tts_path)
+        registered_tts_roots = register_vibevoice_folders(folder_paths)
+        # Every TTS root, not just the primary: extra_model_paths.yaml can add
+        # roots that hold the voice prompts while the primary one is empty.
+        register_voice_preset_folder(
+            folder_paths, registered_tts_roots[0], registered_tts_roots[1:]
+        )
 
         # Populate AVAILABLE_VIBEVOICE_MODELS with official models
         for model_name, config in MODEL_CONFIGS.items():

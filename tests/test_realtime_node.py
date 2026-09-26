@@ -1,49 +1,75 @@
-"""Tests for nodes/realtime_node.py - VibeVoice Realtime (streaming TTS) node.
+"""Tests for the deprecated VibeVoiceRealtime forwarding shim.
 
-NTH-001: the streaming ``VibeVoice-Realtime-0.5B`` model is configured but was
-never reachable through a node. This suite locks the schema (streaming-only
-model combo), input validation (rejects non-streaming types), the extension
-registration, and that ``execute`` routes through the shared patcher /
-``generate_streaming_audio`` path.
+The legacy node keeps its ID, widget order, and one-time deprecation warning,
+but owns no generation logic: validation and execution are delegated to the
+canonical ``VibeVoiceTTSNode``.
 """
 
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import patch, MagicMock
 
 from ComfyUI_VibeVoice.nodes.realtime_node import VibeVoiceRealtimeNode
+from ComfyUI_VibeVoice.nodes.tts_node import VibeVoiceTTSNode
+from tests.test_node_schema import LEGACY_REALTIME_INPUT_IDS
 
 
-def _model_options(schema):
-    for inp in schema.inputs:
-        if inp.id == "model_name":
-            return list(inp.options)
-    raise AssertionError("model_name input not found in schema")
+LEGACY_WORKFLOW_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "legacy_realtime_workflow.json"
+)
 
 
-class TestRealtimeNodeSchema:
-    """VibeVoiceRealtimeNode schema exposes streaming models only."""
+def _legacy_kwargs(**overrides):
+    values = dict(
+        model_name="VibeVoice-Realtime-0.5B",
+        text="[1] Hello world",
+        quantize_llm_4bit=False,
+        attention_mode="sdpa",
+        cfg_scale=1.3,
+        inference_steps=10,
+        seed=42,
+        do_sample=True,
+        temperature=0.95,
+        top_p=0.95,
+        top_k=0,
+        stream=False,
+        force_offload=False,
+        device="cpu",
+        dtype="auto",
+        max_new_tokens=0,
+        voice_preset="en-Carter_man",
+    )
+    values.update(overrides)
+    return values
 
-    def test_schema_node_id(self):
+
+class TestRealtimeShimSchema:
+    def test_node_id_and_deprecation(self):
         schema = VibeVoiceRealtimeNode.define_schema()
         assert schema.node_id == "VibeVoiceRealtime"
+        assert schema.is_deprecated is True
 
-    def test_schema_display_name(self):
+    def test_display_name_points_to_canonical_node(self):
         schema = VibeVoiceRealtimeNode.define_schema()
-        assert schema.display_name == "VibeVoice Realtime TTS"
+        assert "VibeVoice TTS" in schema.display_name
+        assert "deprecated" in schema.display_name.lower()
 
-    def test_schema_category(self):
-        schema = VibeVoiceRealtimeNode.define_schema()
-        assert schema.category == "audio/tts"
+    def test_legacy_prefix_preserved_and_controls_appended(self):
+        ids = tuple(inp.id for inp in VibeVoiceRealtimeNode.define_schema().inputs)
+        assert ids[: len(LEGACY_REALTIME_INPUT_IDS)] == LEGACY_REALTIME_INPUT_IDS
+        assert ids[len(LEGACY_REALTIME_INPUT_IDS):] == ("max_new_tokens", "voice_preset")
+        assert "stream" in ids
 
-    def test_schema_uses_streaming_models_only(self):
-        with patch(
-            "ComfyUI_VibeVoice.modules.model_info.AVAILABLE_VIBEVOICE_MODELS",
-            {"VibeVoice-Realtime-0.5B": {"type": "official"}},
-        ):
-            options = _model_options(VibeVoiceRealtimeNode.define_schema())
-        assert options == ["VibeVoice-Realtime-0.5B"]
+    def test_single_audio_output(self):
+        assert len(VibeVoiceRealtimeNode.define_schema().outputs) == 1
 
-    def test_schema_excludes_asr_and_tts_models(self):
+    def test_schema_lists_only_streaming_models(self):
         with patch(
             "ComfyUI_VibeVoice.modules.model_info.AVAILABLE_VIBEVOICE_MODELS",
             {
@@ -52,316 +78,150 @@ class TestRealtimeNodeSchema:
                 "VibeVoice-1.5B": {"type": "official"},
             },
         ):
-            options = _model_options(VibeVoiceRealtimeNode.define_schema())
-        assert "VibeVoice-Realtime-0.5B" in options
-        assert "VibeVoice-ASR" not in options
-        assert "VibeVoice-1.5B" not in options
-
-    def test_schema_has_stream_toggle(self):
-        schema = VibeVoiceRealtimeNode.define_schema()
-        ids = [inp.id for inp in schema.inputs]
-        assert "stream" in ids
-        assert "force_offload" in ids
-        assert "speaker_1_voice" in ids
-
-    def test_schema_has_audio_output(self):
-        schema = VibeVoiceRealtimeNode.define_schema()
-        assert len(schema.outputs) == 1
+            schema = VibeVoiceRealtimeNode.define_schema()
+        options = next(inp for inp in schema.inputs if inp.id == "model_name").options
+        assert list(options) == ["VibeVoice-Realtime-0.5B"]
 
 
-class TestRealtimeNodeValidate:
-    """VibeVoiceRealtimeNode.validate_inputs accepts only streaming_tts models."""
+class TestRealtimeShimDelegation:
+    def test_validate_inputs_delegates_to_canonical_node(self):
+        with patch.object(
+            VibeVoiceTTSNode, "validate_inputs", return_value="delegated"
+        ) as delegate:
+            result = VibeVoiceRealtimeNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B"
+            )
+        delegate.assert_called_once_with(model_name="VibeVoice-Realtime-0.5B")
+        assert result == "delegated"
 
-    def test_validate_accepts_streaming_model(self):
+    def test_validate_inputs_matching_error_text(self):
         with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.AVAILABLE_VIBEVOICE_MODELS",
-            {"VibeVoice-Realtime-0.5B": {"type": "official"}},
+            "ComfyUI_VibeVoice.nodes.tts_node.AVAILABLE_VIBEVOICE_MODELS",
+            {"VibeVoice-Realtime-0.5B": {}},
         ):
-            result = VibeVoiceRealtimeNode.validate_inputs(model_name="VibeVoice-Realtime-0.5B")
-        assert result is True
+            legacy = VibeVoiceRealtimeNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B"
+            )
+            canonical = VibeVoiceTTSNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B"
+            )
+        assert legacy == canonical
+        assert isinstance(legacy, str)
+        assert "voice_preset" in legacy
 
-    def test_validate_rejects_asr_model(self):
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.AVAILABLE_VIBEVOICE_MODELS",
-            {"VibeVoice-Realtime-0.5B": {"type": "official"}, "VibeVoice-ASR": {"type": "official"}},
-        ):
-            result = VibeVoiceRealtimeNode.validate_inputs(model_name="VibeVoice-ASR")
-        assert isinstance(result, str)
-        assert "streaming" in result.lower() or "streaming TTS" in result
+    def test_shim_validator_signature_has_no_varkw(self):
+        spec = inspect.getfullargspec(VibeVoiceRealtimeNode.validate_inputs)
+        assert spec.varkw is None
+        assert set(spec.args[1:]) == {"model_name", "voice_preset", "external_model"}
+        assert "stream" not in spec.args
 
-    def test_validate_rejects_tts_model(self):
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.AVAILABLE_VIBEVOICE_MODELS",
-            {"VibeVoice-Realtime-0.5B": {"type": "official"}, "VibeVoice-1.5B": {"type": "official"}},
-        ):
-            result = VibeVoiceRealtimeNode.validate_inputs(model_name="VibeVoice-1.5B")
-        assert isinstance(result, str)
-        assert "streaming" in result.lower()
-
-    def test_validate_none_model(self):
-        assert VibeVoiceRealtimeNode.validate_inputs(model_name=None) is True
-
-
-class TestRealtimeNodeExecute:
-    """NTH-001: execute must route through the patcher + streaming generate path."""
-
-    def test_execute_calls_streaming_generate(self):
-        stub_patcher = MagicMock()
-        stub_patcher.is_loaded = True
-        model = MagicMock()
-        processor = MagicMock()
-
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_model",
-            return_value=(stub_patcher, model, processor),
-        ) as mock_load, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.generate_streaming_audio",
-            return_value=(MagicMock(), 24000),
-        ) as mock_generate, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.force_offload_model"
-        ) as mock_offload, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.ui"
-        ) as mock_ui:
-            result = VibeVoiceRealtimeNode.execute(
-                model_name="VibeVoice-Realtime-0.5B",
-                text="[1] Hello world",
-                quantize_llm_4bit=False,
-                attention_mode="sdpa",
-                cfg_scale=1.3,
-                inference_steps=10,
-                seed=42,
-                do_sample=True,
-                temperature=0.95,
-                top_p=0.95,
-                top_k=0,
-                stream=False,
-                force_offload=False,
-                device="cpu",
-                dtype="auto",
+    def test_shim_validator_never_receives_the_legacy_stream_key(self):
+        with pytest.raises(TypeError):
+            VibeVoiceRealtimeNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B", stream=False
             )
 
-        mock_load.assert_called_once()
-        # The model/processor from the patcher loader must reach the streaming generator.
-        mock_generate.assert_called_once()
-        assert mock_generate.call_args.kwargs["model"] is model
-        assert mock_generate.call_args.kwargs["processor"] is processor
-        assert mock_generate.call_args.kwargs["text"] == "[1] Hello world"
-        # Two audio outputs: waveform + (optional) stream — single Audio.Output here.
-        assert result is not None
-        mock_offload.assert_not_called()
-        # ui.PreviewAudio was invoked for the preview.
-        mock_ui.PreviewAudio.assert_called_once()
-
-    def test_execute_offloads_when_requested(self):
-        stub_patcher = MagicMock()
-        stub_patcher.is_loaded = True
-        model = MagicMock()
-        processor = MagicMock()
-
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_model",
-            return_value=(stub_patcher, model, processor),
-        ), patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.generate_streaming_audio",
-            return_value=(MagicMock(), 24000),
-        ), patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.force_offload_model"
-        ) as mock_offload, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.ui"
-        ):
-            VibeVoiceRealtimeNode.execute(
-                model_name="VibeVoice-Realtime-0.5B",
-                text="[1] Hello world",
-                quantize_llm_4bit=False,
-                attention_mode="sdpa",
-                cfg_scale=1.3,
-                inference_steps=10,
-                seed=42,
-                do_sample=True,
-                temperature=0.95,
-                top_p=0.95,
-                top_k=0,
-                stream=False,
-                force_offload=True,
-                device="cpu",
-                dtype="auto",
+    def test_shim_forwards_explicitly_set_inputs_only(self):
+        with patch.object(
+            VibeVoiceTTSNode, "validate_inputs", return_value=True
+        ) as delegate:
+            VibeVoiceRealtimeNode.validate_inputs(
+                model_name="VibeVoice-Realtime-0.5B", voice_preset="en-Carter_man"
             )
-
-        # force_offload=True must hand the patcher to the warm offload path.
-        mock_offload.assert_called_once_with(stub_patcher, "VibeVoice-Realtime-0.5B", warm=True)
-
-
-class TestRealtimeNodeExternalModel:
-    """Phase 3: Realtime node accepts an external VIBEVOICE_MODEL bundle."""
-
-    def _make_bundle(self, is_streaming=True):
-        return {
-            "model": MagicMock(),
-            "processor": MagicMock(),
-            "model_name": "ExtRealtime",
-            "source_path": "/fake/realtime.safetensors",
-            "is_streaming": is_streaming,
+        assert delegate.call_args.kwargs == {
+            "model_name": "VibeVoice-Realtime-0.5B",
+            "voice_preset": "en-Carter_man",
         }
 
-    def test_realtime_schema_has_external_model_input(self):
-        schema = VibeVoiceRealtimeNode.define_schema()
-        ids = [inp.id for inp in schema.inputs]
-        assert "external_model" in ids
+        with patch.object(
+            VibeVoiceTTSNode, "validate_inputs", return_value=True
+        ) as delegate:
+            VibeVoiceRealtimeNode.validate_inputs(
+                external_model=None, model_name="ghost"
+            )
+        assert delegate.call_args.kwargs == {
+            "model_name": "ghost",
+            "external_model": None,
+        }
 
-    def test_realtime_external_model_input_is_optional(self):
-        schema = VibeVoiceRealtimeNode.define_schema()
-        ext_input = next(inp for inp in schema.inputs if inp.id == "external_model")
-        assert ext_input.optional is True
+    def test_execute_delegates_and_strips_stream(self):
+        with patch.object(
+            VibeVoiceTTSNode, "execute", return_value="canonical-output"
+        ) as delegate:
+            result = VibeVoiceRealtimeNode.execute(**_legacy_kwargs())
+        assert result == "canonical-output"
+        delegate.assert_called_once()
+        forwarded = delegate.call_args.kwargs
+        assert "stream" not in forwarded
+        assert forwarded["voice_preset"] == "en-Carter_man"
+        assert forwarded["max_new_tokens"] == 0
 
-    def test_realtime_execute_with_external_model_calls_load_from_external(self):
-        bundle = self._make_bundle(is_streaming=True)
-        stub_patcher = MagicMock()
-
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_from_external",
-            return_value=(stub_patcher, bundle["model"], bundle["processor"]),
-        ) as mock_ext, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_model"
-        ) as mock_std, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.generate_streaming_audio",
-            return_value=(MagicMock(), 24000),
-        ), patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.ui"
+    def test_stream_toggle_does_not_change_behavior(self):
+        outputs = []
+        with patch.object(
+            VibeVoiceTTSNode, "execute", side_effect=lambda **kwargs: outputs.append(kwargs) or "out"
         ):
-            VibeVoiceRealtimeNode.execute(
-                model_name="IgnoredModel",
-                text="[1] Hello world",
-                quantize_llm_4bit=False,
-                attention_mode="sdpa",
-                cfg_scale=1.3,
-                inference_steps=10,
-                seed=42,
-                do_sample=True,
-                temperature=0.95,
-                top_p=0.95,
-                top_k=0,
-                stream=False,
-                force_offload=False,
-                device="cpu",
-                dtype="auto",
-                external_model=bundle,
-            )
+            VibeVoiceRealtimeNode.execute(**_legacy_kwargs(stream=False))
+            VibeVoiceRealtimeNode.execute(**_legacy_kwargs(stream=True))
+        assert outputs[0] == outputs[1]
 
-        mock_ext.assert_called_once()
-        mock_std.assert_not_called()
+    def test_deprecation_warning_logged_once_per_process(self, caplog):
+        from ComfyUI_VibeVoice.nodes import realtime_node as shim_module
 
-    def test_realtime_execute_without_external_model_calls_load_vibevoice_model(self):
-        stub_patcher = MagicMock()
+        shim_module._DEPRECATION_LOGGED = False
+        with patch.object(VibeVoiceTTSNode, "execute", return_value="out"):
+            with caplog.at_level(
+                logging.WARNING, logger="ComfyUI_VibeVoice.nodes.realtime_node"
+            ):
+                VibeVoiceRealtimeNode.execute(**_legacy_kwargs())
+                VibeVoiceRealtimeNode.execute(**_legacy_kwargs())
+                VibeVoiceRealtimeNode.execute(**_legacy_kwargs())
+        messages = [
+            record.message
+            for record in caplog.records
+            if "deprecated" in record.message.lower()
+        ]
+        assert len(messages) == 1
 
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_model",
-            return_value=(stub_patcher, MagicMock(), MagicMock()),
-        ) as mock_std, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_from_external"
-        ) as mock_ext, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.generate_streaming_audio",
-            return_value=(MagicMock(), 24000),
-        ), patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.ui"
-        ):
-            VibeVoiceRealtimeNode.execute(
-                model_name="VibeVoice-Realtime-0.5B",
-                text="[1] Hello world",
-                quantize_llm_4bit=False,
-                attention_mode="sdpa",
-                cfg_scale=1.3,
-                inference_steps=10,
-                seed=42,
-                do_sample=True,
-                temperature=0.95,
-                top_p=0.95,
-                top_k=0,
-                stream=False,
-                force_offload=False,
-                device="cpu",
-                dtype="auto",
-                external_model=None,
-            )
+    def test_shim_does_not_reference_generation_or_loading(self):
+        source_path = Path(__file__).parent.parent / "nodes" / "realtime_node.py"
+        text = source_path.read_text(encoding="utf-8")
+        assert "generate_realtime_audio" not in text
+        assert "generate_audio" not in text
+        assert "load_vibevoice_model" not in text
+        assert "load_vibevoice_from_external" not in text
+        assert "get_cached_voice_preset" not in text
 
-        mock_std.assert_called_once()
-        mock_ext.assert_not_called()
 
-    def test_realtime_execute_external_model_routes_to_streaming_generation(self):
-        """External model path must call generate_streaming_audio (not generate_audio)."""
-        bundle = self._make_bundle(is_streaming=True)
-        stub_patcher = MagicMock()
+class TestRealtimeShimRegistrationAndWorkflow:
+    def test_extension_registers_one_canonical_node_and_one_deprecated_delegate(self):
+        import asyncio
 
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.load_vibevoice_from_external",
-            return_value=(stub_patcher, bundle["model"], bundle["processor"]),
-        ), patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.generate_streaming_audio",
-            return_value=(MagicMock(), 24000),
-        ) as mock_stream_gen, patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.ui"
-        ):
-            VibeVoiceRealtimeNode.execute(
-                model_name="IgnoredModel",
-                text="[1] Hello world",
-                quantize_llm_4bit=False,
-                attention_mode="sdpa",
-                cfg_scale=1.3,
-                inference_steps=10,
-                seed=42,
-                do_sample=True,
-                temperature=0.95,
-                top_p=0.95,
-                top_k=0,
-                stream=False,
-                force_offload=False,
-                device="cpu",
-                dtype="auto",
-                external_model=bundle,
-            )
+        from ComfyUI_VibeVoice.vibevoice_nodes import VibeVoiceExtension
 
-        mock_stream_gen.assert_called_once()
-        assert mock_stream_gen.call_args.kwargs["model"] is bundle["model"]
+        ext = VibeVoiceExtension()
+        node_list = asyncio.get_event_loop().run_until_complete(ext.get_node_list())
+        node_ids = [node.define_schema().node_id for node in node_list]
+        assert node_ids.count("VibeVoiceTTS") == 1
+        assert node_ids.count("VibeVoiceRealtime") == 1
+        assert len(node_ids) == len(set(node_ids))
 
-    def test_realtime_execute_rejects_non_streaming_external_model(self):
-        """A non-streaming external model on the Realtime node raises ValueError."""
-        bundle = self._make_bundle(is_streaming=False)
+    def test_legacy_workflow_fixture_resolves_to_deprecated_node(self):
+        import asyncio
 
-        with pytest.raises(ValueError, match="streaming"):
-            VibeVoiceRealtimeNode.execute(
-                model_name="VibeVoice-Realtime-0.5B",
-                text="[1] Hello world",
-                quantize_llm_4bit=False,
-                attention_mode="sdpa",
-                cfg_scale=1.3,
-                inference_steps=10,
-                seed=42,
-                do_sample=True,
-                temperature=0.95,
-                top_p=0.95,
-                top_k=0,
-                stream=False,
-                force_offload=False,
-                device="cpu",
-                dtype="auto",
-                external_model=bundle,
-            )
+        from ComfyUI_VibeVoice.vibevoice_nodes import VibeVoiceExtension
 
-    def test_realtime_validate_skips_model_name_when_external_model_provided(self):
-        bundle = self._make_bundle(is_streaming=True)
-        result = VibeVoiceRealtimeNode.validate_inputs(
-            external_model=bundle, model_name="nonexistent_model"
-        )
-        assert result is True
+        assert LEGACY_WORKFLOW_FIXTURE.is_file()
+        workflow = json.loads(LEGACY_WORKFLOW_FIXTURE.read_text(encoding="utf-8"))
+        legacy_types = [
+            node["type"] for node in workflow["nodes"] if node["type"] == "VibeVoiceRealtime"
+        ]
+        assert len(legacy_types) == 1
 
-    def test_realtime_validate_bypasses_when_external_model_linked_but_none(self):
-        """REGRESSION: a *connected* external_model resolves to None during prompt
-        validation (ComfyUI has no execution cache yet). The bypass must trigger on
-        the input's *presence* in kwargs, not on a non-None value."""
-        with patch(
-            "ComfyUI_VibeVoice.nodes.realtime_node.is_model_type",
-            return_value=False,  # model_name would be flagged as non-streaming
-        ):
-            result = VibeVoiceRealtimeNode.validate_inputs(
-                external_model=None, model_name="VibeVoice-1.5B"
-            )
-        assert result is True
+        ext = VibeVoiceExtension()
+        node_list = asyncio.get_event_loop().run_until_complete(ext.get_node_list())
+        registered = {
+            node.define_schema().node_id: node.define_schema() for node in node_list
+        }
+        assert "VibeVoiceRealtime" in registered
+        assert registered["VibeVoiceRealtime"].is_deprecated is True

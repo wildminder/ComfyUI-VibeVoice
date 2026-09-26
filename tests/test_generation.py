@@ -855,7 +855,7 @@ class TestGenerateAudioStreamingGuard:
         return VibeVoiceStreamingForConditionalGenerationInference()
 
     def test_rejects_streaming_processor(self):
-        with pytest.raises(ValueError, match="Realtime"):
+        with pytest.raises(ValueError, match="canonical VibeVoice TTS realtime"):
             generate_audio(
                 model=MagicMock(),
                 processor=self._make_streaming_processor(),
@@ -865,7 +865,7 @@ class TestGenerateAudioStreamingGuard:
             )
 
     def test_rejects_streaming_model(self):
-        with pytest.raises(ValueError, match="Realtime"):
+        with pytest.raises(ValueError, match="canonical VibeVoice TTS realtime"):
             generate_audio(
                 model=self._make_streaming_model(),
                 processor=MagicMock(),
@@ -877,7 +877,7 @@ class TestGenerateAudioStreamingGuard:
     def test_guard_fires_before_script_parsing(self):
         """The guard must run before any other work (empty text still raises
         the streaming error, not the empty-script error)."""
-        with pytest.raises(ValueError, match="Realtime"):
+        with pytest.raises(ValueError, match="canonical VibeVoice TTS realtime"):
             generate_audio(
                 model=self._make_streaming_model(),
                 processor=self._make_streaming_processor(),

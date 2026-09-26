@@ -8,7 +8,9 @@ Handles audio transcription using the VibeVoice ASR model, including:
 
 import torch
 import gc
+import math
 import logging
+import numpy as np
 from typing import Optional, Tuple, List, Dict, Any
 
 import comfy.model_management as model_management
@@ -22,7 +24,7 @@ from .model_registry import FAMILY_ASR, evict_if_changed, identity_for_external
 from .utils import VIBEVOICE_ASR_PATCHER_CACHE
 from .device_utils import get_torch_device, get_offload_device, DEVICE_CPU
 from .dtype_utils import resolve_dtype, DTYPE_AUTO
-from .audio_utils import extract_audio_tensor
+from .audio_utils import extract_audio_tensor, resample_audio
 from .attention_utils import resolve_attention_mode
 
 logger = logging.getLogger(__name__)
@@ -357,6 +359,256 @@ def load_asr_from_external(
     return patcher, model, processor
 
 
+def _parse_streaming_chunk(chunk_idx: int, chunk_text: str, frame_config: dict,
+                           num_chunks: int, chunk_duration: float) -> Optional[Dict[str, Any]]:
+    """Parse one streaming chunk's 'speaker, content' text into a segment.
+
+    The streaming model emits lines like 'Speaker 0: hello world' (or
+    'speaker: ...'). Returns None for silence/empty chunks.
+
+    Args:
+        chunk_idx: Zero-based chunk index.
+        chunk_text: Decoded chunk text (special tokens already stripped).
+        frame_config: The processor's streaming frame config.
+        num_chunks: Total chunk count (for end-time clamping).
+        chunk_duration: Chunk duration in seconds (without lookahead).
+
+    Returns:
+        Dict with keys: speaker, text, start, end — or None.
+    """
+    import re
+    text = chunk_text.strip()
+    if not text:
+        return None
+    m = re.match(r"(?:speaker|Speaker)\s*(\d+)\s*[:：]\s*(.*)", text, re.DOTALL)
+    if m:
+        speaker = int(m.group(1))
+        content = m.group(2).strip()
+    else:
+        speaker = 0
+        content = text
+    if not content:
+        return None
+    start = chunk_idx * chunk_duration
+    end = min(start + chunk_duration + frame_config["text_audio_delay"],
+              num_chunks * chunk_duration) if num_chunks > 0 else start + chunk_duration
+    return {"speaker": speaker, "text": content, "start": round(start, 2), "end": round(end, 2)}
+
+
+def _transcribe_streaming(
+    model: Any,
+    processor: Any,
+    audio_array,
+    sample_rate: int,
+    frame_config: dict,
+    context_info: Optional[str],
+    max_new_tokens: int,
+    temperature: float,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Transcribe via the chunked streaming protocol (ASR-Streaming checkpoints).
+
+    Drives :meth:`model.streaming_generate <VibeVoiceASRForConditionalGeneration.streaming_generate>`
+    (ported from upstream): prompt prefill, then per-chunk
+    ``[speech_start, features, speech_end]`` embeds followed by chunk text
+    terminated by ``<|text_chunk_end|>``. Chunks accumulate into segments and
+    drive the standard progress bar (one step per chunk, interruption-checked
+    between chunks).
+    """
+    # The model runs at a fixed 24 kHz (the tokenizers' trained rate); resample
+    # the incoming audio (the processor does the same for its own pipeline).
+    target_sr = frame_config["sample_rate"]
+    if sample_rate != target_sr:
+        audio_array = resample_audio(audio_array, orig_sr=sample_rate, target_sr=target_sr)
+
+    tokenizer = processor.tokenizer
+    if getattr(tokenizer, "text_chunk_end_id", None) is None:
+        raise ValueError(
+            "This checkpoint is marked as streaming (chunk_frames/lookahead_frames "
+            "in preprocessor_config.json) but its tokenizer has no "
+            "<|text_chunk_end|> token; cannot transcribe it with the streaming "
+            "protocol."
+        )
+
+    audio_tensor = torch.from_numpy(np.ascontiguousarray(audio_array))
+    duration = audio_tensor.numel() / target_sr if target_sr else 0.0
+    chunk_duration = frame_config["chunk_duration"]
+    total_chunks_est = max(1, math.ceil(duration / chunk_duration)) if chunk_duration else 1
+
+    # Chunk-count-based progress: exact total is known only inside the
+    # generator, so the bar starts with the estimate and is re-based when the
+    # real count arrives with the first yield.
+    pbar = ProgressBarWithConsole(total_chunks_est)
+    segments: List[Dict[str, Any]] = []
+    texts: List[str] = []
+
+    gen = model.streaming_generate(
+        audio_tensor=audio_tensor,
+        tokenizer=tokenizer,
+        chunk_duration=frame_config["chunk_duration"],
+        text_audio_delay=frame_config["text_audio_delay"],
+        sample_rate=target_sr,
+        max_new_tokens_per_chunk=max(64, max_new_tokens // max(1, total_chunks_est)),
+        temperature=temperature if temperature > 0 else 0.0,
+        context_info=context_info,
+    )
+    try:
+        total_chunks_seen = 0
+        for chunk_idx, num_chunks, chunk_text in gen:
+            model_management.throw_exception_if_processing_interrupted()
+            total_chunks_seen = num_chunks
+            if num_chunks != pbar.total and num_chunks > 0:
+                pbar.update_absolute(0, total=num_chunks)
+            seg = _parse_streaming_chunk(
+                chunk_idx, chunk_text, frame_config, num_chunks, chunk_duration
+            )
+            if seg is not None:
+                segments.append(seg)
+            if chunk_text.strip():
+                texts.append(chunk_text.strip())
+            pbar.update_absolute(chunk_idx + 1)
+    finally:
+        pbar.update_absolute(pbar.total)
+        pbar.close()
+
+    raw_text = "\n".join(texts)
+    logger.info(f"ASR streaming transcription complete. {len(segments)} segments, "
+                f"{total_chunks_seen} chunks.")
+    return raw_text, segments
+
+
+def _asr_processor_kind(processor: Any) -> str:
+    """Classify a processor for transcription-branch selection.
+
+    Returns one of:
+    - ``"native"``: the transformers builtin ``VibeVoiceAsrProcessor``
+      (checkpoint microsoft/VibeVoice-ASR-HF) — single-pass chat-template
+      transcription.
+    - ``"vendored"``: the ``src/vibevoice`` processor (streaming family and
+      original VibeVoice-ASR checkpoints).
+    - ``"unknown"``: anything else (plain test stubs) — legacy JSON-prompt
+      path.
+
+    Classification goes by the processor class's module, NOT
+    ``hasattr``/``getattr`` defaults: MagicMock-based processor stubs report
+    every attribute, which would hijack the native and streaming branches in
+    tests.
+    """
+    mod = getattr(type(processor), "__module__", "")
+    if mod.startswith("transformers."):
+        return "native"
+    if "vibevoice" in mod:
+        return "vendored"
+    return "unknown"
+
+
+def _transcribe_native(
+    model: Any,
+    processor: Any,
+    audio_array: "np.ndarray",
+    sample_rate: int,
+    context_info: Optional[str],
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    do_sample: bool,
+    num_beams: int,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Transcribe via the HF-native protocol (microsoft/VibeVoice-ASR-HF).
+
+    Single-pass batch transcription through the transformers builtins:
+    ``apply_transcription_request`` builds the chat-template inputs (audio
+    placeholder expansion + optional hotword context), standard ``generate()``
+    produces the JSON-style output, and ``decode(return_format="parsed")``
+    splits it into ``Start/End/Speaker/Content`` segments. This is the same
+    7B ASR model as microsoft/VibeVoice-ASR, in its native form.
+    """
+    # The native feature extractor does NOT resample: it raises when the
+    # incoming rate differs from its declared rate (e.g. "trained using a
+    # sampling rate of 24000 ... not 44100"). Resample first — the same
+    # inbuilt conversion the vendored ASR processor performs on its
+    # ``target_sample_rate`` — and stop passing sampling_rate downstream so
+    # the extractor sees only its own rate.
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    target_sr = getattr(feature_extractor, "sampling_rate", 24000)
+    if sample_rate != target_sr:
+        audio_array = resample_audio(audio_array, orig_sr=sample_rate, target_sr=target_sr)
+        sample_rate = target_sr
+
+    # Build inputs (audio already at the extractor's rate).
+    inputs = processor.apply_transcription_request(
+        audio=np.ascontiguousarray(audio_array),
+        prompt=context_info,
+    )
+
+    first_param = next(model.parameters())
+    device, model_dtype = first_param.device, first_param.dtype
+    inputs = inputs.to(device, model_dtype)
+
+    generation_config = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": getattr(processor.tokenizer, "pad_token_id", None),
+        "eos_token_id": processor.tokenizer.eos_token_id,
+    }
+
+    if num_beams > 1:
+        generation_config["num_beams"] = num_beams
+        generation_config["do_sample"] = False
+    else:
+        generation_config["do_sample"] = do_sample
+        if do_sample:
+            generation_config["temperature"] = temperature
+            generation_config["top_p"] = top_p
+
+    generation_config = {k: v for k, v in generation_config.items() if v is not None}
+
+    pbar = ProgressBarWithConsole(max_new_tokens)
+    use_streamer = generation_config.get("num_beams", 1) <= 1
+    streamer = _ASRProgressStreamer(pbar, total=max_new_tokens) if use_streamer else None
+
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                **generation_config,
+                **({"streamer": streamer} if streamer is not None else {}),
+            )
+
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+
+        raw_text = processor.decode(generated_ids, skip_special_tokens=True)[0]
+
+        # Parsed decode returns a list of dicts (or the raw string on parse
+        # failure); map onto our segment schema.
+        segments: List[Dict[str, Any]] = []
+        parsed = processor.decode(generated_ids, return_format="parsed")[0]
+        if isinstance(parsed, list):
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    segments.append({
+                        "speaker": int(item.get("Speaker", 0)),
+                        "text": str(item.get("Content", "")).strip(),
+                        "start": round(float(item.get("Start", 0.0)), 2),
+                        "end": round(float(item.get("End", 0.0)), 2),
+                    })
+                except (TypeError, ValueError):
+                    continue
+
+        logger.info(f"ASR transcription complete. {len(segments)} segments found.")
+        return raw_text, segments
+
+    except model_management.InterruptProcessingException:
+        logger.info("ASR transcription interrupted by user")
+        raise
+    except Exception as e:
+        logger.error(f"ASR transcription failed: {e}")
+        raise RuntimeError(f"Transcription failed: {e}")
+    finally:
+        pbar.update_absolute(pbar.total)
+        pbar.close()
+
+
 def transcribe_audio(
     model: Any,
     processor: Any,
@@ -403,6 +655,44 @@ def transcribe_audio(
         audio_array = waveform.cpu().numpy()
 
     audio_array = audio_array.astype(np.float32)
+
+    # HF-native checkpoints (microsoft/VibeVoice-ASR-HF) use the transformers
+    # processor: single-pass chat-template transcription with native
+    # parsed-segment decoding.
+    if _asr_processor_kind(processor) == "native":
+        return _transcribe_native(
+            model=model,
+            processor=processor,
+            audio_array=audio_array,
+            sample_rate=sample_rate,
+            context_info=context_info,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
+            num_beams=num_beams,
+        )
+
+    # Streaming checkpoints (VibeVoice-ASR-Streaming-*) speak an exclusive
+    # chunked protocol ("transcribe streamingly with keys: speaker, content"
+    # + <|text_chunk_end|>-delimited per-chunk text) and produce garbage under
+    # the JSON-prompt generate() path used for non-streaming ASR checkpoints.
+    # The frame config in the processor's preprocessor_config.json is the
+    # marker (same detection the upstream streaming demo uses); only a real
+    # vendored processor is inspected (see _asr_processor_kind).
+    if _asr_processor_kind(processor) == "vendored":
+        frame_config = getattr(processor, "streaming_frame_config", None)
+        if frame_config is not None:
+            return _transcribe_streaming(
+                model=model,
+                processor=processor,
+                audio_array=audio_array,
+                sample_rate=sample_rate,
+                frame_config=frame_config,
+                context_info=context_info,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
 
     # Process audio through the processor
     inputs = processor(

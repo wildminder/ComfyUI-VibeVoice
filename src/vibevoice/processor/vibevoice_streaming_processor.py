@@ -54,7 +54,7 @@ class VibeVoiceStreamingProcessor:
         import json
         from transformers.utils import cached_file
         from .vibevoice_tokenizer_processor import VibeVoiceTokenizerProcessor
-        from vibevoice.modular.modular_vibevoice_text_tokenizer import (
+        from ..modular.modular_vibevoice_text_tokenizer import (
             VibeVoiceTextTokenizer, 
             VibeVoiceTextTokenizerFast
         )

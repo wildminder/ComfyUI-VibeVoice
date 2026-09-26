@@ -167,3 +167,4 @@ cython_debug/
 .workbuddy-ai/
 tmp/
 tools/
+.zcode/

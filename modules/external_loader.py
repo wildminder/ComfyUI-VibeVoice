@@ -41,6 +41,7 @@ from .base_loader import iter_safetensors_tensors
 from .attention_utils import (
     SAGE_ATTENTION_AVAILABLE,
     resolve_attention_mode,
+    resolve_realtime_attention_mode,
     get_attn_implementation_for_load,
     check_sage_attention_compatible,
 )
@@ -133,15 +134,21 @@ def resolve_auto_config_name(weight_path: str, gguf_reader=None, weights_fp=None
     detected = weights_fp.config_name if weights_fp is not None else None
     if not detected:
         explicit = [o for o in EXTERNAL_CONFIG_OPTIONS if o != AUTO_CONFIG_NAME]
+        if weights_fp is None:
+            observed = "Observed dimensions: unavailable (no embedding fingerprint)."
+        else:
+            observed = (
+                "Observed dimensions: "
+                f"hidden={weights_fp.hidden_size}, vocab={weights_fp.vocab_size}."
+            )
         raise ValueError(
             f"config_name '{AUTO_CONFIG_NAME}': could not determine the "
             f"VibeVoice architecture from "
-            f"'{os.path.basename(weight_path)}'. Auto-detect reads the "
-            f"checkpoint's embedding fingerprint, which is unavailable for "
-            f"this file (.bin/.pt checkpoints and unknown architectures "
-            f"cannot be auto-detected). Select config_name explicitly "
-            f"(one of: {', '.join(explicit)}) or place a sidecar config.json "
-            f"next to the weight file."
+            f"'{os.path.basename(weight_path)}'. {observed} Auto-detect reads "
+            f"the checkpoint's embedding fingerprint; unmatched dimensions "
+            f"are not guessed. Select config_name explicitly (one of: "
+            f"{', '.join(explicit)}) or place a sidecar config.json next to "
+            f"the weight file."
         )
     logger.debug(
         f"Auto-detected architecture '{detected}' from "
@@ -493,15 +500,18 @@ def _load_gguf_state_dict(weight_path: str, device=None) -> dict:
         ) from e
 
     logger.debug(f"Loading GGUF state dict from: {weight_path}")
-    reader = gguf.GGUFReader(weight_path)
+    from .gguf_quant import dequantize_reader_tensor, open_gguf_reader
+
+    reader = open_gguf_reader(weight_path)
 
     state_dict = {}
     for tensor in reader.tensors:
-        # gguf.dequantize returns a correctly-shaped numpy array for all
-        # quantization types (F32/F16 pass through unchanged). The array may be
-        # read-only (mmap-backed), so copy it to make it writable for torch.
-        dequantized = gguf.dequantize(tensor.data, tensor.tensor_type)
-        state_dict[tensor.name] = torch.from_numpy(dequantized.copy()).to(device)
+        # Dequantizes to the tensor's LOGICAL shape in both byte layouts
+        # (spec-conformant row-mapped and the flat-block pool recovery);
+        # the returned tensor is owned (the mmap view is copied), so it is
+        # writable and safe for torch.
+        dequantized = dequantize_reader_tensor(tensor)
+        state_dict[tensor.name] = dequantized.to(device)
 
     logger.debug(f"Loaded {len(state_dict)} tensors from GGUF file")
     return state_dict
@@ -528,19 +538,25 @@ def _load_weight_state_dict(weight_path: str, device) -> dict:
 # ====================================================================
 
 def _open_gguf_reader(weight_path: str):
-    """Open a ``.gguf`` file with :class:`gguf.GGUFReader`.
+    """Open a ``.gguf`` file, recovering flat-block (sub-block-row) tensors.
+
+    Delegates to :func:`modules.gguf_quant.open_gguf_reader` — stock reader
+    first, tolerant flat-block reopen only when a quantized tensor's row is
+    below its block size (quantui-rs conv conversions).
 
     Raises:
         RuntimeError: If the ``gguf`` package is not installed.
     """
     try:
-        import gguf
+        import gguf  # noqa: F401  (availability probe; see below)
     except ImportError as e:
         raise RuntimeError(
             "Loading .gguf weights requires the 'gguf' Python package. "
             "Install it with: pip install gguf"
         ) from e
-    return gguf.GGUFReader(weight_path)
+    from .gguf_quant import open_gguf_reader
+
+    return open_gguf_reader(weight_path)
 
 
 def _gguf_kquant_present(reader) -> bool:
@@ -918,6 +934,36 @@ def _assert_lm_head_not_tied(config, quant_map: dict) -> None:
         )
 
 
+def _assert_gguf_lm_head_not_tied(config, reader) -> None:
+    """GGUF twin of :func:`_assert_lm_head_not_tied`.
+
+    A quantized ``lm_head.weight`` tensor in a tied config is the same
+    contradiction as a quantized ``lm_head.comfy_quant``: the resident install
+    would swap lm_head for a GGUFLinear and ``_post_assign_fixups``'s
+    ``tie_weights()`` would then silently overwrite its raw-block Parameter
+    with the embedding's float one, discarding the quantized weights.
+    """
+    from .gguf_quant import FLOAT_GGML_TYPES
+
+    if not _config_ties_word_embeddings(config):
+        return
+    for t in reader.tensors:
+        # 'output.weight' is llamacpp naming for lm_head and appears in
+        # quantui-rs exports that otherwise keep HF names (VibeVoice-7B).
+        if t.name in ("lm_head.weight", "output.weight") and t.tensor_type not in FLOAT_GGML_TYPES:
+            from .quant_common import QuantTargetMismatch
+
+            raise QuantTargetMismatch(
+                "GGUF file carries a quantized "
+                f"'{t.name}' (lm_head) but the "
+                "config sets tie_word_embeddings=True: a tied lm_head shares "
+                "the input embedding's storage and cannot carry quantized "
+                "weights. The sidecar config.json likely does not match "
+                "this checkpoint — fix the config or re-export without "
+                "quantizing lm_head."
+            )
+
+
 def _demote_nonlinear_fp8_residents(model, quant_map: dict) -> dict:
     """Demote resident-fp8 layers whose target module is not an nn.Linear.
 
@@ -993,15 +1039,21 @@ def _install_gguf_weights(model, reader) -> dict:
        the Linear is swapped for :class:`~modules.gguf_quant.GGUFLinear` and
        the RAW BLOCK BYTES are installed as its uint8 parameter (the one
        unavoidable copy — it IS the residency).
-    3. Float tensors (F32/F16/BF16) take zero-copy views at their NATIVE
+    3. Quantized tensors whose target is NOT a Linear but has a weight
+       parameter of matching shape (embeddings, conv heads — quantui-rs
+       files quantize these too) DEQUANTIZE AT LOAD into the dense state
+       dict — the same fallback the fp8 path uses for non-Linear residents.
+    4. Float tensors (F32/F16/BF16) take zero-copy views at their NATIVE
        dtype into a filtered dense state dict applied through
        :meth:`VibeVoiceLoader._apply_state_dict` (assign semantics, re-tie,
        sentinel/RoPE fixes preserved).
 
-    Peak RAM ≈ raw file size instead of ~2x full-float size.
+    Peak RAM ≈ raw file size + the dequantized non-Linear weights instead
+    of ~2x full-float size.
 
     Returns:
-        Stats dict ``{"n_resident_layers", "raw_bytes", "weight_family"}``.
+        Stats dict ``{"n_resident_layers", "raw_bytes", "n_dequant_load",
+        "dequant_load_bytes", "weight_family"}``.
     """
     import numpy as np
 
@@ -1010,6 +1062,7 @@ def _install_gguf_weights(model, reader) -> dict:
         GGUFTensor,
         SUPPORTED_GGML_TYPES,
         UnsupportedGGMLType,
+        dequantize_reader_tensor,
         gguf_linear_factory,
         map_keys,
     )
@@ -1027,6 +1080,7 @@ def _install_gguf_weights(model, reader) -> dict:
     resident_tensors = {}
     dense_state = {}
     unsupported = []
+    dequant_load = []  # (target_key, tensor) — quantized non-Linear weights
 
     for t in tensors:
         target_key = mapping[t.name]
@@ -1035,16 +1089,18 @@ def _install_gguf_weights(model, reader) -> dict:
 
         if tt in FLOAT_GGML_TYPES:
             data = t.data
-            if data.dtype == np.float32:
-                tensor = torch.from_numpy(data)
-            elif data.dtype == np.float16:
-                tensor = torch.from_numpy(data)
-            else:  # BF16 arrives as raw uint8 bytes
-                tensor = torch.from_numpy(data).view(torch.bfloat16)
-            # clone() severs the reader's file mapping (same hazard class as
-            # the safetensors mmap views); float tensors in a GGUF file are
-            # the small minority (embeddings/norms/biases), so this is cheap.
-            dense_state[target_key] = tensor.reshape(logical_shape).clone()
+            arr = np.ascontiguousarray(data)
+            if arr.flags.writeable:
+                tensor = torch.from_numpy(arr).clone()
+            else:
+                # mmap-backed read-only buffer: copy so torch never warns
+                # (same hazard class as GGUFTensor.from_reader_tensor).
+                tensor = torch.from_numpy(arr.copy())
+            if data.dtype == np.uint8:  # BF16 arrives as raw uint8 bytes
+                tensor = tensor.view(torch.bfloat16)
+            # The tensor is owned above; reshape is a view at the native
+            # dtype into the dense state dict.
+            dense_state[target_key] = tensor.reshape(logical_shape)
             continue
 
         if tt not in SUPPORTED_GGML_TYPES:
@@ -1059,23 +1115,48 @@ def _install_gguf_weights(model, reader) -> dict:
             )
         module_path = target_key[: -len(".weight")]
         target_module = modules_by_name.get(module_path)
-        if target_module is None or not isinstance(target_module, torch.nn.Linear):
-            kind = type(target_module).__name__ if target_module is not None else "missing"
+        if target_module is None:
             raise QuantTargetMismatch(
                 f"GGUF-quantized tensor '{t.name}' maps to '{module_path}' "
-                f"({kind}), expected an nn.Linear. The sidecar config may not "
-                f"match this checkpoint."
+                f"(missing), expected an nn.Linear. The sidecar config may "
+                f"not match this checkpoint."
             )
-        expected_shape = tuple(target_module.weight.shape)
-        if logical_shape != expected_shape:
-            raise QuantTargetMismatch(
-                f"GGUF tensor '{t.name}' shape {logical_shape} disagrees with "
-                f"model {type(target_module).__name__} shape {expected_shape}"
-            )
-        # Copy the raw block bytes off the mmap now (this copy IS the final
-        # residency); float materialization never happens.
-        resident_tensors[module_path] = GGUFTensor.from_reader_tensor(t)
-        resident_plan[module_path] = gguf_linear_factory(tt)
+        if isinstance(target_module, torch.nn.Linear):
+            expected_shape = tuple(target_module.weight.shape)
+            if logical_shape != expected_shape:
+                raise QuantTargetMismatch(
+                    f"GGUF tensor '{t.name}' shape {logical_shape} disagrees "
+                    f"with model {type(target_module).__name__} shape "
+                    f"{expected_shape}"
+                )
+            # Copy the raw block bytes off the mmap now (this copy IS the
+            # final residency); float materialization never happens.
+            resident_tensors[module_path] = GGUFTensor.from_reader_tensor(t)
+            resident_plan[module_path] = gguf_linear_factory(tt)
+            continue
+        target_param = getattr(target_module, "weight", None)
+        if isinstance(target_param, torch.Tensor):
+            # Non-Linear quantized weight (embedding / conv head): these
+            # cannot be quant-resident (only Linear matmuls dequantize
+            # per-call), so materialize the float ONCE here — bounded,
+            # and exactly what the fp8 path does for its non-Linear
+            # residents.
+            expected_shape = tuple(target_param.shape)
+            if logical_shape != expected_shape:
+                raise QuantTargetMismatch(
+                    f"GGUF tensor '{t.name}' shape {logical_shape} disagrees "
+                    f"with model {type(target_module).__name__} shape "
+                    f"{expected_shape}"
+                )
+            dense_state[target_key] = dequantize_reader_tensor(t)
+            dequant_load.append(target_key)
+            continue
+        kind = type(target_module).__name__
+        raise QuantTargetMismatch(
+            f"GGUF-quantized tensor '{t.name}' maps to '{module_path}' "
+            f"({kind}), expected an nn.Linear. The sidecar config may not "
+            f"match this checkpoint."
+        )
 
     if unsupported:
         name, tt = unsupported[0]
@@ -1095,9 +1176,22 @@ def _install_gguf_weights(model, reader) -> dict:
     known_missing = {f"{p}.weight" for p in replaced}
     VibeVoiceLoader._apply_state_dict(model, dense_state, known_missing=known_missing)
 
+    if dequant_load:
+        logger.debug(
+            f"Dequantized {len(dequant_load)} non-Linear GGUF weight(s) at "
+            f"load (embeddings/conv heads): "
+            f"{', '.join(dequant_load[:5])}"
+            + (f" (+{len(dequant_load) - 5} more)" if len(dequant_load) > 5 else "")
+        )
+
     return {
         "n_resident_layers": len(replaced),
         "raw_bytes": total_raw,
+        "n_dequant_load": len(dequant_load),
+        "dequant_load_bytes": int(sum(
+            p.numel() * p.element_size()
+            for p in dense_state.values() if p.dtype.is_floating_point
+        )),
         "weight_family": "gguf_block",
     }
 
@@ -1168,13 +1262,15 @@ def _inspect_gguf_quantization(weight_path: str):
         read or the ``gguf`` package is unavailable.
     """
     try:
-        import gguf
+        import gguf  # noqa: F401  (availability probe)
         from gguf.constants import GGMLQuantizationType
     except ImportError:
         return None
 
     try:
-        reader = gguf.GGUFReader(weight_path)
+        from .gguf_quant import open_gguf_reader
+
+        reader = open_gguf_reader(weight_path)
     except Exception:
         return None
 
@@ -1453,6 +1549,10 @@ def load_external_vibevoice_model(
     is_streaming = isinstance(config, VibeVoiceStreamingConfig)
     if is_streaming:
         logger.debug(f"External model '{config_name}' detected as streaming model")
+        # Backends measured to diverge on the realtime path are dropped before
+        # anything keys off the mode, so the bundle records what will really be
+        # used (plan 2026-09-26, step S3.2).
+        attention_mode = resolve_realtime_attention_mode(attention_mode)
 
     # Step 4: Resolve and load the tokenizer.
     tokenizer_dir = resolve_sidecar_tokenizer_dir(weight_path)
@@ -1508,6 +1608,9 @@ def load_external_vibevoice_model(
         weight_family = "dense"
         quant_stats = {}
         if gguf_reader is not None:
+            # A quantized lm_head under a tied config would be silently
+            # discarded by tie_weights() — reject before any install work.
+            _assert_gguf_lm_head_not_tied(config, gguf_reader)
             quant_stats = _install_gguf_weights(model, gguf_reader)
             weight_family = "gguf_block"
             del gguf_reader
@@ -1789,6 +1892,9 @@ def load_external_vibevoice_asr_model(
         weight_family = "dense"
         quant_stats = {}
         if gguf_reader is not None:
+            # A quantized lm_head under a tied config would be silently
+            # discarded by tie_weights() — reject before any install work.
+            _assert_gguf_lm_head_not_tied(config, gguf_reader)
             quant_stats = _install_gguf_weights(model, gguf_reader)
             weight_family = "gguf_block"
             del gguf_reader

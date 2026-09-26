@@ -1,7 +1,10 @@
-"""VibeVoice TTS Node - Main Text-to-Speech Node (V3 Schema).
+"""VibeVoice TTS Node - canonical standard and realtime TTS node (V3 Schema).
 
-This node provides multi-speaker conversational TTS using the VibeVoice model.
-Supports voice cloning via reference audio (at least one reference is required).
+This is the single user-facing TTS node. It routes standard VibeVoice
+checkpoints through the multi-speaker reference-audio path and
+``VibeVoice-Realtime`` checkpoints through the official cached-voice-prompt
+windowed inference path. Both families return one completed ComfyUI ``AUDIO``
+object; no live PCM transport is provided.
 """
 
 import torch
@@ -13,49 +16,72 @@ from comfy_api.latest import io, ui
 
 from ..modules.model_info import (
     AVAILABLE_VIBEVOICE_MODELS,
-    get_tts_models,
-    is_model_type,
-    MODEL_CONFIGS,
+    get_tts_family_models,
 )
 from ..modules.generation import (
     load_vibevoice_model,
     load_vibevoice_from_external,
     generate_audio,
     force_offload_model,
+    resolve_generation_family,
 )
-from ..modules.attention_utils import ATTENTION_MODES, get_available_attention_modes
-from ..modules.device_utils import get_available_devices
+from ..modules.realtime_generation import (
+    classify_loaded_tts_pair,
+    generate_realtime_audio,
+)
+from ..modules.voice_presets import (
+    PRESET_NONE,
+    get_cached_voice_preset,
+    list_voice_presets,
+)
+from ..modules.attention_utils import get_available_attention_modes
+from ..modules.device_utils import get_device_options
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 from ..modules.custom_types import VibeVoiceModel
 
 logger = logging.getLogger(__name__)
 
+VOICE_PRESET_HELP = (
+    "Official cached .pt voice prompt required by realtime models. Place "
+    "prompts in models/tts/VibeVoice/voices (or another registered "
+    "vibevoice_voices root). Ignored by standard models."
+)
+_MISSING_PRESET_MESSAGE = (
+    "Realtime models require a voice preset. Select a value for "
+    "'voice_preset' from models/tts/VibeVoice/voices."
+)
+# Sentinel default for the optional external_model input. None is not usable:
+# a *linked* input resolves to None during prompt validation, while an
+# unconnected optional input is absent from the prompt entirely.
+_EXTERNAL_UNSET = object()
+
 
 class VibeVoiceTTSNode(io.ComfyNode):
-    """VibeVoice TTS node for expressive, long-form, multi-speaker conversational audio.
+    """VibeVoice TTS node for standard and realtime speech generation.
 
     Features:
-    - Multi-speaker script parsing ([1], [2], etc. or Speaker 1:, Speaker 2:)
-    - Voice cloning via reference audio inputs (at least one reference required)
-    - Multiple attention modes (eager, sdpa, flash_attention_2, sage)
-    - 4-bit LLM quantization for memory savings
-    - Configurable generation parameters (CFG, steps, sampling)
+    - Standard family: multi-speaker script parsing and reference-audio cloning
+    - Realtime family: single-speaker cached ``.pt`` voice prompts
+    - Shared attention modes, 4-bit LLM quantization, patcher, and offload path
+    - Independent diffusion steps and generated-length controls
     """
 
     CATEGORY = "audio/tts"
 
     @classmethod
     def define_schema(cls) -> io.Schema:
-        # Only expose non-streaming TTS models. ASR models are handled by the
-        # dedicated ASR node, and streaming (realtime) models by the dedicated
-        # VibeVoice Realtime TTS node — the streaming processor/model require
-        # the prefill + windowed generation path (generate_streaming_audio),
-        # which this node does not use.
-        model_names = list(get_tts_models().keys())
+        # Standard TTS models first, then realtime models; ASR is excluded.
+        model_names = list(get_tts_family_models().keys())
         if not model_names:
             model_names.append("No models found in models/tts/VibeVoice")
 
-        available_devices = get_available_devices()
+        try:
+            voice_preset_options = [PRESET_NONE, *list_voice_presets().keys()]
+        except Exception as exc:  # Asset discovery must not break schema creation.
+            logger.warning("Could not discover realtime voice presets: %s", exc)
+            voice_preset_options = [PRESET_NONE]
+
+        available_devices = get_device_options()
         default_device = available_devices[0]
 
         dtype_options = get_dtype_options()
@@ -66,8 +92,9 @@ class VibeVoiceTTSNode(io.ComfyNode):
             display_name="VibeVoice TTS",
             category=cls.CATEGORY,
             description=(
-                "Generate expressive, long-form, multi-speaker conversational audio "
-                "using VibeVoice TTS. Supports voice cloning via reference audio."
+                "Generate expressive audio with VibeVoice. Standard models use "
+                "multi-speaker reference-audio voice cloning; realtime models "
+                "use official cached .pt voice prompts."
             ),
             inputs=[
                 # Model selection
@@ -75,7 +102,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     "model_name",
                     options=model_names,
                     default=model_names[0],
-                    tooltip="Select the VibeVoice model to use. Official models will be downloaded automatically.",
+                    tooltip="Select the VibeVoice model to use. Standard and realtime TTS models are listed here; official models are downloaded automatically.",
                 ),
                 # Text input
                 io.String.Input(
@@ -88,7 +115,8 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     tooltip=(
                         "The script for generation. Use '[1]' or 'Speaker 1:' for speakers. "
                         "Each speaker must be anchored to at least one reference voice; speakers "
-                        "without their own reference are cloned from the provided reference(s)."
+                        "without their own reference are cloned from the provided reference(s). "
+                        "Realtime models are single-speaker and ignore speaker labels."
                     ),
                 ),
                 # Quantization
@@ -113,7 +141,10 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     min=0.1,
                     max=50.0,
                     step=0.05,
-                    tooltip="Classifier-Free Guidance scale. Higher values increase adherence to the voice prompt but may reduce naturalness. Recommended: 1.3",
+                    tooltip=(
+                        "Classifier-Free Guidance scale. Higher values increase adherence to the voice prompt but may reduce naturalness. "
+                        "Recommended: 1.3 for standard models, 1.5-1.8 for realtime models — realtime values below 1.5 repeat syllables instead of speaking the script, and are raised to 1.5 automatically."
+                    ),
                 ),
                 io.Int.Input(
                     "inference_steps",
@@ -134,7 +165,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     default=True,
                     label_on="Enabled (Sampling)",
                     label_off="Disabled (Greedy)",
-                    tooltip="Enable to use sampling methods (like temperature and top_p) for more varied output. Disable for deterministic (greedy) decoding.",
+                    tooltip="Enable to use sampling methods (like temperature and top_p) for more varied output. Disable for deterministic (greedy) decoding. Not used by realtime models.",
                 ),
                 io.Float.Input(
                     "temperature",
@@ -166,7 +197,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     min=0,
                     max=8192,
                     step=1,
-                    tooltip="Max generated speech tokens (utterance length budget). 0 = auto (~30x the prompt length). If the voice model exposes a speech-end token, generation stops earlier; raise this if output is cut off, lower it if output is too long.",
+                    tooltip="Max generated speech tokens (utterance length budget). 0 = auto: standard models use ~30x the prompt length; realtime models size the budget from the script (~2.5 latents per text token, capped at 1024) so a short prompt cannot run into a multi-minute decode. If the voice model exposes a speech-end token, generation stops earlier; raise this if output is cut off, lower it if output is too long.",
                 ),
                 # System parameters
                 io.Boolean.Input(
@@ -180,7 +211,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     "device",
                     options=available_devices,
                     default=default_device,
-                    tooltip="Device to run inference on.",
+                    tooltip="Device to run inference on. 'auto' follows ComfyUI's default compute device.",
                 ),
                 io.Combo.Input(
                     "dtype",
@@ -203,6 +234,13 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 io.Audio.Input("speaker_2_voice", optional=True, tooltip="Reference audio for 'Speaker 2' or '[2]' in the script."),
                 io.Audio.Input("speaker_3_voice", optional=True, tooltip="Reference audio for 'Speaker 3' or '[3]' in the script."),
                 io.Audio.Input("speaker_4_voice", optional=True, tooltip="Reference audio for 'Speaker 4' or '[4]' in the script."),
+                # Appended: realtime cached voice prompt (standard models ignore it)
+                io.Combo.Input(
+                    "voice_preset",
+                    options=voice_preset_options,
+                    default=PRESET_NONE,
+                    tooltip=VOICE_PRESET_HELP,
+                ),
             ],
             outputs=[
                 io.Audio.Output(display_name="Audio"),
@@ -210,39 +248,46 @@ class VibeVoiceTTSNode(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, **kwargs) -> bool | str:
-        """Validate inputs, allowing dynamically-discovered custom TTS models."""
+    def validate_inputs(
+        cls,
+        model_name: Optional[str] = None,
+        voice_preset: str = PRESET_NONE,
+        external_model=_EXTERNAL_UNSET,
+    ) -> bool | str:
+        """Validate inputs, allowing dynamically-discovered custom TTS models.
+
+        The signature declares only the inputs this rule inspects. ComfyUI
+        core (execution.py) calls the validator once per input present in the
+        prompt and emits one error per failing call, so a ``**kwargs``
+        signature repeats a single message once per widget.
+        """
         # An externally-loaded model bypasses the model_name dropdown entirely.
         # NOTE: During prompt validation ComfyUI resolves *linked* inputs to
         # None (no execution cache exists yet — see execution.get_input_data /
         # mark_missing), so the value cannot be inspected here. We therefore
-        # detect that the external_model input is *connected* by its presence
-        # in kwargs: a linked input is always present (resolved to None), while
-        # an unconnected optional input is absent from the prompt entirely.
-        if "external_model" in kwargs:
+        # detect that the external_model input is *connected* by it being
+        # passed at all: a linked input is always passed (resolved to None),
+        # while an unconnected optional input is absent from the prompt
+        # entirely and leaves the sentinel default in place.
+        if external_model is not _EXTERNAL_UNSET:
             return True
 
-        model_name = kwargs.get("model_name")
-        if model_name is not None:
-            if model_name not in AVAILABLE_VIBEVOICE_MODELS:
-                available = list(AVAILABLE_VIBEVOICE_MODELS.keys())
-                return f"Model '{model_name}' not found. Available models: {available}"
-            # Reject streaming (realtime) models: they require the streaming
-            # generation path (generate_streaming_audio) used by the dedicated
-            # VibeVoice Realtime TTS node. Routing them through this node hits
-            # VibeVoiceStreamingProcessor.__call__ with unsupported kwargs.
-            if is_model_type(model_name, "streaming_tts"):
-                return (
-                    f"Model '{model_name}' is a streaming (realtime) model; "
-                    f"use the 'VibeVoice Realtime TTS' node for streaming models."
-                )
-            # Reject ASR / other non-TTS types before they reach the loader.
-            if not is_model_type(model_name, "tts"):
-                cfg_type = MODEL_CONFIGS.get(model_name, {}).get("model_type")
-                return (
-                    f"Model '{model_name}' is type '{cfg_type}'; "
-                    f"use the VibeVoice ASR node for ASR models."
-                )
+        if model_name is None:
+            return True
+
+        if model_name not in AVAILABLE_VIBEVOICE_MODELS:
+            available = list(AVAILABLE_VIBEVOICE_MODELS.keys())
+            return f"Model '{model_name}' not found. Available models: {available}"
+
+        try:
+            family = resolve_generation_family(model_name)
+        except ValueError as exc:
+            return str(exc)
+
+        if family == "streaming_tts":
+            # Old saved prompts have no voice_preset key; the default covers it.
+            if not voice_preset or voice_preset == PRESET_NONE:
+                return _MISSING_PRESET_MESSAGE
         return True
 
     @classmethod
@@ -268,23 +313,15 @@ class VibeVoiceTTSNode(io.ComfyNode):
         speaker_3_voice: Optional[dict] = None,
         speaker_4_voice: Optional[dict] = None,
         external_model: Optional[dict] = None,
+        voice_preset: str = PRESET_NONE,
     ) -> io.NodeOutput:
-        """Execute VibeVoice TTS generation."""
+        """Execute standard or realtime VibeVoice TTS generation."""
+
+        # Resolve the family before loading so ASR / unknown inputs fail fast.
+        family = resolve_generation_family(model_name, external_model)
 
         # Load model — external bundle overrides the model_name dropdown.
         if external_model is not None:
-            # Guard: streaming (realtime) models must use the Realtime node.
-            if external_model.get("is_streaming"):
-                raise ValueError(
-                    "The provided external model is a streaming (realtime) model. "
-                    "Use the 'VibeVoice Realtime TTS' node for streaming models."
-                )
-            # Guard: ASR models cannot synthesize speech.
-            if external_model.get("is_asr"):
-                raise ValueError(
-                    "The provided external model is an ASR (speech-to-text) model. "
-                    "Use the 'VibeVoice ASR' node for ASR models."
-                )
             patcher, model, processor = load_vibevoice_from_external(
                 external_model,
                 device=device,
@@ -302,38 +339,68 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 quantize_4bit=quantize_llm_4bit,
             )
 
-        # Collect speaker voice samples
-        speaker_inputs = {
-            1: speaker_1_voice,
-            2: speaker_2_voice,
-            3: speaker_3_voice,
-            4: speaker_4_voice,
-        }
-
-        # Parse script to get speaker IDs
-        from ..modules.audio_utils import parse_script_1_based
-        _, speaker_ids_1_based = parse_script_1_based(text)
-
-        # Build voice samples list in order of speaker IDs
-        voice_samples = [speaker_inputs.get(sid) for sid in speaker_ids_1_based]
+        # Loaded-class safety net: renamed local checkpoints can disagree with
+        # name-based classification. Only tts -> streaming_tts is repaired.
+        loaded_classification = classify_loaded_tts_pair(model, processor)
+        if loaded_classification == "mismatch":
+            raise ValueError(
+                "Loaded VibeVoice model and processor classes are inconsistent. "
+                "Realtime checkpoints must load the VibeVoice realtime model "
+                "with the VibeVoice realtime processor."
+            )
+        if family == "tts" and loaded_classification == "realtime":
+            logger.warning(
+                "Model '%s' was classified as standard TTS by name but loaded "
+                "realtime classes; routing through the realtime path.",
+                model_name,
+            )
+            family = "streaming_tts"
+        elif family == "streaming_tts" and loaded_classification == "standard":
+            raise ValueError(
+                "Model '%s' was classified as a realtime model but loaded "
+                "standard VibeVoice classes. Realtime models require the "
+                "VibeVoice realtime model and processor."
+                % model_name
+            )
 
         try:
-            # Generate audio
-            output_waveform, sample_rate = generate_audio(
-                model=model,
-                processor=processor,
-                text=text,
-                voice_samples=voice_samples,
-                speaker_ids=speaker_ids_1_based,
-                cfg_scale=cfg_scale,
-                inference_steps=inference_steps,
-                seed=seed,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                max_new_tokens=max_new_tokens if max_new_tokens else None,
-            )
+            if family == "streaming_tts":
+                output_waveform, sample_rate = cls._generate_realtime(
+                    model=model,
+                    processor=processor,
+                    text=text,
+                    voice_preset=voice_preset,
+                    cfg_scale=cfg_scale,
+                    inference_steps=inference_steps,
+                    max_new_tokens=max_new_tokens,
+                    seed=seed,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    speaker_1_voice=speaker_1_voice,
+                    speaker_2_voice=speaker_2_voice,
+                    speaker_3_voice=speaker_3_voice,
+                    speaker_4_voice=speaker_4_voice,
+                )
+            else:
+                output_waveform, sample_rate = cls._generate_standard(
+                    model=model,
+                    processor=processor,
+                    text=text,
+                    speaker_1_voice=speaker_1_voice,
+                    speaker_2_voice=speaker_2_voice,
+                    speaker_3_voice=speaker_3_voice,
+                    speaker_4_voice=speaker_4_voice,
+                    cfg_scale=cfg_scale,
+                    inference_steps=inference_steps,
+                    seed=seed,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    max_new_tokens=max_new_tokens,
+                )
 
             output_audio = {
                 "waveform": output_waveform,
@@ -351,15 +418,133 @@ class VibeVoiceTTSNode(io.ComfyNode):
 
         except model_management.InterruptProcessingException:
             logger.info("VibeVoice TTS generation was cancelled")
-            return io.NodeOutput(
-                {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000}
-            )
+            return io.NodeOutput(cls._silent_output())
 
         except Exception as e:
             logger.error(f"Error during VibeVoice generation with {attention_mode} attention: {e}")
             if "interrupt" in str(e).lower() or "cancel" in str(e).lower():
                 logger.info("Generation was interrupted")
-                return io.NodeOutput(
-                    {"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000}
-                )
+                return io.NodeOutput(cls._silent_output())
             raise
+
+    @classmethod
+    def _silent_output(cls) -> dict:
+        """Return the shared one-second silent fallback for cancellation."""
+        return {
+            "waveform": torch.zeros((1, 1, 24000), dtype=torch.float32),
+            "sample_rate": 24000,
+        }
+
+    @classmethod
+    def _generate_standard(
+        cls,
+        model,
+        processor,
+        text: str,
+        speaker_1_voice: Optional[dict],
+        speaker_2_voice: Optional[dict],
+        speaker_3_voice: Optional[dict],
+        speaker_4_voice: Optional[dict],
+        cfg_scale: float,
+        inference_steps: int,
+        seed: int,
+        do_sample: bool,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        max_new_tokens: int,
+    ):
+        """Run the standard multi-speaker reference-audio generation path."""
+        speaker_inputs = {
+            1: speaker_1_voice,
+            2: speaker_2_voice,
+            3: speaker_3_voice,
+            4: speaker_4_voice,
+        }
+
+        # Parse script to get speaker IDs
+        from ..modules.audio_utils import parse_script_1_based
+        _, speaker_ids_1_based = parse_script_1_based(text)
+
+        # Build voice samples list in order of speaker IDs
+        voice_samples = [speaker_inputs.get(sid) for sid in speaker_ids_1_based]
+
+        return generate_audio(
+            model=model,
+            processor=processor,
+            text=text,
+            voice_samples=voice_samples,
+            speaker_ids=speaker_ids_1_based,
+            cfg_scale=cfg_scale,
+            inference_steps=inference_steps,
+            seed=seed,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens if max_new_tokens else None,
+        )
+
+    @classmethod
+    def _generate_realtime(
+        cls,
+        model,
+        processor,
+        text: str,
+        voice_preset: str,
+        cfg_scale: float,
+        inference_steps: int,
+        max_new_tokens: int,
+        seed: int,
+        do_sample: bool,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        speaker_1_voice: Optional[dict],
+        speaker_2_voice: Optional[dict],
+        speaker_3_voice: Optional[dict],
+        speaker_4_voice: Optional[dict],
+    ):
+        """Run the official realtime cached-voice-prompt generation path."""
+        if not voice_preset or voice_preset == PRESET_NONE:
+            raise ValueError(_MISSING_PRESET_MESSAGE)
+
+        if any(
+            voice is not None
+            for voice in (
+                speaker_1_voice,
+                speaker_2_voice,
+                speaker_3_voice,
+                speaker_4_voice,
+            )
+        ):
+            logger.warning(
+                "Speaker reference audio is ignored for realtime models: the "
+                "VibeVoice realtime architecture is single-speaker and uses "
+                "the selected 'voice_preset' cached prompt."
+            )
+
+        if do_sample or temperature != 0.95 or top_p != 0.95 or top_k != 0:
+            logger.warning(
+                "Sampling controls (do_sample/temperature/top_p/top_k) are not "
+                "used by the current realtime generation loop; model defaults "
+                "are used instead."
+            )
+
+        cached_voice_preset = get_cached_voice_preset(
+            voice_preset,
+            model_management.get_torch_device(),
+        )
+        return generate_realtime_audio(
+            model=model,
+            processor=processor,
+            text=text,
+            voice_preset=cached_voice_preset,
+            cfg_scale=cfg_scale,
+            diffusion_steps=inference_steps,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+        )
+
+
+__all__ = ["VibeVoiceTTSNode"]

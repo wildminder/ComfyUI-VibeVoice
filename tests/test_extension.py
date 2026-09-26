@@ -9,6 +9,16 @@ from ComfyUI_VibeVoice.nodes.realtime_node import VibeVoiceRealtimeNode
 from ComfyUI_VibeVoice.nodes.external_loader_node import VibeVoiceExternalLoaderNode
 
 
+# Compatibility snapshot captured before canonical-node changes. The extension
+# must retain these IDs until the explicit migration/major-release boundary.
+LEGACY_EXTENSION_NODE_IDS = (
+    "VibeVoiceTTS",
+    "VibeVoiceASR",
+    "VibeVoiceRealtime",
+    "VibeVoiceLoadExternalModel",
+)
+
+
 class TestVibeVoiceExtension:
     """Test VibeVoiceExtension class."""
 
@@ -21,6 +31,13 @@ class TestVibeVoiceExtension:
         node_list = asyncio.get_event_loop().run_until_complete(ext.get_node_list())
         assert isinstance(node_list, list)
         assert len(node_list) > 0
+
+    def test_node_ids_match_legacy_snapshot(self):
+        ext = VibeVoiceExtension()
+        node_list = asyncio.get_event_loop().run_until_complete(ext.get_node_list())
+        assert tuple(node.define_schema().node_id for node in node_list) == (
+            LEGACY_EXTENSION_NODE_IDS
+        )
 
     def test_node_list_contains_tts_node(self):
         ext = VibeVoiceExtension()

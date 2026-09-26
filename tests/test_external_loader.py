@@ -287,6 +287,12 @@ class TestLoadExternalModel:
             result = load_external_vibevoice_model(weight_file, "VibeVoice-1.5B", **kwargs)
         return result, mocks
 
+    def test_external_pt_checkpoint_remains_accepted(self, tmp_path):
+        weight = tmp_path / "realtime-checkpoint.pt"
+        weight.write_bytes(b"dummy")
+        result, _ = self._run(str(weight))
+        assert result["source_path"] == str(weight)
+
     def test_load_external_model_returns_dict_with_required_keys(self, weight_file):
         """Returned bundle has all required keys."""
         result, _ = self._run(weight_file)
@@ -1073,6 +1079,18 @@ class TestResolveAutoConfigName:
         )
         with pytest.raises(ValueError, match="could not determine"):
             resolve_auto_config_name(weight_file, weights_fp=foreign)
+
+    def test_unmatched_fingerprint_reports_dimensions_and_explicit_selection(self, weight_file):
+        foreign = WeightsFingerprint(
+            hidden_size=999, vocab_size=888, source_key="k"
+        )
+        with pytest.raises(ValueError) as excinfo:
+            resolve_auto_config_name(weight_file, weights_fp=foreign)
+        message = str(excinfo.value)
+        assert "hidden=999" in message
+        assert "vocab=888" in message
+        assert "explicitly" in message
+        assert "not guessed" in message
 
 
 class TestAutoDetectLoaderSemantics:

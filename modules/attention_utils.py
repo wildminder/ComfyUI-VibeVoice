@@ -134,3 +134,72 @@ def get_attn_implementation_for_load(attention_mode: str) -> str:
     if attention_mode == "sage":
         return "sdpa"
     return attention_mode
+
+
+# ---------------------------------------------------------------------------
+# Realtime (streaming) attention policy
+# ---------------------------------------------------------------------------
+# Measured on VibeVoice-Realtime-0.5B, RTX SM89, bf16, one fixed voice prompt,
+# through the node load path (plan 2026-09-26, step S3.2). The compared
+# quantity is the conditioning vector of the first text window -- the tensor the
+# diffusion head actually consumes -- as cosine/relative-L2 against eager:
+#
+#   sdpa               cos=0.999962  rel_l2=0.0088
+#   flash_attention_2  cos=0.999940  rel_l2=0.0110
+#   sage               cos=0.994651  rel_l2=0.1033   <- fails the 0.999 gate
+#
+# Two independent causes, both measured on the same prompt:
+#   1. The sage kernel ignores the additive attention mask
+#      (``sage_attention_forward`` sets ``is_causal = attention_mask is None and
+#      q_len > 1``). With the realtime loop's 5-token text window over the
+#      316-token voice prefill, causal masking lets query i see keys <= 316+i,
+#      while sage lets every query see all 321 keys -- a lookahead leak over the
+#      rest of the window. Shrinking the query to 1 token (where causal and
+#      non-causal coincide) drops sage's error from rel_l2=0.103 to 0.043.
+#   2. What remains at q_len=1 is the int8-QK / fp8-PV kernel's own error,
+#      still 4-5x the sdpa/flash gap (0.043 vs 0.009).
+#
+# A backend that diverges is excluded here rather than offered and quietly
+# producing different conditioning than every other backend. This is a
+# realtime-only decision: the standard TTS family generates without a cached
+# prefill window, and the change is visible to users, so the README has to say
+# so (plan step S6.1).
+REALTIME_ATTENTION_FALLBACK = "sdpa"
+
+REALTIME_EXCLUDED_ATTENTION_MODES: dict[str, str] = {
+    "sage": (
+        "its conditioning diverges from every other backend (cos=0.9947 vs "
+        "eager, gate is 0.999): the sage kernel ignores the attention mask, so "
+        "a text window over the voice prefill attends ahead of its own "
+        "positions, and its int8/fp8 quantisation adds a further rel_l2=0.043"
+    ),
+}
+
+
+def resolve_realtime_attention_mode(attention_mode: str) -> str:
+    """Downgrade a backend excluded from the realtime path, with a log line.
+
+    Call this where the model family is known (the loader, the external loader
+    node). Excluded backends are replaced by
+    :data:`REALTIME_ATTENTION_FALLBACK` and the reason is logged at WARNING
+    level, so a user who picked sage sees why the run used sdpa instead.
+
+    Args:
+        attention_mode: The resolved attention mode.
+
+    Returns:
+        The attention mode to actually use, or ``attention_mode`` unchanged
+        when it is not excluded.
+    """
+    reason = REALTIME_EXCLUDED_ATTENTION_MODES.get(attention_mode)
+    if reason is None:
+        return attention_mode
+    logger.warning(
+        "Attention mode '%s' is not used for realtime (VibeVoice-Realtime) "
+        "models: %s. Falling back to '%s' for this load. The standard TTS "
+        "family is unaffected.",
+        attention_mode,
+        reason,
+        REALTIME_ATTENTION_FALLBACK,
+    )
+    return REALTIME_ATTENTION_FALLBACK

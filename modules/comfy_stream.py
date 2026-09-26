@@ -301,11 +301,15 @@ def make_streaming_container(base_cls):
 
     base_forward = base_cls.forward
 
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
+        # Transparent passthrough of extra args/kwargs: the wrapped module
+        # keeps its base forward's full signature (the native ASR encoders
+        # receive padding_cache=/use_cache=; a bare (self, x) wrapper raised
+        # "unexpected keyword argument 'padding_cache'" there).
         global _LAST_DEVICE
         _LAST_DEVICE = x.device
         _relocate_direct_params(self, x.device)
-        return base_forward(self, x)
+        return base_forward(self, x, *args, **kwargs)
 
     def __getattr__(self, name):
         # nn.Module resolves direct params through its own __getattr__ from

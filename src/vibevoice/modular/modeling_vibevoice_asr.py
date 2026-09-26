@@ -1,6 +1,8 @@
 from typing import List, Optional, Tuple, Union
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers.models.auto import AutoModel, AutoModelForCausalLM
 
@@ -415,6 +417,180 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
             attentions=outputs.attentions,
         )
 
+    @torch.no_grad()
+    def init_streaming_state(self, tokenizer, context_info: str = None):
+        """Streaming model: build the initial KV cache and cached embeddings.
+
+        Ported verbatim from upstream VibeVoice (the streaming checkpoints
+        are driven exclusively through this chunked protocol).
+        """
+        device = next(self.parameters()).device
+        embed_tokens = self.get_input_embeddings()
+
+        keys_str = "speaker, content"
+        if context_info:
+            prompt_text = (
+                "You are a helpful assistant that transcribes audio input into text output. "
+                f"Please transcribe the following audios streamingly with these keys: {keys_str} "
+                f"and extra info: {context_info}\n"
+            )
+        else:
+            prompt_text = (
+                "You are a helpful assistant that transcribes audio input into text output. "
+                f"Please transcribe the following audios streamingly with these keys: {keys_str}\n"
+            )
+
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        prompt_embeds = embed_tokens(prompt_tensor)
+
+        outputs = self(
+            inputs_embeds=prompt_embeds,
+            use_cache=True,
+            return_dict=True,
+        )
+
+        return {
+            "past_key_values": outputs.past_key_values,
+            "sp_start_embed": embed_tokens(torch.tensor([[tokenizer.speech_start_id]], device=device)),
+            "sp_end_embed": embed_tokens(torch.tensor([[tokenizer.speech_end_id]], device=device)),
+            "text_chunk_end_id": tokenizer.text_chunk_end_id,
+            "eos_id": tokenizer.eos_token_id,
+            "embed_tokens": embed_tokens,
+        }
+
+    @torch.no_grad()
+    def streaming_generate(
+        self,
+        audio_tensor: torch.FloatTensor,
+        tokenizer,
+        chunk_duration: float = 2.0,
+        text_audio_delay: float = None,
+        sample_rate: int = 24000,
+        max_new_tokens_per_chunk: int = 256,
+        temperature: float = 0.0,
+        context_info: str = None,
+        encode_mode: str = "split_then_encode",
+        pad_last_chunk: bool = True,
+    ):
+        """Streaming model: chunked ASR inference over a full audio tensor.
+
+        Ported verbatim from upstream VibeVoice. Yields
+        ``(chunk_index, total_chunks, chunk_text)`` per audio chunk.
+        """
+        device = next(self.parameters()).device
+
+        sp_start_id = tokenizer.speech_start_id
+        sp_end_id = tokenizer.speech_end_id
+        text_chunk_end_id = tokenizer.text_chunk_end_id
+        eos_id = tokenizer.eos_token_id
+
+        embed_tokens = self.get_input_embeddings()
+
+        state = self.init_streaming_state(tokenizer, context_info=context_info)
+        past_key_values = state["past_key_values"]
+        sp_start_embed = state["sp_start_embed"]
+        sp_end_embed = state["sp_end_embed"]
+
+        if audio_tensor.ndim == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        audio_tensor = audio_tensor.to(device)
+
+        if encode_mode == "encode_then_split":
+            all_features = self.encode_speech(audio_tensor)
+            total_tokens = all_features.shape[1]
+            audio_duration = audio_tensor.shape[1] / sample_rate
+            tps = total_tokens / audio_duration if audio_duration > 0 else 7.5
+            tokens_per_chunk = max(1, math.ceil(chunk_duration * tps))
+
+            _frame_dur = 3200 / sample_rate
+            _delay = text_audio_delay if text_audio_delay is not None else 0.5
+            lookahead_sec = round(_delay / _frame_dur) * _frame_dur
+            lookahead_tokens = int(round(lookahead_sec * tps))
+
+            feature_chunks = []
+            text_start = 0
+            while text_start < total_tokens:
+                audio_end = min(text_start + tokens_per_chunk + lookahead_tokens, total_tokens)
+                if audio_end > text_start:
+                    feature_chunks.append(all_features[:, text_start:audio_end, :])
+                text_start = min(text_start + tokens_per_chunk, total_tokens)
+        else:
+            total_samples = audio_tensor.shape[1]
+            chunk_samples = int(chunk_duration * sample_rate)
+
+            _frame_dur = 3200 / sample_rate
+            _delay = text_audio_delay if text_audio_delay is not None else 0.5
+            lookahead_sec = round(_delay / _frame_dur) * _frame_dur
+            lookahead_samples = int(round(lookahead_sec * sample_rate))
+
+            feature_chunks = []
+            text_start_sample = 0
+            _target_samples = chunk_samples + lookahead_samples
+            while text_start_sample < total_samples:
+                audio_end_sample = min(text_start_sample + chunk_samples + lookahead_samples, total_samples)
+                if audio_end_sample > text_start_sample:
+                    seg = audio_tensor[:, text_start_sample:audio_end_sample]
+                    if pad_last_chunk and seg.shape[1] < _target_samples:
+                        seg = F.pad(seg, (0, _target_samples - seg.shape[1]))
+                    chunk_features = self.encode_speech(seg)
+                    feature_chunks.append(chunk_features)
+                text_start_sample = min(text_start_sample + chunk_samples, total_samples)
+
+        total_chunks = len(feature_chunks)
+
+        for chunk_idx, feat_chunk in enumerate(feature_chunks):
+            audio_embeds = torch.cat([sp_start_embed, feat_chunk, sp_end_embed], dim=1)
+
+            outputs = self(
+                inputs_embeds=audio_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_logits = outputs.logits
+
+            chunk_tokens = []
+            for _ in range(max_new_tokens_per_chunk):
+                logits = next_logits[:, -1, :]
+
+                if temperature <= 0:
+                    next_token_id = torch.argmax(logits, dim=-1).item()
+                else:
+                    probs = F.softmax(logits / temperature, dim=-1)
+                    next_token_id = torch.multinomial(probs, num_samples=1).squeeze(-1).item()
+
+                if next_token_id == text_chunk_end_id or next_token_id == eos_id:
+                    break
+
+                chunk_tokens.append(next_token_id)
+
+                next_embed = embed_tokens(torch.tensor([[next_token_id]], device=device))
+                outputs = self(
+                    inputs_embeds=next_embed,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = outputs.past_key_values
+                next_logits = outputs.logits
+
+            tce_embed = embed_tokens(torch.tensor([[text_chunk_end_id]], device=device))
+            outputs = self(
+                inputs_embeds=tce_embed,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = outputs.past_key_values
+
+            chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            for _st in ['<|text_chunk_end|>', '<|object_ref_start|>', '<|object_ref_end|>',
+                        '<|box_start|>', '<|speech_start|>', '<|speech_end|>', '<|speech_pad|>']:
+                chunk_text = chunk_text.replace(_st, '')
+            yield chunk_idx, total_chunks, chunk_text
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -434,16 +610,18 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
         Prepare inputs for generation step. This method is called by generate() 
         for each token generation step.
         
-        Following Qwen2-VL's approach: speech inputs are only forwarded on the first pass
-        (when cache_position[0] == 0), and are excluded in subsequent generation steps.
+        Following Qwen2-VL's approach: speech inputs are only forwarded on the
+        first pass (prefill, cache still empty), and are excluded in
+        subsequent generation steps.
         """
         # If we have past key values, we only need to process the new tokens
+        past_length = 0
         if past_key_values is not None:
             if isinstance(past_key_values, tuple):
                 past_length = past_key_values[0][0].shape[2]
             else:
                 past_length = past_key_values.get_seq_length()
-            
+
             # Keep only the new tokens
             if input_ids is not None and input_ids.shape[1] > past_length:
                 input_ids = input_ids[:, past_length:]
@@ -459,10 +637,21 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens, 
-                past_seen_tokens + (input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]), 
+                past_seen_tokens,
+                past_seen_tokens + (input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]),
                 device=input_ids.device if input_ids is not None else inputs_embeds.device
             )
+
+        # transformers 5.x grows position_ids / cache_position by append (they
+        # always cover the FULL sequence), while this step only feeds the new
+        # tokens. Slice both to this step's length — mirroring the default
+        # prepare in transformers 5.x — otherwise the causal mask is built
+        # over past + full-window keys and mismatches the decode batch.
+        sequence_length = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+        if position_ids is not None and position_ids.shape[-1] != sequence_length:
+            position_ids = position_ids[..., -sequence_length:]
+        if cache_position is not None and cache_position.shape[-1] != sequence_length:
+            cache_position = cache_position[..., -sequence_length:]
 
         # Prepare model inputs
         if inputs_embeds is not None and past_key_values is None:
@@ -480,9 +669,14 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
             }
         )
         
-        # Following Qwen2-VL pattern: only include speech inputs on the first forward pass
-        # (when cache_position[0] == 0), exclude them in subsequent generation steps
-        if cache_position is not None and len(cache_position) > 0 and cache_position[0] == 0:
+        # Following Qwen2-VL pattern: only include speech inputs on the first
+        # forward pass (prefill), exclude them in subsequent generation steps.
+        # The first-pass signal is the EMPTY CACHE, not cache_position[0] == 0:
+        # transformers 5.x builds cache_position via append (it always contains
+        # a leading 0, even on decode steps), so the old test fired every step
+        # and the full-length acoustic mask collided with the 1-token decode
+        # batch (IndexError in forward).
+        if past_length == 0:
             # First forward pass - include speech inputs if provided
             model_inputs.update({
                 "speech_tensors": speech_tensors,
@@ -494,14 +688,20 @@ class VibeVoiceASRForConditionalGeneration(VibeVoiceASRPreTrainedModel, Generati
             # Subsequent generation steps - exclude speech inputs
             model_inputs.update({
                 "speech_tensors": None,
-                "speech_masks": None, 
+                "speech_masks": None,
                 "speech_semantic_tensors": None,
                 "acoustic_input_mask": None,
             })
-        
-        # Include any remaining kwargs that might be needed
-        model_inputs.update(kwargs)
-        
+
+        # Include any remaining kwargs that might be needed. transformers 5.x
+        # forwards the FULL model_kwargs through **kwargs, so a blind update
+        # would re-override the speech inputs nulled above (or the sliced
+        # input_ids) with their original full-sequence values on every
+        # subsequent generation step.
+        for _k, _v in kwargs.items():
+            if _k not in model_inputs:
+                model_inputs[_k] = _v
+
         return model_inputs
 
 AutoModel.register(VibeVoiceASRConfig, VibeVoiceASRModel, exist_ok=True)

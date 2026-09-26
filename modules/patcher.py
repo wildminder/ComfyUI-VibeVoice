@@ -104,7 +104,11 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                 "sage": "SageAttention (Quantized High-Performance)",
             }
             logger.debug(f"Attention Mode: {mode_names.get(self.attention_mode, self.attention_mode)}")
-            self.model.load_model(target_device, self.attention_mode)
+            # Keyword, not positional: the TTS handler takes
+            # (device, attention_mode) but the ASR handler takes
+            # (device, dtype_str, attention_mode) — a positional call landed
+            # the attention mode in the ASR handler's dtype slot.
+            self.model.load_model(target_device, attention_mode=self.attention_mode)
 
         # Plan 2026-08-18 D6/RC-5 + 2026-08-26: the single H2D transfer is
         # owned by super().patch_model(); the tree itself is made fluent in

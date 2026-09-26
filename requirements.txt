@@ -15,7 +15,14 @@ accelerate
 torchaudio
 huggingface_hub
 soundfile
-transformers>=4.51.3
+# transformers is bounded to the 5.3.x line — the version this node is
+# developed, tested and shipped against, and the only green realtime row in
+# docs/plans/2026-09-26-two-version-matrix.md. Do NOT re-add a "<5" cap here:
+# ComfyUI's own requirements declare transformers>=4.50.3, so a sub-5.0 pin
+# makes a Manager install downgrade a package this node does not own, and it
+# would also break the shipped ASR node, which needs >= 5.3.0. See the comment
+# in pyproject.toml for the full rationale; keep the two in sync.
+transformers>=5.3.0,<5.4
 diffusers
 bitsandbytes
 

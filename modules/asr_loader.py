@@ -12,12 +12,13 @@ import torch
 import comfy.model_management as model_management
 
 from .model_info import AVAILABLE_VIBEVOICE_MODELS, MODEL_CONFIGS
-from .attention_utils import resolve_attention_mode, get_attn_implementation_for_load
+from .attention_utils import resolve_attention_mode, get_attn_implementation_for_load, check_sage_attention_compatible
 from .dtype_utils import resolve_dtype
 from .base_loader import BaseVibeVoiceLoader
 
 # Support both package-relative imports and direct imports
 from ..src.vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
+from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
 from ..src.vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 
 logger = logging.getLogger(__name__)
@@ -50,16 +51,24 @@ class VibeVoiceASRModelHandler(torch.nn.Module):
     def load_model(self, device, dtype_str: str = "auto", attention_mode: str = "sdpa"):
         """Load the ASR model and processor into memory.
 
+        Device contract (DF-003, same as the TTS handler): the loader builds
+        the model on CPU and this handler performs NO device move — ``device``
+        is only forwarded for dtype-auto resolution. The single host-to-device
+        transfer is owned by ``VibeVoiceASRPatcher.patch_model`` (via core's
+        ModelPatcher.load) after ComfyUI's VRAM arbitration, so an oversized
+        model (e.g. the 17 GB ASR-HF on a 16 GB GPU) partially offloads
+        instead of OOM-ing. A force ``.to(device)`` here would bypass that
+        arbitration and OOM mid-load (user-reported on 2026-09-09).
+
         Args:
-            device: Target device for the model.
+            device: Target device (used for dtype-auto resolution inside the
+                loader; NOT used for placement here).
             dtype_str: Dtype string ("auto", "bf16", "fp16", "fp32").
             attention_mode: Attention implementation to use.
         """
         self.model, self.processor = VibeVoiceASRLoader.load_model(
             self.model_name, device, dtype_str=dtype_str, attention_mode=attention_mode
         )
-        if hasattr(self.model, 'device') and self.model.device != device:
-            self.model.to(device)
         # Plan 2026-08-18, Phase 6 (D7/RC-7): refine the size estimate from
         # the real parameters now that the model is loaded (config size_gb
         # can be inaccurate for quantized / merged checkpoints).
@@ -75,6 +84,60 @@ class VibeVoiceASRModelHandler(torch.nn.Module):
                 self.size = total
         except Exception:
             pass
+
+
+def _is_native_asr_checkpoint(model_path: str) -> bool:
+    """Return True when the checkpoint dir is a HF-native VibeVoice ASR model.
+
+    Native checkpoints (``microsoft/VibeVoice-ASR-HF``) declare
+    ``"model_type": "vibevoice_asr"`` in ``config.json`` and are handled by
+    the transformers builtins (``VibeVoiceAsrForConditionalGeneration`` /
+    ``AutoProcessor``). Vendored checkpoints (the streaming family, the
+    original ``microsoft/VibeVoice-ASR``) share ``model_type: "vibevoice"``
+    with TTS and keep going through ``src/vibevoice``.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        import json
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f).get("model_type") == "vibevoice_asr"
+    except (OSError, ValueError):
+        return False
+
+
+def _apply_sage_attention_if_requested(model, attention_mode: str) -> None:
+    """Apply SageAttention post-load (TTS parity: loader.py's block).
+
+    SageAttention is a per-instance monkey-patch of ``Qwen2Attention.forward``
+    (real HF instances in both the vendored and native trees), applied AFTER
+    the streaming conversion — the same order the TTS loader uses.
+    """
+    if attention_mode != "sage":
+        return
+    if check_sage_attention_compatible():
+        set_sage_attention(model)
+    else:
+        raise RuntimeError("Incompatible hardware/setup for SageAttention.")
+
+
+def _neutralize_generation_config_presets(model) -> None:
+    """Drop the checkpoint's preset max/min length knobs from generation_config.
+
+    The ASR-HF checkpoint ships ``generation_config.json`` with BOTH
+    ``max_length`` and ``max_new_tokens`` (32768). transformers warns on every
+    ``generate()`` when a passed ``max_new_tokens`` meets a non-default
+    ``max_length``. The node drives generation exclusively via
+    ``max_new_tokens`` (node widget + progress-streamer budget), so the
+    preset is neutralized at load time — matching the TTS models, which carry
+    no preset at all.
+    """
+    gen_cfg = getattr(model, "generation_config", None)
+    if gen_cfg is None:
+        return
+    if getattr(gen_cfg, "max_length", None) is not None:
+        gen_cfg.max_length = None
+    if getattr(gen_cfg, "min_length", None) is not None:
+        gen_cfg.min_length = None
 
 
 class VibeVoiceASRLoader(BaseVibeVoiceLoader):
@@ -112,19 +175,127 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
         return model_path, tokenizer_repo
 
     @staticmethod
+    def _load_native(model_path: str, device, model_dtype, attn_implementation: str,
+                     attention_mode: str = "sdpa"):
+        """Load a HF-native VibeVoice-ASR-HF checkpoint via transformers.
+
+        The native classes (transformers >= 5.3.0) match the checkpoint
+        exactly — no vendored compat shims involved. The processor comes
+        from ``AutoProcessor`` (reads processor_config.json + the shipped
+        tokenizer), the model from ``VibeVoiceAsrForConditionalGeneration``.
+
+        Device contract (DF-003, same as the TTS loader): the model is built
+        entirely on CPU and NO device move happens here — ``device`` is only
+        used for dtype-auto resolution. The single host-to-device transfer is
+        owned by ``VibeVoiceASRPatcher.patch_model`` after ComfyUI's VRAM
+        arbitration, so an oversized model partially offloads instead of
+        OOM-ing. The tree is also converted to ComfyUI's streaming protocol
+        (``convert_tree_for_streaming``) so it survives that partial offload.
+        """
+        try:
+            logger.debug(
+                f"Loading native ASR model from '{model_path}' with dtype: {model_dtype} "
+                f"and attention: '{attn_implementation}'"
+            )
+            from transformers import AutoProcessor, VibeVoiceAsrForConditionalGeneration
+
+            processor = AutoProcessor.from_pretrained(model_path)
+
+            # Attention routing for the composite native model. The acoustic
+            # and semantic tokenizer encoders are ConvNext-based and only
+            # support eager attention (an explicit sdpa/flash request raises
+            # "does not support ... scaled_dot_product_attention"); the
+            # language model takes the requested mode. The per-subconfig
+            # dict is applied recursively by the transformers config
+            # ("" = root + text_config inherit the requested mode).
+            _LM_ONLY = ("acoustic_tokenizer_encoder_config", "semantic_tokenizer_encoder_config")
+            from_pretrained_kwargs = {"attn_implementation": attn_implementation}
+            try:
+                from transformers import AutoConfig
+                _cfg = AutoConfig.from_pretrained(model_path)
+                if any(getattr(_cfg, k, None) is not None for k in _LM_ONLY):
+                    from_pretrained_kwargs["attn_implementation"] = {
+                        "": attn_implementation,
+                        **{k: "eager" for k in _LM_ONLY},
+                    }
+            except Exception:
+                # Config unreadable or a transformers without sub-config
+                # dicts: fall back to the plain string.
+                pass
+
+            import transformers
+            from packaging import version
+            if version.parse(transformers.__version__) >= version.parse("4.56.0"):
+                from_pretrained_kwargs['dtype'] = model_dtype
+            else:
+                from_pretrained_kwargs['torch_dtype'] = model_dtype
+
+            # CPU-resident load. No `device_map`/`.to(device)` here: force
+            # placement would bypass ComfyUI's VRAM arbitration (user OOM'd
+            # at 15.14/15.99 GiB when this moved the whole tree to GPU
+            # inside patch_model before the budget was computed).
+            model = VibeVoiceAsrForConditionalGeneration.from_pretrained(
+                model_path,
+                **from_pretrained_kwargs,
+            )
+
+            # Native lowvram streaming (same conversion the TTS tree gets):
+            # swap leaf classes so core's partial-load machinery can stream
+            # this 17 GB tree under a 16 GB budget instead of stranding
+            # offloaded modules on CPU. Class-only swap; weights untouched.
+            try:
+                from .comfy_stream import convert_tree_for_streaming
+
+                convert_tree_for_streaming(model)
+            except Exception as e:
+                logger.warning(
+                    f"Streaming conversion failed (continuing without it): {e}"
+                )
+
+            model.eval()
+
+            # Post-load attention patch + generation-config hygiene (TTS
+            # parity, loader.py blocks).
+            _apply_sage_attention_if_requested(model, attention_mode)
+            _neutralize_generation_config_presets(model)
+
+            logger.info(f"Successfully loaded native ASR model from '{model_path}'")
+            return model, processor
+
+        except ImportError as e:
+            raise RuntimeError(
+                f"The checkpoint at '{model_path}' requires transformers >= 5.3.0 "
+                f"(native VibeVoice-ASR support); installed: {e}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load native ASR model from '{model_path}': {e}")
+            raise RuntimeError(f"Failed to load ASR model '{model_path}': {e}")
+
+    @staticmethod
     def load_model(
         model_name: str,
         device,
         dtype_str: str = "auto",
         attention_mode: str = "sdpa",
     ):
-        """Load a VibeVoice ASR model, downloading if necessary. Caches the loaded model.
+        """Load a VibeVoice ASR model, downloading if necessary.
+
+        This is a PURE BUILDER (TTS parity): it constructs and returns
+        ``(model, processor)`` and does NOT register them in any cache.
+        Cache ownership belongs to the callers — ``load_asr_model_patched`` /
+        ``load_asr_from_external`` register the live model under the PATCHER
+        key (which ``VibeVoiceASRPatcher.unpatch_model`` evicts on destroy),
+        and the legacy direct path under its own key. Registering here as
+        well created a second cache entry under a third key format that
+        survived model eviction and pinned the superseded 17 GB tree in
+        RAM/VRAM (user-reported leak, 2026-09-09).
 
         Args:
             model_name: Name of the model to load.
             device: Target device for the model.
             dtype_str: Dtype string ("auto", "bf16", "fp16", "fp32").
-            attention_mode: Attention implementation ("eager", "sdpa", "flash_attention_2").
+            attention_mode: Attention implementation ("eager", "sdpa",
+                "flash_attention_2", "sage").
 
         Returns:
             Tuple of (model, processor).
@@ -139,11 +310,6 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
                 f"Available models: {list(AVAILABLE_VIBEVOICE_MODELS.keys())}"
             )
 
-        cache_key = f"asr_{model_name}_{dtype_str}_{attention_mode}"
-        if cache_key in LOADED_ASR_MODELS_CACHE:
-            logger.debug(f"Using cached ASR model: {model_name}")
-            return LOADED_ASR_MODELS_CACHE[cache_key]
-
         # Resolve paths
         model_path, tokenizer_repo = VibeVoiceASRLoader._resolve_model_paths(model_name)
 
@@ -154,6 +320,16 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
         # Resolve attention mode
         attention_mode = resolve_attention_mode(attention_mode, quantize_4bit=False)
         attn_implementation = get_attn_implementation_for_load(attention_mode)
+
+        # HF-native checkpoints (model_type "vibevoice_asr", e.g.
+        # microsoft/VibeVoice-ASR-HF) load through the transformers builtins;
+        # everything else (streaming family, original VibeVoice-ASR) keeps the
+        # vendored src/vibevoice classes.
+        if _is_native_asr_checkpoint(model_path):
+            return VibeVoiceASRLoader._load_native(
+                model_path, device, model_dtype, attn_implementation,
+                attention_mode=attention_mode,
+            )
 
         try:
             logger.debug(
@@ -167,11 +343,11 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
                 language_model_pretrained_name=tokenizer_repo,
             )
 
-            # Load model
-            from_pretrained_kwargs = {
-                "attn_implementation": attn_implementation,
-                "device_map": device if isinstance(device, str) else None,
-            }
+            # CPU-resident load (device contract DF-003, same as the native
+            # branch): no `device_map`/`.to(device)` — force placement would
+            # bypass ComfyUI's VRAM arbitration; the patcher owns the single
+            # H2D transfer after the budget is computed.
+            from_pretrained_kwargs = {"attn_implementation": attn_implementation}
 
             # Handle dtype kwarg based on transformers version
             import transformers
@@ -186,11 +362,26 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
                 **from_pretrained_kwargs,
             )
 
-            if isinstance(device, torch.device) or (isinstance(device, str) and device != "auto"):
-                model = model.to(device)
+            # Native lowvram streaming (same conversion the TTS tree gets):
+            # class-only swap so core's partial-load machinery can stream
+            # this tree under a tight VRAM budget instead of stranding
+            # offloaded modules on CPU.
+            try:
+                from .comfy_stream import convert_tree_for_streaming
+
+                convert_tree_for_streaming(model)
+            except Exception as e:
+                logger.warning(
+                    f"Streaming conversion failed (continuing without it): {e}"
+                )
 
             model.eval()
-            LOADED_ASR_MODELS_CACHE[cache_key] = (model, processor)
+
+            # Post-load attention patch + generation-config hygiene (TTS
+            # parity, loader.py blocks).
+            _apply_sage_attention_if_requested(model, attention_mode)
+            _neutralize_generation_config_presets(model)
+
             logger.info(f"Successfully loaded ASR model '{model_name}'")
             return model, processor
 
