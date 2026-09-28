@@ -319,3 +319,103 @@ class TestVibeVoiceASRPatcher:
 
         LOADED_ASR_MODELS_CACHE.clear()
         LOADED_MODELS_CACHE.clear()
+
+
+class TestCloneCompatibility:
+    """core's ModelPatcher.clone() reconstructs the subclass with POSITIONAL
+    args — (model, load_device, offload_device, size, ...) — at
+    comfy/model_patcher.py:446.
+
+    With ``__init__(self, model, attention_mode="eager", dtype=None, *args,
+    **kwargs)`` the first two POSITIONAL args bind to attention_mode and
+    dtype, ``offload_device`` is never forwarded, and the call dies with
+    ``TypeError: ModelPatcher.__init__() missing 1 required positional
+    argument: 'offload_device'``. The two extras are keyword-only for that
+    reason; this class is the lock.
+    """
+
+    @staticmethod
+    def _real_base_record():
+        """A stand-in ModelPatcher.__init__ that RECORDS what it was given.
+
+        The bug is an argument-routing fault, so the test has to look at the
+        call, not merely at the absence of an exception. Using a real
+        ``super().__init__`` (rather than a MagicMock) is also what makes the
+        failure mode real: a mocked base swallows the broken call entirely and
+        the test would pass either way.
+        """
+        return patch(
+            "comfy.model_patcher.ModelPatcher.__init__",
+            autospec=True,
+            side_effect=lambda model, *a, **kw: None,
+        )
+
+    def test_clone_forwards_devices_and_size_positionally(self):
+        handler = MagicMock()
+        handler.cache_key = "clone-test"
+        load_device = torch.device("cuda")
+        offload_device = torch.device("cpu")
+
+        with self._real_base_record() as base_init:
+            VibeVoicePatcher(
+                handler,
+                attention_mode="sage",
+                dtype=torch.bfloat16,
+                load_device=load_device,
+                offload_device=offload_device,
+                size=1000,
+            )
+        # Exactly what core's clone() does on a second, un-keyed construction.
+        with self._real_base_record() as clone_init:
+            clone = VibeVoicePatcher(handler, load_device, offload_device, 1000)
+
+        # autospec records the bound `self` first, so args[0] is the patcher,
+        # args[1] the model, and everything after is what core passed on.
+        args, kwargs = clone_init.call_args
+        assert args[1] is handler
+        assert args[2:] == (load_device, offload_device, 1000), (
+            "the positional device/size arguments must reach "
+            "ModelPatcher.__init__ untouched. A positional extra in the "
+            "subclass signature swallows load_device into attention_mode and "
+            "then drops offload_device, which is exactly the TypeError core "
+            "raises during clone eviction."
+        )
+        assert kwargs == {}
+
+    def test_clone_without_keywords_gets_eager_defaults(self):
+        """A core-constructed clone has no attention_mode/dtype, so it must
+        fall back to the class defaults rather than to a device object."""
+        handler = MagicMock()
+        handler.cache_key = "clone-test"
+        with self._real_base_record():
+            clone = VibeVoicePatcher(
+                handler, torch.device("cuda"), torch.device("cpu"), 1000
+            )
+        assert clone.attention_mode == "eager"
+        assert clone.target_dtype is None
+
+    def test_asr_patcher_inherits_the_keyword_only_signature(self):
+        """VibeVoiceASRPatcher subclasses the same __init__, so the fix must
+        reach it — otherwise ComfyUI still crashes on an ASR clone."""
+        import inspect
+
+        for cls in (VibeVoicePatcher, VibeVoiceASRPatcher):
+            spec = inspect.getfullargspec(cls.__init__)
+            assert spec.kwonlyargs == ["attention_mode", "dtype"], (
+                f"{cls.__name__}.__init__ must take its extras keyword-only"
+            )
+            assert spec.args == ["self", "model"], (
+                f"{cls.__name__}.__init__ must not declare a positional "
+                f"parameter after `model` — core's clone() passes the devices "
+                f"positionally and they would bind here"
+            )
+            assert spec.varargs == "args"
+
+    def test_keyword_construction_still_works(self):
+        """Every construction site in modules/ passes the extras by keyword
+        (generation.py x2, asr_generation.py x2); guard that here."""
+        handler = MagicMock()
+        handler.cache_key = "clone-test"
+        patcher = _create_patcher(handler, attention_mode="sdpa", dtype=torch.float16)
+        assert patcher.attention_mode == "sdpa"
+        assert patcher.target_dtype is torch.float16

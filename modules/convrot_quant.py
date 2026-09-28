@@ -12,8 +12,7 @@ Weights stay INT8 resident in VRAM; activations are rotated and dynamically
 row-quantized online by :func:`comfy_kitchen.int8_linear`. LOAD-ONLY: this
 module executes existing checkpoints, it does not requantize.
 
-Ported from ComfyUI-Raon-OpenTTS ``int8.py`` (runtime contract identical;
-local stats, no global state).
+No global state; statistics are per-call.
 """
 
 from __future__ import annotations

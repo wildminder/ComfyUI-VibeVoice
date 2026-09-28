@@ -20,12 +20,18 @@ from .progress_utils import ProgressBarWithConsole
 
 from .asr_loader import VibeVoiceASRLoader, VibeVoiceASRModelHandler, LOADED_ASR_MODELS_CACHE, cleanup_asr_models
 from .patcher import VibeVoiceASRPatcher
-from .model_registry import FAMILY_ASR, evict_if_changed, identity_for_external
+from .model_registry import (
+    FAMILY_ASR,
+    evict_if_changed,
+    identity_for_external,
+    register_model_bundle,
+)
 from .utils import VIBEVOICE_ASR_PATCHER_CACHE
 from .device_utils import get_torch_device, get_offload_device, DEVICE_CPU
 from .dtype_utils import resolve_dtype, DTYPE_AUTO
 from .audio_utils import extract_audio_tensor, resample_audio
-from .attention_utils import resolve_attention_mode
+from .attention_utils import resolve_attention_mode, resolve_asr_attention_mode
+from .gguf_quant import log_gguf_forward_counters
 
 logger = logging.getLogger(__name__)
 
@@ -199,8 +205,12 @@ def load_asr_model_patched(
     Returns:
         Tuple of (patcher, model, processor).
     """
-    # Resolve attention mode with internal fallback (no 4-bit for ASR).
-    actual_attn = resolve_attention_mode(attention_mode, quantize_4bit=False)
+    # Resolve attention mode with internal fallback (no 4-bit for ASR), then
+    # drop the ASR exclusions. This must happen BEFORE the cache key and the
+    # patcher are built, or the exclusion would never reach the weights.
+    actual_attn = resolve_asr_attention_mode(
+        resolve_attention_mode(attention_mode, quantize_4bit=False)
+    )
 
     # Device placement (mirrors load_vibevoice_model).
     if device == DEVICE_CPU:
@@ -297,11 +307,17 @@ def load_asr_from_external(
     # Resolve attention mode with internal fallback (no 4-bit for ASR).
     # Plan 2026-08-20 (P1): prefer the bundle-recorded (loader-resolved) mode
     # so the cache key describes the weights actually built.
+    # The ASR exclusion is re-applied on both branches: the external loader
+    # already applies it to the recorded value, but a hand-built bundle can
+    # carry a mode the loader never saw, and this is the value that reaches
+    # the patcher.
     bundle_attention = model_bundle.get("attention_mode")
     if isinstance(bundle_attention, str) and bundle_attention:
-        actual_attn = bundle_attention
+        actual_attn = resolve_asr_attention_mode(bundle_attention)
     else:
-        actual_attn = resolve_attention_mode(attention_mode, quantize_4bit=False)
+        actual_attn = resolve_asr_attention_mode(
+            resolve_attention_mode(attention_mode, quantize_4bit=False)
+        )
 
     # Device placement (mirrors load_asr_model_patched).
     if device == DEVICE_CPU:
@@ -326,6 +342,12 @@ def load_asr_from_external(
         dtype_str=bundle_dtype_str,
         prefix="asr_external",
     )
+
+    # Register the bundle under its patcher key so eviction can NEUTRALIZE it
+    # (same reasoning as the TTS consumer: ComfyUI's output cache holds the
+    # node-output bundle strongly, so popping the patcher entry frees nothing).
+    # A reused-patcher run re-registers the same live dict (no-op replace).
+    register_model_bundle(cache_key, model_bundle)
 
     # Unload-before-load gate (plan 2026-08-20, C4/RC-1).
     evict_if_changed(FAMILY_ASR, cache_key, (VIBEVOICE_ASR_PATCHER_CACHE,))
@@ -470,6 +492,10 @@ def _transcribe_streaming(
         pbar.update_absolute(pbar.total)
         pbar.close()
 
+    # After the forwards, not at load time: this is the only point where the
+    # fast/streamed split says anything about this run. No-op for non-GGUF.
+    log_gguf_forward_counters("asr_streaming")
+
     raw_text = "\n".join(texts)
     logger.info(f"ASR streaming transcription complete. {len(segments)} segments, "
                 f"{total_chunks_seen} chunks.")
@@ -607,6 +633,9 @@ def _transcribe_native(
     finally:
         pbar.update_absolute(pbar.total)
         pbar.close()
+
+    # After the forwards, not at load time — see log_gguf_forward_counters.
+    log_gguf_forward_counters("asr_transcribe_native")
 
 
 def transcribe_audio(
@@ -782,6 +811,9 @@ def transcribe_audio(
         # (EOS before max_new_tokens) or raised.
         pbar.update_absolute(pbar.total)
         pbar.close()
+
+    # After the forwards, not at load time — see log_gguf_forward_counters.
+    log_gguf_forward_counters("asr_transcribe_audio")
 
 
 def force_offload_asr_model(model_name: str, patcher=None) -> None:

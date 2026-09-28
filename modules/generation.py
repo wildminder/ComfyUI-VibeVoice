@@ -16,13 +16,19 @@ from .progress_utils import ProgressBarWithConsole
 
 from .loader import VibeVoiceModelHandler, VibeVoiceLoader, cleanup_old_models, LOADED_MODELS_CACHE
 from .patcher import VibeVoicePatcher
-from .model_registry import FAMILY_TTS, evict_if_changed, identity_for_external
+from .model_registry import (
+    FAMILY_TTS,
+    evict_if_changed,
+    identity_for_external,
+    register_model_bundle,
+)
 from .model_info import is_model_type
 from .utils import VIBEVOICE_PATCHER_CACHE
 from .audio_utils import parse_script_1_based, preprocess_comfy_audio, set_seed, check_for_interrupt
 from .device_utils import get_torch_device, get_offload_device, DEVICE_CPU
 from .dtype_utils import resolve_dtype, DTYPE_AUTO
 from .attention_utils import resolve_attention_mode, resolve_realtime_attention_mode
+from .gguf_quant import log_gguf_forward_counters
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +152,21 @@ def load_vibevoice_from_external(
         ValueError: If the bundle is missing required keys.
         RuntimeError: If the model fails to load to GPU.
     """
+    # A bundle whose heavy fields were released still carries everything
+    # needed to rebuild it, so recover instead of failing. The loader node's
+    # output is cached by ComfyUI and can outlive the registry entry that
+    # backed it.
+    if model_bundle.get("model") is None and model_bundle.get("source_path"):
+        from .external_loader import load_external_vibevoice_model
+
+        model_bundle = load_external_vibevoice_model(
+            model_bundle["source_path"],
+            model_bundle.get("model_name") or "",
+            attention_mode=model_bundle.get("attention_mode") or "eager",
+            use_llm_4bit=bool(model_bundle.get("use_llm_4bit", False)),
+            dtype_str=model_bundle.get("dtype_str") or "auto",
+        )
+
     # Validate required bundle keys (Phase 5.3 guard).
     for required_key in ("model", "processor", "model_name"):
         if model_bundle.get(required_key) is None:
@@ -197,6 +218,12 @@ def load_vibevoice_from_external(
         use_llm_4bit=bundle_use_llm_4bit,
         dtype_str=bundle_dtype_str,
     )
+
+    # Register the bundle under its patcher key so eviction can NEUTRALIZE it.
+    # ComfyUI's output cache keeps the node-output bundle strongly alive, so
+    # dropping our own patcher entry would not free the weights otherwise.
+    # A reused-patcher run re-registers the same live dict (no-op replace).
+    register_model_bundle(cache_key, model_bundle)
 
     # Unload-before-load gate (plan 2026-08-20, C2/RC-1): if a DIFFERENT model
     # is active for this family, fully release it before touching the caches.
@@ -360,9 +387,11 @@ def generate_audio(
         top_p: Nucleus sampling threshold.
         top_k: Top-K sampling (0 to disable).
         max_new_tokens: Hard cap on generated speech tokens (utterance length budget).
-            None = auto (~30x prompt length). Passed through to ``model.generate``
-            so the non-streaming AR loop terminates; when the processor tokenizer
-            exposes ``speech_end_id`` it also stops on the EOS speech token.
+            None = auto (2x prompt length — ``max_length_times=2``, the
+            value ``model.generate`` uses when the caller passes nothing).
+            Passed through to ``model.generate`` so the non-streaming AR loop
+            terminates; when the processor tokenizer exposes ``speech_end_id``
+            it also stops on the EOS speech token.
 
     Returns:
         Tuple of (output audio tensor [1, 1, T], sample_rate).
@@ -512,6 +541,10 @@ def generate_audio(
             # early (EOS before max_steps) or generation raised.
             pbar.update_absolute(pbar.total)
             pbar.close()
+
+    # After the forwards, not at load time: this is the only point where the
+    # fast/streamed split says anything about this run. No-op for non-GGUF.
+    log_gguf_forward_counters("tts_generate")
 
     # Post-process output.
     # Guard: the vendored AR loop appends None for any sample that never emitted

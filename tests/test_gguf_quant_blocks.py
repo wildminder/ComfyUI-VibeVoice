@@ -6,6 +6,8 @@ block builders with controlled fp16 scales; the oracle dequantizes whatever
 bytes we craft.
 """
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -32,6 +34,21 @@ class TestBitwiseParityAgainstOracle:
         )
         assert np.array_equal(ref, ours.numpy())
 
+    def _parity(self, raw_bytes, qtype, shape):
+        """Assert our dequantizer is bitwise equal to gguf-py's.
+
+        ``raw_bytes`` is whatever a ``GGUFReader`` tensor carries (the mmap is
+        read through here, not copied wholesale) and ``shape`` is the
+        TORCH-logical shape. The reader reports ggml (reversed) dims, so the
+        caller is responsible for having already flipped them.
+        """
+        ref = oracle_dequantize(raw_bytes, qtype).reshape(shape)
+        ours = G.dequantize_blocks(
+            torch.from_numpy(np.ascontiguousarray(raw_bytes)).view(torch.uint8),
+            qtype, torch.float32, shape,
+        )
+        assert np.array_equal(ref, ours.numpy())
+
     def test_q8_0_quantized_by_oracle(self):
         for shape in [(64, 32), (37, 96), (1, 32)]:
             x = _seeded_float(shape)
@@ -53,22 +70,60 @@ class TestBitwiseParityAgainstOracle:
             blocks = craft_for_test("Q6_K", nb, seed=nb)
             self._check(blocks.reshape(-1), T.Q6_K, None)
 
+    def test_synthetic_q8_0_tensor(self, make_gguf_file):
+        """Bitwise parity on a Q8_0 tensor with a realistic block count.
+
+        This is the machine-independent half of the real-checkpoint check: the
+        synthetic file carries a 2048x256 Q8_0 weight (16 K blocks, the same
+        order as a real projection), so the oracle comparison below runs on
+        every machine and in CI instead of only where a 3.2 GB fixture happens
+        to live. See ``test_real_file_q8_0_tensor`` for the real checkpoint.
+        """
+        path = make_gguf_file(
+            [("model.language_model.layers.0.self_attn.q_proj.weight",
+              "Q8_0", (2048, 256))],
+            tag="q8_oracle",
+        )
+        reader = gguf.GGUFReader(str(path))
+        t = max(reader.tensors, key=lambda x: int(np.prod(x.shape)))
+        assert t.tensor_type == T.Q8_0
+        shape = tuple(int(s) for s in t.shape)[::-1]
+        self._parity(t.data, t.tensor_type, shape)
+
     def test_real_file_q8_0_tensor(self):
-        """Bitwise parity on a REAL tensor from the user's VibeVoice GGUF."""
-        path = r"C:/AI/ComfyUI/ComfyUI/models/diffusion_models/vibevoice-1.5b-q8_0.gguf"
+        """Bitwise parity on a REAL tensor from the user's VibeVoice GGUF.
+
+        The file is selected by TENSOR TYPE, not by name: this checkpoint
+        quantises 378 Q8_0 tensors but names none of them
+        `*.self_attn.q_proj.weight` (the vendored tree uses a different module
+        layout), so the old name filter raised StopIteration and the oracle
+        check never ran. The largest Q8_0 tensor is used so the comparison
+        exercises a realistic block count rather than a single block.
+
+        Optional by construction: the path is overridable via
+        ``VIBEVOICE_TEST_GGUF`` and the test skips when no real checkpoint is
+        present. It must stay optional — the 3.2 GB file is not something a
+        unit suite can require, and nothing here may load a real model. The
+        always-runs coverage of the same code path is
+        ``test_synthetic_q8_0_tensor`` above.
+        """
+        path = os.environ.get(
+            "VIBEVOICE_TEST_GGUF",
+            r"C:/AI/ComfyUI/ComfyUI/models/diffusion_models/vibevoice-1.5b-q8_0.gguf",
+        )
         try:
             reader = gguf.GGUFReader(path)
         except Exception:
             pytest.skip("real vibevoice gguf not present")
-        t = next(t for t in reader.tensors
-                 if t.name.endswith("layers.0.self_attn.q_proj.weight"))
-        shape = tuple(int(s) for s in t.shape)
-        ref = oracle_dequantize(t.data, t.tensor_type).reshape(shape)
-        ours = G.dequantize_blocks(
-            torch.from_numpy(np.ascontiguousarray(t.data)).view(torch.uint8),
-            t.tensor_type, torch.float32, shape,
+        candidates = [t for t in reader.tensors if t.tensor_type == T.Q8_0]
+        assert candidates, (
+            f"{path} has no Q8_0 tensor (types: "
+            f"{sorted({t.tensor_type.name for t in reader.tensors})}); the "
+            f"fixture is not the q8_0 checkpoint this test is written for."
         )
-        assert np.array_equal(ref, ours.numpy())
+        t = max(candidates, key=lambda x: int(np.prod(x.shape)))
+        shape = tuple(int(s) for s in t.shape)
+        self._parity(t.data, t.tensor_type, shape)
 
 
 def craft_for_test(qtype_name: str, n_blocks: int, seed: int = 0):

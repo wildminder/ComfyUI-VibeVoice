@@ -49,19 +49,19 @@ MR = "ComfyUI_VibeVoice.modules.model_registry"
 @pytest.fixture(autouse=True)
 def _isolated_state(monkeypatch):
     """Isolate global registries and neuter accelerator cache flushes."""
-    VIBEVOICE_PATCHER_CACHE.clear()
-    VIBEVOICE_ASR_PATCHER_CACHE.clear()
-    LOADED_MODELS_CACHE.clear()
-    LOADED_ASR_MODELS_CACHE.clear()
-    clear_active_keys()
+    def _reset():
+        VIBEVOICE_PATCHER_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        LOADED_MODELS_CACHE.clear()
+        LOADED_ASR_MODELS_CACHE.clear()
+        clear_active_keys()
+        model_registry.clear_bundle_registry()
+
+    _reset()
     monkeypatch.setattr(comfy_mm, "soft_empty_cache", lambda: None)
     monkeypatch.setattr(comfy_mm, "current_loaded_models", [])
     yield
-    VIBEVOICE_PATCHER_CACHE.clear()
-    VIBEVOICE_ASR_PATCHER_CACHE.clear()
-    LOADED_MODELS_CACHE.clear()
-    LOADED_ASR_MODELS_CACHE.clear()
-    clear_active_keys()
+    _reset()
 
 
 # ====================================================================
@@ -228,11 +228,18 @@ class TestModelChangeFreesOldModel:
         bundle_b, _ = _make_tts_bundle(tmp_path, tag="b")
 
         (p1, _, _), _ = _gen_load(bundle_a)
-        _gen_load(bundle_b)          # evicts A
+        _gen_load(bundle_b)          # evicts A -> neutralizes bundle_a
         with patch(f"{MR}.evict_patcher", wraps=model_registry.evict_patcher) as spy:
-            (p3, _, _), _ = _gen_load(dict(bundle_a))  # switch back -> rebuild
+            # Switching back means a FRESH loader output for the same weights
+            # (the previous bundle was released, exactly as ComfyUI's output
+            # cache would see it), carrying the same identity fields => key.
+            bundle_a2 = dict(bundle_a)
+            bundle_a2["model"] = torch.nn.Linear(8, 8)
+            bundle_a2["processor"] = object()
+            (p3, _, _), _ = _gen_load(bundle_a2)  # switch back -> rebuild
         assert spy.called, "switching back must evict B first"
         assert p3 is not p1
+        assert p3.cache_key == p1.cache_key
         assert list(VIBEVOICE_PATCHER_CACHE.keys()) == [p3.cache_key]
 
 
@@ -244,6 +251,8 @@ class TestSameModelNoOp:
     def test_same_bundle_reuses_patcher_without_eviction(self, tmp_path):
         bundle, _ = _make_tts_bundle(tmp_path, tag="a")
         (p1, _, _), _ = _gen_load(bundle)
+        live_model = bundle["model"]
+        live_processor = bundle["processor"]
 
         with patch(f"{MR}.evict_patcher") as mock_evict:
             (p2, _, _), _ = _gen_load(bundle)
@@ -251,6 +260,54 @@ class TestSameModelNoOp:
         mock_evict.assert_not_called()
         assert p2 is p1
         assert list(VIBEVOICE_PATCHER_CACHE.keys()) == [p1.cache_key]
+        # FIX 1: the consumer re-registers the bundle on every run (including
+        # the reused-patcher path). Registering must NOT release a bundle whose
+        # key is still active — the live weights stay reachable.
+        assert bundle["model"] is live_model, (
+            "re-registering the still-active bundle must not neutralize it"
+        )
+        assert bundle["processor"] is live_processor
+
+    def test_external_to_external_does_not_reload(self, tmp_path):
+        """Re-running the external loader with the SAME model_file must not
+        churn the eviction gate: both runs must compute the identical request
+        key, evict nothing, and the consumer must reuse the live patcher (built
+        exactly once). The loader function itself is still invoked per run by
+        design — the node cannot skip the build without breaking the
+        pre-load peak-RAM gate — so the "loaded once" contract is asserted on
+        the patcher, which is the thing that actually pins the weights."""
+        f = _write_weights(tmp_path, "ext_same")
+        bundle, _ = _make_tts_bundle(tmp_path, tag="ext_same")
+
+        evict_keys = []
+        real_evict = model_registry.evict_if_changed
+
+        def _spy_evict(family, new_key, caches):
+            evict_keys.append((family, new_key))
+            return real_evict(family, new_key, caches)
+
+        with patch(f"{NODE}.evict_if_changed", side_effect=_spy_evict), \
+             patch(f"{NODE}.folder_paths.get_full_path_or_raise",
+                   return_value=str(f)), \
+             patch(f"{NODE}.load_external_vibevoice_model", return_value=bundle):
+            _node_execute(f)                          # run 1: external
+            (p1, _, _), _ = _gen_load(bundle)
+            _node_execute(f)                          # run 2: same external
+            (p2, _, _), _ = _gen_load(bundle)
+
+        assert len(evict_keys) == 2
+        assert evict_keys[0][1] == evict_keys[1][1], (
+            "an identical external re-run must compute the identical request "
+            f"key: {evict_keys[0][1]!r} != {evict_keys[1][1]!r}"
+        )
+        assert evict_keys[0][1] == p1.cache_key, (
+            "the node's request identity must equal the consumer's cache key"
+        )
+        assert p2 is p1, "the model must be built exactly once across both runs"
+        assert list(VIBEVOICE_PATCHER_CACHE.keys()) == [p1.cache_key]
+        assert bundle["model"] is not None, (
+            "an identical re-run must leave the live bundle's weights intact"
+        )
 
     def test_consumer_widget_attention_change_does_not_fork_patcher(self, tmp_path):
         """The TTS node's own attention widget must NOT fork a second patcher

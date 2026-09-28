@@ -150,10 +150,17 @@ class TestUnifiedTTSNodeValidation:
         # instead of one per inspected input; keep the declaration narrow.
         spec = inspect.getfullargspec(VibeVoiceTTSNode.validate_inputs)
         assert spec.varkw is None
+        # dtype / attention_mode / quantize_llm_4bit are declared so the
+        # fp32 + sage cross-check can read them together — the sage kernels
+        # hard-assert fp16/bf16 inputs and nothing in the load path
+        # cross-checks those two independent widgets.
         assert set(spec.args[1:]) == {
             "model_name",
             "voice_preset",
             "external_model",
+            "dtype",
+            "attention_mode",
+            "quantize_llm_4bit",
         }
         assert spec.defaults[0] is None
         assert spec.defaults[1] == PRESET_NONE
@@ -836,16 +843,28 @@ class TestTTSNodePromptValidationFanOut:
         assert failed
         # ...once per declared param, not once per prompt widget.
         assert len(failed) == len({e["extra_info"]["input_name"] for e in failed})
-        # Exactly core's fan-out width -- measured 2, down from 20 in the report.
+        # Exactly core's fan-out width — one per declared validator param that
+        # is present in the prompt, down from one per prompt widget (20 in the
+        # original report). The width is the declared-param count, NOT a fixed
+        # number: declaring dtype/attention_mode/quantize_llm_4bit for the
+        # fp32 + sage cross-check widens it, and the guarantee it encodes is
+        # "attributed to declared params only", not "at most N".
         assert {e["extra_info"]["input_name"] for e in failed} == fanned_inputs
-        assert len(failed) <= 3
+        assert len(failed) == len(fanned_inputs)
+        assert len(failed) < len(prompt["1"]["inputs"])
         assert len(failed) <= len(declared_params)
         assert all(e["message"] == "Custom validation failed for node" for e in failed)
         assert all(
             e["details"].endswith(f" - {_MISSING_PRESET_MESSAGE}") for e in failed
         )
         assert all(e["extra_info"]["input_name"] in declared_params for e in failed)
-        assert REPORTED_PROMPT_WIDGETS.isdisjoint(
+        # Of the widgets named in the bug report, only the ones the validator
+        # does NOT declare may stay un-blamed. dtype / attention_mode /
+        # quantize_llm_4bit used to be in that protected set; declaring them
+        # for the fp32 + sage cross-check moved them out, which is the
+        # deliberate trade — three more attributed errors in exchange for a
+        # queue-time error instead of a CUDA-kernel assert minutes into a load.
+        assert (REPORTED_PROMPT_WIDGETS - set(declared_params)).isdisjoint(
             e["extra_info"]["input_name"] for e in failed
         )
 

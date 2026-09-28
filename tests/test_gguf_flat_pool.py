@@ -271,6 +271,50 @@ class TestInstallNonLinearFallback:
         conv = model.model.acoustic_tokenizer.decoder.head.conv.conv
         assert torch.equal(conv.weight.data, ref)
 
+    def test_nonlinear_dequant_targets_model_dtype(self, flat_pool_gguf):
+        """Dequant-at-load lands in the destination dtype, not fp32.
+
+        The fp32 intermediate used to be materialized and cast afterwards,
+        so a bf16 model carried 4x-size scratch for every embedding/conv head.
+        """
+        model = self._build_model().to(torch.bfloat16)
+        reader = open_gguf_reader(flat_pool_gguf)
+        stats = _install_gguf_weights(model, reader)
+
+        conv = model.model.acoustic_tokenizer.decoder.head.conv.conv
+        assert conv.weight.dtype is torch.bfloat16
+
+        by_name = {t.name: t for t in reader.tensors}
+        ref = dequantize_reader_tensor(by_name[FLAT_CONV_KEY])
+        assert torch.equal(conv.weight.data, ref.to(torch.bfloat16))
+        # reported bytes track the stored dtype, not the fp32 scratch
+        assert stats["dequant_load_bytes"] > 0
+
+    def test_install_streams_dense_tensors(self, flat_pool_gguf, monkeypatch):
+        """Dense tensors stream one at a time; no batch state dict is built."""
+        from ComfyUI_VibeVoice.modules.loader import VibeVoiceLoader
+
+        seen = {}
+        real = VibeVoiceLoader._stream_apply_dense
+
+        def _spy(model, tensor_pairs, known_missing=None):
+            seen["lazy"] = not isinstance(tensor_pairs, (dict, list, tuple))
+            seen["pairs"] = list(tensor_pairs)
+            return real(model, tensor_pairs, known_missing=known_missing)
+
+        def _batch(*a, **k):
+            raise AssertionError("batch _apply_state_dict must not be used")
+
+        monkeypatch.setattr(VibeVoiceLoader, "_stream_apply_dense", staticmethod(_spy))
+        monkeypatch.setattr(VibeVoiceLoader, "_apply_state_dict", staticmethod(_batch))
+
+        model = self._build_model()
+        reader = open_gguf_reader(flat_pool_gguf)
+        _install_gguf_weights(model, reader)
+
+        assert seen["lazy"], "dense pairs must be a generator, not a materialized dict"
+        assert seen["pairs"], "expected at least one dense tensor"
+
     def test_embedding_quantized_dequants_at_load(self, flat_pool_gguf):
         """Q8_0 embed_tokens (nn.Embedding) lands as float, stays float."""
         model = self._build_model()

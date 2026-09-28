@@ -34,7 +34,7 @@ from ..modules.voice_presets import (
     get_cached_voice_preset,
     list_voice_presets,
 )
-from ..modules.attention_utils import get_available_attention_modes
+from ..modules.attention_utils import get_available_attention_modes, check_dtype_attention_compatible
 from ..modules.device_utils import get_device_options
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 from ..modules.custom_types import VibeVoiceModel
@@ -197,7 +197,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
                     min=0,
                     max=8192,
                     step=1,
-                    tooltip="Max generated speech tokens (utterance length budget). 0 = auto: standard models use ~30x the prompt length; realtime models size the budget from the script (~2.5 latents per text token, capped at 1024) so a short prompt cannot run into a multi-minute decode. If the voice model exposes a speech-end token, generation stops earlier; raise this if output is cut off, lower it if output is too long.",
+                    tooltip="Max generated speech tokens (utterance length budget). 0 = auto: standard models use 2x the prompt length; realtime models size the budget from the script (~2.5 latents per text token, capped at 1024) so a short prompt cannot run into a multi-minute decode. If the voice model exposes a speech-end token, generation stops earlier; raise this if output is cut off, lower it if output is too long.",
                 ),
                 # System parameters
                 io.Boolean.Input(
@@ -253,6 +253,9 @@ class VibeVoiceTTSNode(io.ComfyNode):
         model_name: Optional[str] = None,
         voice_preset: str = PRESET_NONE,
         external_model=_EXTERNAL_UNSET,
+        dtype: Optional[str] = None,
+        attention_mode: Optional[str] = None,
+        quantize_llm_4bit: Optional[bool] = None,
     ) -> bool | str:
         """Validate inputs, allowing dynamically-discovered custom TTS models.
 
@@ -261,6 +264,27 @@ class VibeVoiceTTSNode(io.ComfyNode):
         prompt and emits one error per failing call, so a ``**kwargs``
         signature repeats a single message once per widget.
         """
+        # dtype x attention_mode: the sage kernels hard-assert fp16/bf16, and
+        # nothing in the load path cross-checks the two independent widgets.
+        # A linked external_model is exempt — the external loader node owns
+        # the effective dtype/attention for the bundle it already validated.
+        if external_model is _EXTERNAL_UNSET:
+            message = check_dtype_attention_compatible(
+                dtype, attention_mode, bool(quantize_llm_4bit)
+            )
+            if message is not None:
+                return message
+            # Declaring `attention_mode` opts it out of core's own combo
+            # membership check (execution.py only range-checks inputs the
+            # validator does not declare), so re-check it here: a stale
+            # workflow must be rejected, not silently downgraded to eager by
+            # resolve_attention_mode — a backend swap changes the audio.
+            if attention_mode is not None and attention_mode not in get_available_attention_modes():
+                return (
+                    f"attention_mode '{attention_mode}' is not available. "
+                    f"Choose one of: {', '.join(get_available_attention_modes())}"
+                )
+
         # An externally-loaded model bypasses the model_name dropdown entirely.
         # NOTE: During prompt validation ComfyUI resolves *linked* inputs to
         # None (no execution cache exists yet — see execution.get_input_data /

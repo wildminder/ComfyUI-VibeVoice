@@ -20,6 +20,7 @@ import comfy.model_management as model_management
 from .audio_utils import parse_script_1_based, set_seed
 from .progress_utils import ProgressBarWithConsole
 from .voice_presets import validate_voice_preset
+from .gguf_quant import log_gguf_forward_counters
 
 
 logger = logging.getLogger(__name__)
@@ -321,6 +322,10 @@ def generate_realtime_audio(
     finally:
         pbar.update_absolute(pbar.total)
         pbar.close()
+
+    # After the forwards, not at load time: this is the only point where the
+    # fast/streamed split says anything about this run. No-op for non-GGUF.
+    log_gguf_forward_counters("realtime_generate")
 
     speech_outputs = getattr(outputs, "speech_outputs", None)
     if not speech_outputs or speech_outputs[0] is None:

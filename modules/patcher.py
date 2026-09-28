@@ -24,9 +24,32 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
 
     Handles moving the model to the correct device (GPU) for inference
     and offloading it to free VRAM.
+
+    NOTE: the base class is spelled out literally as
+    ``comfy.model_patcher.ModelPatcher``, i.e. the LEGACY patcher, not
+    ``comfy.model_patcher.CoreModelPatcher``. ``main.py`` rebinds the module
+    global ``CoreModelPatcher = ModelPatcherDynamic`` (aimdo), so writing
+    ``ModelPatcher`` here opts this node out of DynamicVRAM: no VBAR, no CUDA
+    graph capture, and the legacy ``partially_unload`` eviction order. That is
+    a deliberate, recorded opt-out, not an oversight — adoption is not a rename
+    because ``ModelPatcherDynamic.patch_model`` asserts ``not load_weights``
+    (comfy/model_patcher.py:2137) while this override calls
+    ``super().patch_model(load_weights=True)``, and ``deepclone_multigpu``
+    additionally requires ``cached_patcher_init``
+    (comfy/model_patcher.py:509-516) which this class does not set. Porting the
+    load path onto ``load_models_gpu()`` is a separate, fully-tested change;
+    doing it here would destabilise a working memory path for no defect.
     """
 
-    def __init__(self, model, attention_mode: str = "eager", dtype=None, *args, **kwargs):
+    def __init__(self, model, *args, attention_mode: str = "eager", dtype=None, **kwargs):
+        # attention_mode/dtype are keyword-only: core's ModelPatcher.clone()
+        # reconstructs the class with POSITIONAL args
+        # (model, load_device, offload_device, size, ...) at
+        # comfy/model_patcher.py:446, so any positional parameter declared
+        # before *args silently binds load_device to attention_mode and then
+        # blows up in ModelPatcher.__init__ with "missing 1 required
+        # positional argument: 'offload_device'". clone eviction runs from
+        # comfy/model_management.py, so this is a hard crash on a stock install.
         super().__init__(model, *args, **kwargs)
         self.attention_mode = attention_mode
         self.cache_key = getattr(model, 'cache_key', 'VibeVoice_Unknown')

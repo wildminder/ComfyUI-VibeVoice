@@ -329,9 +329,16 @@ class TestASRSingleCacheOwnership:
 
 
 class TestASRSageAttentionParity:
-    """TTS parity: sage is applied POST-LOAD on both ASR branches (the
-    native _load_native and the vendored branch), after the streaming
-    conversion, via the vendored set_sage_attention patch."""
+    """Sage is EXCLUDED from the ASR path (modules/attention_utils
+    .ASR_EXCLUDED_ATTENTION_MODES) and downgraded to sdpa before the model is
+    built.
+
+    Reason: the ASR processor left-pads every batch to the longest utterance, so
+    a prefill step arrives with a real additive (B,1,S,S) mask, and sageattn has
+    no attn_mask parameter — `sage_attention_forward` used the mask only to pick
+    `is_causal` and then dropped it, letting every query attend to the pad
+    columns. These tests pin the exclusion so it cannot be re-added by accident;
+    the TTS family still uses sage and is unaffected."""
 
     @staticmethod
     def _native_patches(fake_model, fake_processor):
@@ -359,7 +366,8 @@ class TestASRSageAttentionParity:
             "ComfyUI_VibeVoice.modules.comfy_stream.convert_tree_for_streaming",
         )
 
-    def test_native_branch_applies_sage_post_load(self):
+    def test_native_branch_never_applies_sage(self):
+        """A sage request on the native ASR branch must not reach the kernel."""
         fake_model, fake_processor = MagicMock(), MagicMock()
         tmp, registry, proc, fpg, convert = self._native_patches(fake_model, fake_processor)
         with registry, proc, fpg, convert, \
@@ -370,30 +378,12 @@ class TestASRSageAttentionParity:
                    return_value=(tmp, "Qwen/Qwen2.5-7B")):
             VibeVoiceASRLoader.load_model("VibeVoice-ASR-HF", "cpu", "auto", "sage")
 
-        mock_sage.assert_called_once_with(fake_model)
+        assert not mock_sage.called, (
+            "sage must never be applied on the ASR path: the left-padded prefill "
+            "mask cannot be forwarded to sageattn and would be silently dropped."
+        )
 
-    def test_native_branch_sage_loads_with_sdpa_backend(self):
-        """attn_implementation for the native load is the FOR-LOAD mapping
-        (sage→sdpa); sage itself is the post-load instance patch."""
-        fake_model, fake_processor = MagicMock(), MagicMock()
-        tmp, registry, proc, fpg, convert = self._native_patches(fake_model, fake_processor)
-        with registry, proc, fpg as mock_fpg, convert, \
-             patch("ComfyUI_VibeVoice.modules.asr_loader.set_sage_attention"), \
-             patch("ComfyUI_VibeVoice.modules.asr_loader.check_sage_attention_compatible",
-                   return_value=True), \
-             patch("ComfyUI_VibeVoice.modules.asr_loader.VibeVoiceASRLoader._resolve_model_paths",
-                   return_value=(tmp, "Qwen/Qwen2.5-7B")):
-            VibeVoiceASRLoader.load_model("VibeVoice-ASR-HF", "cpu", "auto", "sage")
-        # The native per-subconfig dict routes sdpa to the LM (the "" key);
-        # the tokenizer encoders always load eager.
-        attn = mock_fpg.call_args.kwargs.get("attn_implementation")
-        if isinstance(attn, dict):
-            assert attn[""] == "sdpa"
-            assert attn["acoustic_tokenizer_encoder_config"] == "eager"
-        else:
-            assert attn == "sdpa"
-
-    def test_vendored_branch_applies_sage_post_load(self):
+    def test_vendored_branch_never_applies_sage(self):
         fake_model, fake_processor = MagicMock(), MagicMock()
         with patch.dict(
             "ComfyUI_VibeVoice.modules.asr_loader.AVAILABLE_VIBEVOICE_MODELS",
@@ -417,9 +407,39 @@ class TestASRSageAttentionParity:
         patch("ComfyUI_VibeVoice.modules.asr_loader.check_sage_attention_compatible",
               return_value=True):
             VibeVoiceASRLoader.load_model("VibeVoice-ASR", "cpu", "auto", "sage")
-        mock_sage.assert_called_once_with(fake_model)
+        assert not mock_sage.called, (
+            "the exclusion must reach the vendored ASR branch too, not just the "
+            "native one."
+        )
 
-    def test_sage_incompatible_raises_actionable(self):
+    def test_native_branch_sage_loads_with_sdpa_backend(self):
+        """attn_implementation for the native load is the FOR-LOAD mapping
+        (sage→sdpa); the sage post-load patch is unreachable on ASR."""
+        fake_model, fake_processor = MagicMock(), MagicMock()
+        tmp, registry, proc, fpg, convert = self._native_patches(fake_model, fake_processor)
+        with registry, proc, fpg as mock_fpg, convert, \
+             patch("ComfyUI_VibeVoice.modules.asr_loader.set_sage_attention"), \
+             patch("ComfyUI_VibeVoice.modules.asr_loader.check_sage_attention_compatible",
+                   return_value=True), \
+             patch("ComfyUI_VibeVoice.modules.asr_loader.VibeVoiceASRLoader._resolve_model_paths",
+                   return_value=(tmp, "Qwen/Qwen2.5-7B")):
+            VibeVoiceASRLoader.load_model("VibeVoice-ASR-HF", "cpu", "auto", "sage")
+        # The native per-subconfig dict routes sdpa to the LM (the "" key);
+        # the tokenizer encoders always load eager.
+        attn = mock_fpg.call_args.kwargs.get("attn_implementation")
+        if isinstance(attn, dict):
+            assert attn[""] == "sdpa"
+            assert attn["acoustic_tokenizer_encoder_config"] == "eager"
+        else:
+            assert attn == "sdpa"
+
+    def test_sage_on_incompatible_hardware_falls_back_instead_of_raising(self):
+        """The ASR path must not raise on a machine that cannot run sage.
+
+        The old contract raised RuntimeError("Incompatible hardware/setup")
+        from inside the loader. The exclusion resolves sage to sdpa first, so
+        the request is honoured as the nearest usable backend instead.
+        """
         fake_model, fake_processor = MagicMock(), MagicMock()
         tmp, registry, proc, fpg, convert = self._native_patches(fake_model, fake_processor)
         with registry, proc, fpg, convert, \
@@ -428,8 +448,7 @@ class TestASRSageAttentionParity:
              patch("ComfyUI_VibeVoice.modules.asr_loader.set_sage_attention"), \
              patch("ComfyUI_VibeVoice.modules.asr_loader.VibeVoiceASRLoader._resolve_model_paths",
                    return_value=(tmp, "Qwen/Qwen2.5-7B")):
-            with pytest.raises(RuntimeError, match="Incompatible hardware"):
-                VibeVoiceASRLoader.load_model("VibeVoice-ASR-HF", "cpu", "auto", "sage")
+            VibeVoiceASRLoader.load_model("VibeVoice-ASR-HF", "cpu", "auto", "sage")
 
     def test_sdpa_mode_never_calls_sage(self):
         fake_model, fake_processor = MagicMock(), MagicMock()

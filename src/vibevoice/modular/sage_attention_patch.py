@@ -26,36 +26,65 @@ def get_sage_attention_function_and_params():
     """
     Selects the best available SageAttention CUDA kernel and its parameters
     based on the current GPU architecture.
+
+    Dispatch is by EXACT architecture, not by ">= the newest known". The
+    previous threshold chain (`>= 120`, then `>= 90`, then `== 89`, then
+    `>= 80`) routed sm100/sm103 (Blackwell datacenter, CC 10.x) into the SM90
+    branch. Note that THIS module calls the kernels directly and never goes
+    through sage's own `sageattn()`, so nothing here raises sage's
+    `ValueError: Unsupported CUDA architecture` for an unknown arch: the sm90
+    kernel asserts only that it COMPILED, not that it is running on the right
+    silicon, so the pre-fix failure mode was SILENT wrong-kernel selection --
+    a Hopper kernel handed to a GPU it was never built for, with no exception
+    anywhere downstream. Unknown archs are refused here instead.
+
+    KNOWN DIVERGENCE from sage's own ``sageattn()`` dispatcher, recorded rather
+    than silently reconciled. sage (2.2.0, core.py) picks ``pv_accum_dtype``
+    per arch *and* per CUDA runtime: for sm89 and sm120 it uses ``fp32+fp16``
+    ("SageAttention2++") whenever ``torch.version.cuda >= (12, 8)`` and
+    ``fp32+fp32`` below that. This module hardcodes ``fp32+fp32`` on both.
+    That is a deliberate, unchanged-from-the-initial-commit choice, not an
+    oversight introduced by the arch-alignment work above, and it is NOT
+    changed here: measured on this box (sm89, CUDA 13.0) the two settings are
+    numerically indistinguishable for a bf16 1x8x512x128 causal attention --
+    rel_l2 vs an fp32 SDPA reference 0.03401 (fp32+fp32) vs 0.03415 (fp32+fp16)
+    -- so switching would alter published output quality by an amount that
+    cannot be justified, in either direction, from a default suite. A change
+    here needs a Tier-G measurement on the real checkpoint, exactly like every
+    other backend-parity decision in this repo.
     """
     if not SAGE_ATTENTION_AVAILABLE or not torch.cuda.is_available():
         return None, None, None
 
     major, minor = torch.cuda.get_device_capability()
     arch_code = major * 10 + minor
-    
+
     attn_func = None
     pv_accum_dtype = "fp32"
 
-    if arch_code >= 120: # Blackwell
-        pv_accum_dtype = "fp32+fp32" 
-        attn_func = sageattn_qk_int8_pv_fp8_cuda
-        logger.info(f"SageAttention: Using SM120 (Blackwell) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
-    elif arch_code >= 90: # Hopper
-        pv_accum_dtype = "fp32+fp32" 
-        attn_func = sageattn_qk_int8_pv_fp8_cuda_sm90
-        logger.info(f"SageAttention: Using SM90 (Hopper) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
-    elif arch_code == 89: # Ada Lovelace
-        pv_accum_dtype = "fp32+fp32" 
-        attn_func = sageattn_qk_int8_pv_fp8_cuda
-        logger.info(f"SageAttention: Using SM89 (Ada) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
-    elif arch_code >= 80: # Ampere
-        pv_accum_dtype = "fp32" 
+    if arch_code in (80, 86):  # Ampere
+        pv_accum_dtype = "fp32"
         attn_func = sageattn_qk_int8_pv_fp16_cuda
         logger.info(f"SageAttention: Using SM80+ (Ampere) FP16 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
+    elif arch_code == 89:  # Ada Lovelace
+        pv_accum_dtype = "fp32+fp32"
+        attn_func = sageattn_qk_int8_pv_fp8_cuda
+        logger.info(f"SageAttention: Using SM89 (Ada) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
+    elif arch_code == 90:  # Hopper
+        pv_accum_dtype = "fp32+fp32"
+        attn_func = sageattn_qk_int8_pv_fp8_cuda_sm90
+        logger.info(f"SageAttention: Using SM90 (Hopper) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
+    elif arch_code == 120:  # Blackwell
+        pv_accum_dtype = "fp32+fp32"
+        attn_func = sageattn_qk_int8_pv_fp8_cuda
+        logger.info(f"SageAttention: Using SM120 (Blackwell) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
     else:
-        logger.warning(f"SageAttention not supported on current GPU architecture (SM{arch_code}).")
+        logger.warning(
+            f"SageAttention has no kernel for SM{arch_code}; SageAttention "
+            f"supports SM80/86/89/90/120."
+        )
         return None, None, None
-    
+
     return attn_func, "per_warp", pv_accum_dtype
 
 SAGE_ATTENTION_FUNCTION, QK_QUANT_GRAN, PV_ACCUM_DTYPE = get_sage_attention_function_and_params()
@@ -90,7 +119,24 @@ def sage_attention_forward(
     
     if SAGE_ATTENTION_FUNCTION is None:
         raise RuntimeError("SageAttention was selected but no compatible kernel was found for this GPU.")
-    
+
+    # sageattention 2.2.0's `sageattn` takes no attn_mask argument at all: the
+    # additive mask transformers builds can be neither forwarded nor folded
+    # into the kernel. The `is_causal` line below would still "use" it — and
+    # then drop it — so a padded ASR prefill or any right-padded batch would
+    # silently attend to the pad columns. Refuse instead of computing the
+    # wrong thing; callers that legitimately have a mask must keep this
+    # backend off the path (see
+    # modules/attention_utils.ASR_EXCLUDED_ATTENTION_MODES).
+    if attention_mask is not None:
+        raise ValueError(
+            "SageAttention received a non-None attention_mask, which it "
+            "cannot honour: sageattn() has no attn_mask parameter, and the "
+            "mask would be used only to pick `is_causal` and then discarded, "
+            "silently letting every query attend to masked-out positions. "
+            "Use sdpa or flash_attention_2 for this input."
+        )
+
     original_dtype = hidden_states.dtype
 
     target_dtype = resolve_sage_target_dtype(self.q_proj, hidden_states)
@@ -121,7 +167,9 @@ def sage_attention_forward(
     # !! DO NOT repeat K and V heads here. The SageAttention kernel is optimized
     # to handle the broadcasting internally.
 
-    is_causal = attention_mask is None and q_len > 1
+    # The mask is guaranteed None by the guard at the top of this function,
+    # so causality is decided purely by the query length.
+    is_causal = q_len > 1
     
     attn_output = SAGE_ATTENTION_FUNCTION(
         query_states.to(target_dtype),
