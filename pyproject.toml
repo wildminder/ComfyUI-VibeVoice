@@ -1,11 +1,11 @@
 [project]
 name = "ComfyUI-VibeVoice"
-description = "VibeVoice TTS. Expressive, long-form, multi-speaker conversational audio"
-version = "2.10.0"
+description = "VibeVoice TTS Updated! Expressive, long-form, multi-speaker conversational audio"
+version = "2.11.0"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 
-dependencies = ["torch", "torchaudio", "numpy", "huggingface_hub", "accelerate", "soundfile", "tqdm", "safetensors", "transformers>=5.3.0,<5.4", "diffusers", "bitsandbytes"]
+dependencies = ["torch", "torchaudio", "numpy", "huggingface_hub", "accelerate", "soundfile", "tqdm", "safetensors", "transformers", "diffusers", "bitsandbytes"]
 classifiers = [
     "Operating System :: OS Independent",
     "Environment :: GPU :: NVIDIA CUDA",
@@ -25,5 +25,5 @@ Issues = "https://github.com/wildminder/ComfyUI-VibeVoice/issues"
 
 [tool.comfy]
 PublisherId = "wildai"
-DisplayName = "VibeVoice TTS"
+DisplayName = "WM VibeVoice TTS"
 requires-comfyui = ">=0.28.0"

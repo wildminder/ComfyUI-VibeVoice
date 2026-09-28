@@ -27,7 +27,7 @@ from ..modules.asr_generation import (
 from ..modules.custom_types import VibeVoiceModel
 from ..modules.device_utils import get_available_devices
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
-from ..modules.attention_utils import get_available_attention_modes
+from ..modules.attention_utils import get_available_attention_modes, check_dtype_attention_compatible
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +175,18 @@ class VibeVoiceASRNode(io.ComfyNode):
         # in kwargs: a linked input is always present (resolved to None), while
         # an unconnected optional input is absent from the prompt entirely.
         if "external_model" in kwargs:
+            # A linked external_model is validated by the external loader node,
+            # which owns the effective dtype/attention for its bundle.
             return True
+
+        # The sage kernels hard-assert fp16/bf16 inputs and nothing in the
+        # load path cross-checks the two independent widgets, so catch
+        # dtype='fp32' + attention_mode='sage' at queue time.
+        message = check_dtype_attention_compatible(
+            kwargs.get("dtype"), kwargs.get("attention_mode")
+        )
+        if message is not None:
+            return message
 
         model_name = kwargs.get("model_name")
         if model_name is not None and model_name != "No ASR models found":

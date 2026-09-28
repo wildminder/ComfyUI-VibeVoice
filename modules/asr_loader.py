@@ -12,7 +12,7 @@ import torch
 import comfy.model_management as model_management
 
 from .model_info import AVAILABLE_VIBEVOICE_MODELS, MODEL_CONFIGS
-from .attention_utils import resolve_attention_mode, get_attn_implementation_for_load, check_sage_attention_compatible
+from .attention_utils import resolve_attention_mode, resolve_asr_attention_mode, get_attn_implementation_for_load, check_sage_attention_compatible
 from .dtype_utils import resolve_dtype
 from .base_loader import BaseVibeVoiceLoader
 
@@ -317,8 +317,13 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
         load_device = model_management.get_torch_device() if not isinstance(device, torch.device) else device
         model_dtype = resolve_dtype(dtype_str, load_device)
 
-        # Resolve attention mode
-        attention_mode = resolve_attention_mode(attention_mode, quantize_4bit=False)
+        # Resolve attention mode. The ASR exclusion runs here, BEFORE the
+        # attn_implementation and the model are built, so a sage request
+        # cannot reach `set_sage_attention` on a path whose prefill always
+        # carries a padding mask the kernel would drop.
+        attention_mode = resolve_asr_attention_mode(
+            resolve_attention_mode(attention_mode, quantize_4bit=False)
+        )
         attn_implementation = get_attn_implementation_for_load(attention_mode)
 
         # HF-native checkpoints (model_type "vibevoice_asr", e.g.

@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 
-SCRIPT_PATH = Path(__file__).parent.parent / "e2e_smoke_test.py"
+# The smoke script is a developer tool, not part of the published node:
+# it lives outside the package and may be absent on a user install.
+SCRIPT_PATH = Path(__file__).parent.parent / ".dev" / "tools" / "e2e_smoke_test.py"
 
 
 def _load_script():
@@ -22,6 +24,8 @@ def _load_script():
 
 @pytest.fixture(scope="module")
 def smoke_script():
+    if not SCRIPT_PATH.exists():
+        pytest.skip(f"developer smoke script not present: {SCRIPT_PATH}")
     return _load_script()
 
 

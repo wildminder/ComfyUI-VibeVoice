@@ -261,6 +261,80 @@ class TestLoadASRModelPatched:
         LOADED_ASR_MODELS_CACHE.clear()
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
 
+    def test_sage_request_reaches_the_cache_key_and_the_patcher(self):
+        """The ASR sage exclusion must land on BOTH the cache key and the
+        patcher, exactly as the realtime exclusion does.
+
+        A downgrade that misses either leaves a mismatch: a sage-built model
+        cached under an sdpa key (or vice versa) means the key no longer
+        describes the weights, and a stale entry under the old key pins the
+        wrong model in VRAM.
+        """
+        from ComfyUI_VibeVoice.modules.asr_loader import VibeVoiceASRModelHandler, LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_model_patched
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+        def fake_load(self, device, attention_mode="sdpa"):
+            self.model = torch.nn.Linear(8, 8)
+            self.processor = object()
+
+        with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load),              patch("comfy.model_patcher.ModelPatcher.patch_model"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
+                   side_effect=lambda p: p.patch_model()),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
+                   return_value=torch.device("cpu")),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device",
+                   return_value=torch.device("cpu")):
+            patcher, _, _ = load_asr_model_patched(
+                model_name="VibeVoice-ASR", device="cpu", dtype="fp32",
+                attention_mode="sage",
+            )
+
+        assert patcher.attention_mode == "sdpa", (
+            "the patcher must carry the mode the weights were actually built "
+            "with, not the one the user asked for"
+        )
+        assert list(VIBEVOICE_ASR_PATCHER_CACHE) == ["asr_VibeVoice-ASR_attn_sdpa"]
+        assert list(LOADED_ASR_MODELS_CACHE) == ["asr_VibeVoice-ASR_attn_sdpa"]
+        assert "sage" not in "".join(VIBEVOICE_ASR_PATCHER_CACHE)
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
+    def test_sage_request_collides_with_the_sdpa_entry(self):
+        """A sage request must reuse the sdpa entry, not build a second model
+        under a different key for the same backend."""
+        from ComfyUI_VibeVoice.modules.asr_loader import VibeVoiceASRModelHandler, LOADED_ASR_MODELS_CACHE
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_model_patched
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        load_calls = {"n": 0}
+
+        def fake_load(self, device, attention_mode="sdpa"):
+            load_calls["n"] += 1
+            self.model = torch.nn.Linear(8, 8)
+            self.processor = object()
+
+        with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load),              patch("comfy.model_patcher.ModelPatcher.patch_model"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
+                   side_effect=lambda p: p.patch_model()),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
+                   return_value=torch.device("cpu")),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device",
+                   return_value=torch.device("cpu")):
+            p1, _, _ = load_asr_model_patched(
+                model_name="VibeVoice-ASR", device="cpu", dtype="fp32",
+                attention_mode="sdpa")
+            p2, _, _ = load_asr_model_patched(
+                model_name="VibeVoice-ASR", device="cpu", dtype="fp32",
+                attention_mode="sage")
+
+        assert p1 is p2
+        assert load_calls["n"] == 1
+        assert len(VIBEVOICE_ASR_PATCHER_CACHE) == 1
+
+        LOADED_ASR_MODELS_CACHE.clear()
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+
 
 class TestExternalVibeVoiceASRModelHandler:
     """Phase 4: handler for an externally-loaded (pre-instantiated) ASR model."""
@@ -896,25 +970,28 @@ class TestASRAttentionSwitchNoLeak:
         LOADED_ASR_MODELS_CACHE.clear()
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
         clear_active_keys()
-        sdpa_model, sage_model = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
-        models_by_attn = {"sdpa": sdpa_model, "sage": sage_model}
+        # The switch is eager -> sdpa, not sdpa -> sage: sage is excluded from
+        # the ASR path (ASR_EXCLUDED_ATTENTION_MODES), so a sage request
+        # resolves to sdpa and would collide with run 1 instead of switching.
+        eager_model, sdpa_model = torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
+        models_by_attn = {"eager": eager_model, "sdpa": sdpa_model}
 
         try:
-            # Run 1: sdpa — one patcher + one model entry, under ONE key format.
-            _, model1, _ = self._run_patched_load(models_by_attn, "sdpa")
-            assert model1 is sdpa_model
+            # Run 1: eager — one patcher + one model entry, under ONE key format.
+            _, model1, _ = self._run_patched_load(models_by_attn, "eager")
+            assert model1 is eager_model
+            assert list(VIBEVOICE_ASR_PATCHER_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_eager"]
+            assert list(LOADED_ASR_MODELS_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_eager"]
+            assert get_active(FAMILY_ASR) == "asr_VibeVoice-ASR_attn_eager"
+
+            # Run 2: sdpa — the eager model must be FULLY released before the
+            # new one loads (this is where the old code leaked a stale
+            # static-format entry pinning the 17 GB tree).
+            _, model2, _ = self._run_patched_load(models_by_attn, "sdpa")
+            assert model2 is sdpa_model
             assert list(VIBEVOICE_ASR_PATCHER_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sdpa"]
             assert list(LOADED_ASR_MODELS_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sdpa"]
             assert get_active(FAMILY_ASR) == "asr_VibeVoice-ASR_attn_sdpa"
-
-            # Run 2: sage — the sdpa model must be FULLY released before the
-            # new one loads (this is where the old code leaked a stale
-            # static-format entry pinning the 17 GB tree).
-            _, model2, _ = self._run_patched_load(models_by_attn, "sage")
-            assert model2 is sage_model
-            assert list(VIBEVOICE_ASR_PATCHER_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sage"]
-            assert list(LOADED_ASR_MODELS_CACHE.keys()) == ["asr_VibeVoice-ASR_attn_sage"]
-            assert get_active(FAMILY_ASR) == "asr_VibeVoice-ASR_attn_sage"
         finally:
             LOADED_ASR_MODELS_CACHE.clear()
             VIBEVOICE_ASR_PATCHER_CACHE.clear()

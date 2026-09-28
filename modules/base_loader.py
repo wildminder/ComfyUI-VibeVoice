@@ -34,7 +34,7 @@ def _default_device() -> torch.device:
 def iter_safetensors_tensors(ckpt_path: str):
     """Yield ``(key, tensor)`` one at a time from a safetensors file.
 
-    Per-tensor streaming contract (Breeze-TTS-2 pattern): only ONE tensor is
+    Per-tensor streaming contract: only ONE tensor is
     materialized at any moment — the full-file state dict (and its
     ~file-size RAM residency) never exists.
 

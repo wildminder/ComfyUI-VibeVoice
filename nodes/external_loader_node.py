@@ -22,9 +22,15 @@ from ..modules.external_loader import (
     EXTERNAL_CONFIG_OPTIONS,
     is_asr_config_name,
     normalize_config_name,
+    reconciled_config_name,
+    remember_reconciled_config,
     resolve_auto_config_name,
 )
-from ..modules.attention_utils import get_available_attention_modes, resolve_attention_mode
+from ..modules.attention_utils import (
+    get_available_attention_modes,
+    resolve_attention_mode,
+    check_dtype_attention_compatible,
+)
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 from ..modules.model_registry import (
     FAMILY_ASR,
@@ -188,13 +194,26 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         normalizes the alias onto its canonical option.
         """
         cfg = kwargs.get("config_name")
-        if cfg in EXTERNAL_CONFIG_OPTIONS or \
-                normalize_config_name(cfg) in EXTERNAL_CONFIG_OPTIONS:
-            return True
-        return (
-            f"config_name '{cfg}' is not valid. "
-            f"Choose one of: {', '.join(EXTERNAL_CONFIG_OPTIONS)}"
+        if cfg not in EXTERNAL_CONFIG_OPTIONS and \
+                normalize_config_name(cfg) not in EXTERNAL_CONFIG_OPTIONS:
+            return (
+                f"config_name '{cfg}' is not valid. "
+                f"Choose one of: {', '.join(EXTERNAL_CONFIG_OPTIONS)}"
+            )
+
+        # This node is the single owner of the dtype/attention pair for every
+        # model it builds (TTS and ASR alike), so the sage fp32/bf16
+        # cross-check belongs here as well as on the generation nodes. The
+        # ASR branch additionally drops sage entirely (see
+        # modules/attention_utils.ASR_EXCLUDED_ATTENTION_MODES).
+        message = check_dtype_attention_compatible(
+            kwargs.get("dtype"),
+            kwargs.get("attention_mode"),
+            bool(kwargs.get("quantize_llm_4bit")),
         )
+        if message is not None:
+            return message
+        return True
 
     @classmethod
     def execute(
@@ -222,6 +241,12 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         if config_name == AUTO_CONFIG_NAME:
             config_name = resolve_auto_config_name(weight_path)
 
+        # The name the USER asked for, captured before anything downstream can
+        # rewrite it. The loader may still reconcile it against the weights'
+        # architecture fingerprint (reconcile_config), and the memo below is
+        # keyed by this requested name.
+        requested_config_name = config_name
+
         # Unload-before-load gate (plan 2026-08-20, C1/RC-1/RC-5): compute the
         # request identity EXACTLY as the external loader will record it on the
         # bundle (same resolution rules), and fully release any different
@@ -231,6 +256,17 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         family = FAMILY_ASR if is_asr else FAMILY_TTS
         use_llm_4bit = False if is_asr else bool(quantize_llm_4bit)
         resolved_attn = resolve_attention_mode(attention_mode, use_llm_4bit)
+        # The name the consumer will key the built patcher off is the bundle's
+        # POST-reconciliation model_name. The gate cannot run after the load
+        # (peak-RAM), so on a memo miss the requested name is used — byte-
+        # identical to the pre-memo behaviour, i.e. the first run of a
+        # reconciling model still evicts, and every later run is a strict
+        # no-op. Family/attention resolution above is unaffected: the ASR
+        # branch never reconciles, and reconciliation only ever substitutes a
+        # TTS family detected from the same fingerprint.
+        config_name = reconciled_config_name(
+            weight_path, requested_config_name
+        )
         # The request key MUST live in the same namespace as the consumer's
         # cache key ("asr_external" vs "external") — a prefix mismatch would
         # make every identical re-run of an ASR model spuriously evict and
@@ -256,5 +292,15 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
             use_llm_4bit=quantize_llm_4bit,
             dtype_str=dtype,
         )
+
+        # Remember what this load actually built, so the NEXT run computes the
+        # same request key the consumer will compute. Guarded: a hand-built or
+        # mocked bundle without 'model_name' must never break execute().
+        try:
+            remember_reconciled_config(
+                weight_path, requested_config_name, model_bundle["model_name"]
+            )
+        except Exception as e:
+            logger.debug(f"Could not memoize reconciled config name: {e}")
 
         return io.NodeOutput(model_bundle)

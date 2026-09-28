@@ -1066,6 +1066,14 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         if use_llm_4bit:
             bnb_compute_dtype = model_dtype
             if attention_mode == 'sage':
+                # WHY fp32 here: the sage kernels quantise Q/K per block and
+                # assert fp16/bf16 inputs, and a 4-bit bnb linear matmul in
+                # fp16 is the known-accuracy trap. The attention itself still
+                # runs in bfloat16 -- `resolve_sage_target_dtype` returns bf16
+                # for any linear carrying a `quant_state` -- so the 4-bit +
+                # sage path is bf16 attention over an fp32-configured model.
+                # That asymmetry is intentional, not a bug: attention reads
+                # q/k/v (bf16) while the MLP/projection matmuls stay fp32.
                 bnb_compute_dtype, final_load_dtype = torch.float32, torch.float32
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,

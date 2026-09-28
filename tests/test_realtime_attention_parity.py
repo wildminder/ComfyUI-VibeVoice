@@ -90,13 +90,17 @@ def test_every_attention_mode_still_loads_through_the_masked_interface():
         assert impl in mapping, f"{mode} loads as {impl!r}, which builds no mask"
 
 
-def test_sage_forward_ignores_the_attention_mask(real_vibevoice, monkeypatch):
+def test_sage_forward_refuses_an_attention_mask(real_vibevoice, monkeypatch):
     """The mechanism behind sage's exclusion, asserted rather than assumed.
 
-    ``sage_attention_forward`` derives causality from whether a mask was passed,
-    not from the mask itself, so any masked (i.e. every windowed) call runs
-    non-causal over the whole cache. Both branches are recorded here.
+    ``sage_attention_forward`` used to derive causality from whether a mask was
+    passed and then DISCARD the mask, so any masked (i.e. every windowed, and
+    every left-padded ASR) call ran non-causal over the whole cache. The
+    function now refuses a mask outright: sageattn has no attn_mask parameter,
+    so the mask cannot be honoured and dropping it produces silently wrong
+    output. Unmasked calls are unchanged — still causal at q_len > 1.
     """
+    import pytest
     import torch.nn as nn
 
     sage_patch = real_vibevoice["sage_attention_patch"]
@@ -153,24 +157,29 @@ def test_sage_forward_ignores_the_attention_mask(real_vibevoice, monkeypatch):
         attention_mask=None,
         past_key_values=cache,
     )
-    sage_patch.sage_attention_forward(
-        attn,
-        hidden,
-        position_embeddings=position_embeddings,
-        attention_mask=additive_mask,
-        past_key_values=cache,
-    )
 
-    # Same keys either way — the mask changes nothing about what is attended to,
-    # only about the is_causal flag, which is derived from the mask's presence.
+    # Unmasked: the kernel sees the whole cache, causally.
     assert [entry["kv_len"] for entry in recorded] == [
         PREFILL_TOKENS + WINDOW_TOKENS
-    ] * 2
-    assert [entry["q_len"] for entry in recorded] == [WINDOW_TOKENS] * 2
+    ]
+    assert recorded[0]["q_len"] == WINDOW_TOKENS
     assert recorded[0]["is_causal"] is True
-    assert recorded[1]["is_causal"] is False, (
-        "a masked call must not fall back to is_causal; the mask itself is never "
-        "read, so a windowed step attends to keys ahead of its own positions"
+
+    # Masked: refused before the kernel is reached. Silently ignoring the mask
+    # is what let a window — or a left-padded ASR prefill — attend to keys
+    # ahead of its own positions.
+    calls_before = len(recorded)
+    with pytest.raises(ValueError, match="attention_mask"):
+        sage_patch.sage_attention_forward(
+            attn,
+            hidden,
+            position_embeddings=position_embeddings,
+            attention_mask=additive_mask,
+            past_key_values=cache,
+        )
+    assert len(recorded) == calls_before, (
+        "the kernel must not run at all when a mask is present — the mask it "
+        "cannot honour is the entire point of the refusal"
     )
 
 

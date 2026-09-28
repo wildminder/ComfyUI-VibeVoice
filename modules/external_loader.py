@@ -21,6 +21,7 @@ import os
 import json
 import logging
 import contextlib
+import gc
 
 import torch
 
@@ -42,6 +43,7 @@ from .attention_utils import (
     SAGE_ATTENTION_AVAILABLE,
     resolve_attention_mode,
     resolve_realtime_attention_mode,
+    resolve_asr_attention_mode,
     get_attn_implementation_for_load,
     check_sage_attention_compatible,
 )
@@ -197,6 +199,94 @@ def reconcile_config(selected_name: str, resolved_config, weights_fp):
         f"Using '{detected}'."
     )
     return detected, True
+
+
+# ====================================================================
+# Reconciliation memo
+# ====================================================================
+#
+# The loader node's unload-before-load gate must run BEFORE the model is
+# built (it is the ~1x-model-size peak-RAM guard), so the node cannot know
+# what reconcile_config() will decide without opening the weight file itself.
+# This memo records the (file identity, requested name) -> effective name
+# mapping learned from the PREVIOUS load, so the node can compute the same
+# config name the consumer will key the built patcher off.
+#
+# Keying on the file's stat (mtime_ns + size) means the memo is invalidated
+# whenever the checkpoint changes; the first run after such a change falls
+# back to the REQUESTED name, which is the pre-fix behaviour. That is the
+# safe direction: a genuinely different model is still evicted, at the cost
+# of one extra churn on the run that detects the change.
+
+# (abspath, mtime_ns, size, selected_name) -> effective config_name.
+_RECONCILIATION_MEMO: dict = {}
+
+
+def _reconciliation_memo_key(weight_path: str, selected_name: str):
+    """Build the stat-guarded memo key for a weight file / config selection.
+
+    Mirrors the guarded ``os.stat`` pattern of
+    :func:`modules.model_registry.identity_for_external`: an unreadable or
+    missing file degrades to placeholder stat values instead of raising, so
+    a hand-built/mocked path can never break the loader node.
+
+    Args:
+        weight_path: Absolute path to the weight file (may not exist).
+        selected_name: The requested config_name, post alias/auto resolution.
+
+    Returns:
+        Hashable memo key tuple.
+    """
+    abspath = os.path.abspath(weight_path) if weight_path else ""
+    mtime_ns = 0
+    size = 0
+    try:
+        stat = os.stat(abspath)
+        mtime_ns = stat.st_mtime_ns
+        size = stat.st_size
+    except OSError:
+        # Unreadable/missing file: degrade to placeholders (deterministic).
+        pass
+    return (abspath, mtime_ns, size, selected_name)
+
+
+def reconciled_config_name(weight_path: str, selected_name: str) -> str:
+    """Return the config name the loader will use for this exact request.
+
+    Args:
+        weight_path: Absolute path to the weight file.
+        selected_name: The requested config_name (post alias/auto resolution).
+
+    Returns:
+        The remembered effective config_name, or ``selected_name`` on a memo
+        miss (cold memo, changed weight file, or no reconciliation applied).
+    """
+    return _RECONCILIATION_MEMO.get(
+        _reconciliation_memo_key(weight_path, selected_name), selected_name
+    )
+
+
+def remember_reconciled_config(
+    weight_path: str, selected_name: str, effective_name: str
+) -> None:
+    """Record the config name a completed load actually used.
+
+    Args:
+        weight_path: Absolute path to the weight file.
+        selected_name: The config_name that was requested from the loader.
+        effective_name: The config_name the produced bundle records (post
+            reconciliation). Empty values are ignored.
+    """
+    if not effective_name:
+        return
+    _RECONCILIATION_MEMO[
+        _reconciliation_memo_key(weight_path, selected_name)
+    ] = effective_name
+
+
+def clear_reconciliation_memo() -> None:
+    """Forget all reconciliation bookkeeping (test isolation helper)."""
+    _RECONCILIATION_MEMO.clear()
 
 
 # ====================================================================
@@ -542,7 +632,7 @@ def _open_gguf_reader(weight_path: str):
 
     Delegates to :func:`modules.gguf_quant.open_gguf_reader` — stock reader
     first, tolerant flat-block reopen only when a quantized tensor's row is
-    below its block size (quantui-rs conv conversions).
+    below its block size (non-spec conv conversions).
 
     Raises:
         RuntimeError: If the ``gguf`` package is not installed.
@@ -949,7 +1039,7 @@ def _assert_gguf_lm_head_not_tied(config, reader) -> None:
         return
     for t in reader.tensors:
         # 'output.weight' is llamacpp naming for lm_head and appears in
-        # quantui-rs exports that otherwise keep HF names (VibeVoice-7B).
+        # exports that otherwise keep HF names (VibeVoice-7B).
         if t.name in ("lm_head.weight", "output.weight") and t.tensor_type not in FLOAT_GGML_TYPES:
             from .quant_common import QuantTargetMismatch
 
@@ -1033,23 +1123,24 @@ def _install_gguf_weights(model, reader) -> dict:
     materialization (plan 2026-08-24, D1 — the RAM-spike kill).
 
     Pipeline:
-    1. Map every reader tensor onto the model tree (HF pass-through or
-       llamacpp naming).
+    1. Metadata pass: map every reader tensor onto the model tree (HF
+       pass-through or llamacpp naming) and decide its disposition. No weight
+       bytes are read here.
     2. Quantized tensors whose target is an ``nn.Linear`` become RESIDENTS:
        the Linear is swapped for :class:`~modules.gguf_quant.GGUFLinear` and
        the RAW BLOCK BYTES are installed as its uint8 parameter (the one
        unavoidable copy — it IS the residency).
     3. Quantized tensors whose target is NOT a Linear but has a weight
-       parameter of matching shape (embeddings, conv heads — quantui-rs
-       files quantize these too) DEQUANTIZE AT LOAD into the dense state
-       dict — the same fallback the fp8 path uses for non-Linear residents.
-    4. Float tensors (F32/F16/BF16) take zero-copy views at their NATIVE
-       dtype into a filtered dense state dict applied through
-       :meth:`VibeVoiceLoader._apply_state_dict` (assign semantics, re-tie,
-       sentinel/RoPE fixes preserved).
+       parameter of matching shape (embeddings, conv heads) DEQUANTIZE AT
+       LOAD directly into that parameter's dtype — the same fallback the fp8
+       path uses for non-Linear residents.
+    4. Float tensors (F32/F16/BF16) keep their NATIVE dtype.
+    5. Install pass: residents are assigned in place, then the dense tensors
+       stream through :meth:`VibeVoiceLoader._stream_apply_dense` one at a
+       time (assign semantics, re-tie, sentinel/RoPE fixes preserved).
 
-    Peak RAM ≈ raw file size + the dequantized non-Linear weights instead
-    of ~2x full-float size.
+    Peak host RAM ≈ the installed model plus one tensor in flight, instead of
+    the whole checkpoint buffered in a dict alongside it.
 
     Returns:
         Stats dict ``{"n_resident_layers", "raw_bytes", "n_dequant_load",
@@ -1076,11 +1167,14 @@ def _install_gguf_weights(model, reader) -> dict:
     mapping = map_keys([t.name for t in tensors])
     modules_by_name = dict(model.named_modules())
 
+    # Pass 1 touches metadata only: it decides the resident plan and the
+    # dense assignment order without reading a single weight byte, so the
+    # swap below can happen before any tensor is materialized.
     resident_plan = {}
-    resident_tensors = {}
-    dense_state = {}
+    plan = []  # (tensor, "resident"|"dense", target, dtype, nbytes)
     unsupported = []
-    dequant_load = []  # (target_key, tensor) — quantized non-Linear weights
+    dequant_load = []
+    dequant_bytes = 0
 
     for t in tensors:
         target_key = mapping[t.name]
@@ -1088,19 +1182,7 @@ def _install_gguf_weights(model, reader) -> dict:
         tt = t.tensor_type
 
         if tt in FLOAT_GGML_TYPES:
-            data = t.data
-            arr = np.ascontiguousarray(data)
-            if arr.flags.writeable:
-                tensor = torch.from_numpy(arr).clone()
-            else:
-                # mmap-backed read-only buffer: copy so torch never warns
-                # (same hazard class as GGUFTensor.from_reader_tensor).
-                tensor = torch.from_numpy(arr.copy())
-            if data.dtype == np.uint8:  # BF16 arrives as raw uint8 bytes
-                tensor = tensor.view(torch.bfloat16)
-            # The tensor is owned above; reshape is a view at the native
-            # dtype into the dense state dict.
-            dense_state[target_key] = tensor.reshape(logical_shape)
+            plan.append((t, "dense", target_key, None, 0))
             continue
 
         if tt not in SUPPORTED_GGML_TYPES:
@@ -1129,18 +1211,11 @@ def _install_gguf_weights(model, reader) -> dict:
                     f"with model {type(target_module).__name__} shape "
                     f"{expected_shape}"
                 )
-            # Copy the raw block bytes off the mmap now (this copy IS the
-            # final residency); float materialization never happens.
-            resident_tensors[module_path] = GGUFTensor.from_reader_tensor(t)
+            plan.append((t, "resident", module_path, None, 0))
             resident_plan[module_path] = gguf_linear_factory(tt)
             continue
         target_param = getattr(target_module, "weight", None)
         if isinstance(target_param, torch.Tensor):
-            # Non-Linear quantized weight (embedding / conv head): these
-            # cannot be quant-resident (only Linear matmuls dequantize
-            # per-call), so materialize the float ONCE here — bounded,
-            # and exactly what the fp8 path does for its non-Linear
-            # residents.
             expected_shape = tuple(target_param.shape)
             if logical_shape != expected_shape:
                 raise QuantTargetMismatch(
@@ -1148,14 +1223,25 @@ def _install_gguf_weights(model, reader) -> dict:
                     f"with model {type(target_module).__name__} shape "
                     f"{expected_shape}"
                 )
-            dense_state[target_key] = dequantize_reader_tensor(t)
+            # Materialized once, straight into the destination dtype: the
+            # fp32 intermediate is never allocated.
+            dst = (
+                target_param.dtype
+                if target_param.dtype.is_floating_point
+                else torch.float32
+            )
+            nbytes = 1
+            for s in expected_shape:
+                nbytes *= int(s)
+            plan.append((t, "dense", target_key, dst, nbytes * dst.itemsize))
             dequant_load.append(target_key)
+            dequant_bytes += nbytes * dst.itemsize
             continue
         kind = type(target_module).__name__
         raise QuantTargetMismatch(
             f"GGUF-quantized tensor '{t.name}' maps to '{module_path}' "
-            f"({kind}), expected an nn.Linear. The sidecar config may not "
-            f"match this checkpoint."
+            f"({kind}), expected an nn.Linear. The sidecar config may "
+            f"not match this checkpoint."
         )
 
     if unsupported:
@@ -1165,16 +1251,40 @@ def _install_gguf_weights(model, reader) -> dict:
         ))
 
     replaced = replace_linears_for_quant(model, resident_plan)
+    resident_set = set(replaced)
+
+    # Pass 2 installs one tensor at a time; the previous tensor is released
+    # before the next is read, so host RAM is bounded by the installed model
+    # plus one tensor in flight rather than by the whole checkpoint.
     total_raw = 0
-    for module_path in replaced:
-        module = resolve_module(model, module_path)
-        gtensor = resident_tensors[module_path]
-        module.set_raw_weight(gtensor.raw)
-        total_raw += gtensor.raw.numel()
-        resident_tensors[module_path] = None
+    for t, kind, target, _dst, _nbytes in plan:
+        if kind != "resident" or target not in resident_set:
+            continue
+        module = resolve_module(model, target)
+        module.set_raw_weight(GGUFTensor.from_reader_tensor(t).raw)
+        total_raw += module.weight.numel()
+
+    def _dense_pairs():
+        for t, kind, target, dst, _nbytes in plan:
+            if kind != "dense":
+                continue
+            if dst is None:
+                arr = np.ascontiguousarray(t.data)
+                # read-only mmap: copy so torch never warns
+                tensor = torch.from_numpy(
+                    arr if arr.flags.writeable else arr.copy()
+                ).clone()
+                if t.data.dtype == np.uint8:  # BF16 arrives as raw bytes
+                    tensor = tensor.view(torch.bfloat16)
+                shape = tuple(int(s) for s in reversed(t.shape))
+                yield target, tensor.reshape(shape)
+            else:
+                yield target, dequantize_reader_tensor(t, dst)
 
     known_missing = {f"{p}.weight" for p in replaced}
-    VibeVoiceLoader._apply_state_dict(model, dense_state, known_missing=known_missing)
+    VibeVoiceLoader._stream_apply_dense(
+        model, _dense_pairs(), known_missing=known_missing
+    )
 
     if dequant_load:
         logger.debug(
@@ -1188,10 +1298,7 @@ def _install_gguf_weights(model, reader) -> dict:
         "n_resident_layers": len(replaced),
         "raw_bytes": total_raw,
         "n_dequant_load": len(dequant_load),
-        "dequant_load_bytes": int(sum(
-            p.numel() * p.element_size()
-            for p in dense_state.values() if p.dtype.is_floating_point
-        )),
+        "dequant_load_bytes": int(dequant_bytes),
         "weight_family": "gguf_block",
     }
 
@@ -1384,6 +1491,43 @@ def _load_state_dict_into_model_from_memory(model, state_dict: dict):
 # Core external loading function
 # ====================================================================
 
+def _log_load_diagnostics(
+    *,
+    config_name: str,
+    requested_attention_mode: str,
+    resolved_attention_mode: str,
+    weight_family: str,
+    load_device,
+) -> None:
+    """Emit the ONE line per load that attributes a slow run from the log.
+
+    WHY the GGUF forward counters are NOT here: they only move once forwards
+    run, so a readout taken during a load is structurally always
+    ``fast=0 streamed=0`` — the very value a reader would take as "the hook
+    path is not poisoning this run", i.e. a wrong answer produced by the
+    instrument. The loaders zero the counters instead
+    (:func:`~modules.gguf_quant.reset_gguf_forward_counters`) and the
+    generation paths report them afterwards under
+    "GGUF forward diagnostics:" — paste THAT line back for a slow run.
+    """
+    logger.info(
+        "Load diagnostics: model='%s' family=%s requested_attention=%s "
+        "resolved_attention=%s device=%s",
+        config_name, weight_family, requested_attention_mode,
+        resolved_attention_mode, load_device,
+    )
+
+
+def _reset_gguf_forward_counters() -> None:
+    """Zero the GGUF forward counters at load (diagnostics must never fail a load)."""
+    try:
+        from .gguf_quant import reset_gguf_forward_counters
+
+        reset_gguf_forward_counters()
+    except Exception:  # pragma: no cover - diagnostics must never break a load
+        pass
+
+
 def load_external_vibevoice_model(
     weight_path: str,
     config_name: str,
@@ -1433,6 +1577,9 @@ def load_external_vibevoice_model(
     # Legacy alias normalization (plan 2026-08-27, D1): saved workflows may
     # still carry removed option values (e.g. "VibeVoice-Large").
     config_name = normalize_config_name(config_name)
+    # Per-load counter scope: the "GGUF forward diagnostics" line printed
+    # after generation describes THIS model, not the whole process history.
+    _reset_gguf_forward_counters()
 
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
@@ -1461,7 +1608,11 @@ def load_external_vibevoice_model(
             device=device,
         )
 
-    # Resolve attention mode with fallback logic (same as standard loader)
+    # Resolve attention mode with fallback logic (same as standard loader).
+    # Keep the REQUESTED value: the resolved one can silently differ (sage ->
+    # sdpa on unsupported hardware, eager -> sdpa under 4-bit), and a silent
+    # substitution is exactly what a slow run must be able to rule out.
+    requested_attention_mode = attention_mode
     attention_mode = resolve_attention_mode(attention_mode, use_llm_4bit)
 
     # Weight-plan validation + lazy source opening (plan 2026-08-24, D1/D2/D4).
@@ -1615,6 +1766,10 @@ def load_external_vibevoice_model(
             weight_family = "gguf_block"
             del gguf_reader
             gguf_reader = None
+            # Unmap the file and drop install scratch before the patcher H2D:
+            # the mmap otherwise keeps the whole checkpoint in the working
+            # set, on top of the VRAM copy.
+            gc.collect()
         elif convrot_quant_map:
             from .quant_common import replace_linears_for_quant
 
@@ -1693,6 +1848,13 @@ def load_external_vibevoice_model(
         logger.info(
             f"Successfully loaded external VibeVoice model '{config_name}' "
             f"from {weight_path}"
+        )
+        _log_load_diagnostics(
+            config_name=config_name,
+            requested_attention_mode=requested_attention_mode,
+            resolved_attention_mode=attention_mode,
+            weight_family=weight_family,
+            load_device=load_device,
         )
 
         # Step 13: Assemble the bundle.
@@ -1784,6 +1946,8 @@ def load_external_vibevoice_asr_model(
     """
     # Legacy alias normalization (plan 2026-08-27, D1) — mirrors the TTS branch.
     config_name = normalize_config_name(config_name)
+    # Per-load counter scope — mirrors the TTS branch.
+    _reset_gguf_forward_counters()
 
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"External weight file not found: {weight_path}")
@@ -1800,8 +1964,13 @@ def load_external_vibevoice_asr_model(
     # Defensive: warn early if the checkpoint looks over-quantized / naively cast.
     warn_if_lowbit_quantization(weight_path)
 
-    # Resolve attention mode with fallback logic (no 4-bit for ASR).
-    attention_mode = resolve_attention_mode(attention_mode, quantize_4bit=False)
+    # Resolve attention mode with fallback logic (no 4-bit for ASR), then drop
+    # the ASR exclusions — this branch builds an ASR model, whose prefill
+    # always carries a left-pad mask the sage kernel cannot honour.
+    requested_attention_mode = attention_mode
+    attention_mode = resolve_asr_attention_mode(
+        resolve_attention_mode(attention_mode, quantize_4bit=False)
+    )
 
     # Weight-plan validation + lazy source opening (mirrors the TTS branch).
     lower_path = weight_path.lower()
@@ -1899,6 +2068,10 @@ def load_external_vibevoice_asr_model(
             weight_family = "gguf_block"
             del gguf_reader
             gguf_reader = None
+            # Unmap the file and drop install scratch before the patcher H2D:
+            # the mmap otherwise keeps the whole checkpoint in the working
+            # set, on top of the VRAM copy.
+            gc.collect()
         elif convrot_quant_map:
             from .quant_common import replace_linears_for_quant
 
@@ -1964,6 +2137,13 @@ def load_external_vibevoice_asr_model(
         logger.info(
             f"Successfully loaded external VibeVoice ASR model '{config_name}' "
             f"from {weight_path}"
+        )
+        _log_load_diagnostics(
+            config_name=config_name,
+            requested_attention_mode=requested_attention_mode,
+            resolved_attention_mode=attention_mode,
+            weight_family=weight_family,
+            load_device=load_device,
         )
 
         # Step 11: Assemble the bundle (identity fields mirror the TTS bundle,

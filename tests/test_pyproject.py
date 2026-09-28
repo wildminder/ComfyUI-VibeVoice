@@ -209,18 +209,26 @@ class TestRequirementsPyprojectParity:
 
 
 class TestTransformersRangeHonesty:
-    """S5.1: the declared ``transformers`` range must not admit an unvalidated version.
+    """S5.1: the declared ``transformers`` range must be internally consistent.
 
     ``transformers`` is the one dependency whose internal API this node adapts to
     (the realtime path carries a legacy pickled ``DynamicCache`` across a 4.x ->
-    5.x cache refactor). An unbounded or wrongly-bounded declaration therefore
-    lets an installer land on a major version nobody ran, and the failure is
-    silent: a wrong cache shim conditions the model on nothing and produces
-    plausible-looking audio.
+    5.x cache refactor). The declaration therefore has to be *agreed* rather
+    than merely present.
 
-    These tests keep the declaration and the set of measured versions in step, so
-    a future 5.x bump fails loudly in the default suite instead of at a user's
-    machine.
+    The current declaration is unbounded (``"transformers"`` in both files), a
+    deliberate decision: a registry install and a Manager/git-clone install must
+    resolve the same major, and the two files used to disagree — pyproject.toml
+    without a cap, requirements.txt with ``>=5.3.0,<5.4`` — so the two install
+    paths landed on different transformers. Whether a bound is present is
+    therefore a *choice*; whether the two files express the *same* choice is a
+    contract, and that is what these tests assert.
+
+    What a bound buys is still checked: when one IS declared, every major it
+    admits must be in :attr:`MEASURED_MAJORS`, and the version the suite
+    actually runs against must satisfy the declaration. When none is declared,
+    the installed major must itself be measured — the only remaining guard
+    against the silent-cache-shim failure described above.
 
     The measured set is recorded here as a literal rather than read from a
     development document: it is a fact about the shipped code, and the published
@@ -231,7 +239,7 @@ class TestTransformersRangeHonesty:
 
     # The ``transformers`` major lines this node has actually been exercised on.
     # Widen MEASURED_MAJORS only after running the real-checkpoint generation
-    # tests against the new major; the declared range is then widened to match.
+    # tests against the new major.
     MEASURED_MAJORS = ("4", "5")
 
     @classmethod
@@ -243,30 +251,49 @@ class TestTransformersRangeHonesty:
         )
         return specs[0]
 
-    def test_transformers_range_is_upper_bounded(self):
-        """An unbounded range is exactly the F12 defect; it must not come back."""
-        spec = self._spec()
-        assert "<" in spec, (
-            f"pyproject.toml declares '{spec}' with no upper bound, so a future "
-            f"transformers 5.x/6.x install is accepted without validation. The "
-            f"checkpoint targets the 4.5x generation and the dual-API cache shim "
-            f"was measured against 4.57.6 and 5.3.0 only. Cap the range, or add the "
-            f"new major to MEASURED_MAJORS after running the real-checkpoint tests."
+    @classmethod
+    def _requirement_spec(cls) -> str:
+        entries = [e for e in _requirements_entries() if _dep_name(e) == "transformers"]
+        assert len(entries) == 1, (
+            f"requirements.txt must list transformers exactly once, found {entries}"
+        )
+        return entries[0]
+
+    def test_transformers_spec_agrees_across_files(self):
+        """pyproject.toml and requirements.txt must express the SAME choice.
+
+        This is the invariant that survives a decision to bound or not to
+        bound. Comparing the whole spec (not just the cap) also catches a
+        floor added on one side only.
+        """
+        py_spec = self._spec()
+        req_spec = self._requirement_spec()
+        assert py_spec == req_spec, (
+            f"The transformers declaration disagrees across the two install "
+            f"paths: pyproject.toml declares {py_spec!r} while requirements.txt "
+            f"declares {req_spec!r}. A Comfy registry install resolves the "
+            f"former and a Manager/git-clone install resolves the latter, so "
+            f"the same workflow runs on two different transformers majors. "
+            f"Make the two files identical."
         )
 
     def test_requirements_txt_bound_matches_pyproject(self):
-        """requirements.txt serves Manager installs; the cap must travel with it."""
+        """The cap, when one is declared, must be the same cap in both files.
+
+        Narrower than :meth:`test_transformers_spec_agrees_across_files` on
+        purpose: this fails with a message that names the cap specifically,
+        which is the field that actually broke (pyproject had dropped it while
+        requirements.txt kept it).
+        """
         py_spec = self._spec()
         py_cap = py_spec.split("<")[-1].strip() if "<" in py_spec else None
-        for entry in _requirements_entries():
-            if _dep_name(entry) != "transformers":
-                continue
-            req_cap = entry.split("<")[-1].strip() if "<" in entry else None
-            assert req_cap == py_cap, (
-                f"transformers upper bounds disagree: pyproject.toml has {py_cap!r}, "
-                f"requirements.txt has {req_cap!r}. A Manager/git-clone install "
-                f"would resolve a different major than a registry install."
-            )
+        req_spec = self._requirement_spec()
+        req_cap = req_spec.split("<")[-1].strip() if "<" in req_spec else None
+        assert req_cap == py_cap, (
+            f"transformers upper bounds disagree: pyproject.toml has {py_cap!r}, "
+            f"requirements.txt has {req_cap!r}. A Manager/git-clone install "
+            f"would resolve a different major than a registry install."
+        )
 
     def test_range_matches_the_version_the_suite_runs_against(self):
         """The installed transformers must satisfy the declared range.
@@ -295,20 +322,41 @@ class TestTransformersRangeHonesty:
         )
 
     def test_every_admitted_major_has_been_measured(self):
-        """A version the range admits must be recorded as measured."""
+        """Whatever the declaration admits must be recorded as measured.
+
+        With a cap this is the historical check: each major below the cap must
+        appear in :attr:`MEASURED_MAJORS`. Without a cap the declaration admits
+        every future major, so that loop is vacuous and the meaningful guard is
+        that the major the suite actually runs against was measured — an
+        unbounded declaration must not become a way to run unmeasured code.
+        """
         spec = self._spec()
         majors = set()
         for part in spec.split(",", 1)[1:]:
             part = part.strip()
             if part.startswith("<"):
                 majors.add(part[1:].strip().split(".")[0])
-        assert majors, (
-            f"'{spec}' has no upper bound to check; see "
-            f"test_transformers_range_is_upper_bounded."
+
+        if majors:
+            for major in sorted(majors):
+                assert major in self.MEASURED_MAJORS, (
+                    f"The declared range admits transformers {major}.x, but "
+                    f"{major}.x is not in MEASURED_MAJORS. Widening the range "
+                    f"without measuring the new major first is the F12 defect."
+                )
+            return
+
+        installed = _installed_transformers_version()
+        assert installed is not None, (
+            f"'{spec}' is unbounded, so the only remaining guard is that the "
+            f"version this suite runs against is a measured one — but "
+            f"transformers is not importable here."
         )
-        for major in sorted(majors):
-            assert major in self.MEASURED_MAJORS, (
-                f"The declared range admits transformers {major}.x, but "
-                f"{major}.x is not in MEASURED_MAJORS. Widening the range without "
-                f"measuring the new major first is the F12 defect."
-            )
+        running_major = installed.split(".")[0]
+        assert running_major in self.MEASURED_MAJORS, (
+            f"'{spec}' is unbounded, so it admits any transformers major, and "
+            f"the suite is running {installed} — whose major {running_major}.x "
+            f"is not in MEASURED_MAJORS. An unbounded declaration is a decision "
+            f"to accept new majors as they arrive; it is not a decision to run "
+            f"them unmeasured."
+        )

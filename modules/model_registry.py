@@ -5,8 +5,7 @@ per family (``"tts"`` / ``"asr"``) and for fully releasing a superseded model
 (RAM + VRAM + ComfyUI's ``model_management.current_loaded_models`` registry)
 BEFORE any allocation for a replacement begins.
 
-Reference implementation: ComfyUI-Raon-OpenTTS single-active-bundle semantics
-(``unload_raon_bundle`` / ``_unregister_from_comfy``).
+Single-active-bundle semantics: at most one live bundle per cache key.
 
 Design notes:
 
@@ -17,6 +16,15 @@ Design notes:
 - Every destructive sub-step is individually exception-guarded: a failure in
   one step must never block the remaining release steps (a half-released model
   is still better than a leaked one, and warnings surface the failure).
+- The BUNDLE registry exists because the patcher cache is NOT the only holder
+  of the weights. The external loader node returns the model bundle as a node
+  OUTPUT (``nodes/external_loader_node.VibeVoiceModel.Output``), and ComfyUI's
+  execution cache keeps that dict STRONGLY (``execution.CacheEntry.outputs``)
+  until the node leaves the prompt or re-executes. So popping our own
+  patcher-cache entry frees nothing: the cached bundle still references the
+  live ``nn.Module`` and its GPU/CPU tensors. Eviction must therefore
+  NEUTRALIZE the bundle (null its heavy fields) — see
+  :func:`register_model_bundle` / :func:`release_model_bundles`.
 """
 
 import gc
@@ -31,6 +39,89 @@ FAMILY_ASR = "asr"
 
 # family -> cache_key of the currently active model.
 _ACTIVE_KEYS: dict = {}
+
+# Fields of a model bundle that hold the heavy references (the instantiated
+# nn.Module and its processor). Nulling exactly these two drops the weights
+# while leaving the plain-string identity fields debuggable.
+_BUNDLE_HEAVY_FIELDS = ("model", "processor")
+
+# patcher cache_key -> the ONE live model bundle registered for that key.
+# Popping/clearing this dict alone frees nothing (ComfyUI's output cache owns
+# a strong ref to the bundle); release_model_bundles() nulls the heavy fields
+# of the bundle it removes.
+_BUNDLE_REGISTRY: dict = {}
+
+
+def _neutralize_bundle(bundle) -> None:
+    """Null a bundle's heavy fields, per-field guarded, never raising.
+
+    The identity fields (``model_name``, ``source_path``, ``attention_mode``,
+    ``use_llm_4bit``, ``dtype_str``, ``is_asr``, ...) are intentionally left
+    intact so the dict ComfyUI keeps cached stays small and inspectable — and
+    so a still-connected consumer of a DIFFERENT key keeps working.
+    """
+    if bundle is None:
+        return
+    for field in _BUNDLE_HEAVY_FIELDS:
+        try:
+            bundle[field] = None
+        except Exception as e:
+            logger.warning(
+                f"model_registry: could not null bundle field '{field}': {e}"
+            )
+
+
+def register_model_bundle(cache_key: str, bundle) -> None:
+    """Record the live model bundle for ``cache_key``.
+
+    Single-slot-per-key semantics: if a DIFFERENT bundle was already registered
+    under ``cache_key`` it is neutralized first, then replaced. That self-heals
+    the external -> external re-execution case, where the loader node produces
+    a brand-new bundle dict for weights that are already cached. Re-registering
+    the SAME dict (the reused-patcher path) is a no-op replace — the live
+    bundle is never neutralized out from under its own consumer.
+
+    Never raises: registration is bookkeeping and must not break loading.
+    """
+    try:
+        previous = _BUNDLE_REGISTRY.get(cache_key)
+        if previous is not None and previous is not bundle:
+            _neutralize_bundle(previous)
+        _BUNDLE_REGISTRY[cache_key] = bundle
+    except Exception as e:
+        logger.warning(
+            f"model_registry.register_model_bundle({cache_key!r}) failed: {e}"
+        )
+
+
+def release_model_bundles(cache_key: str) -> int:
+    """Neutralize the bundle registered under ``cache_key`` and drop it.
+
+    Only the given key is touched, so a consumer still connected to a DIFFERENT
+    key is never collateral damage.
+
+    Args:
+        cache_key: The patcher-cache key whose bundle is being evicted.
+
+    Returns:
+        ``1`` if a bundle was released, ``0`` if nothing was registered.
+    """
+    try:
+        bundle = _BUNDLE_REGISTRY.pop(cache_key, None)
+    except Exception as e:
+        logger.warning(
+            f"model_registry.release_model_bundles({cache_key!r}) failed: {e}"
+        )
+        return 0
+    if bundle is None:
+        return 0
+    _neutralize_bundle(bundle)
+    return 1
+
+
+def clear_bundle_registry() -> None:
+    """Forget all bundle registrations (test isolation helper)."""
+    _BUNDLE_REGISTRY.clear()
 
 
 def set_active(family: str, cache_key: str) -> None:
@@ -113,7 +204,7 @@ def unregister_from_comfy(patcher) -> list:
     Iterates ``comfy.model_management.current_loaded_models`` and drops every
     entry whose wrapped model IS ``patcher``, detaching both finalizers first
     so neither ComfyUI's GC hooks nor the entry itself can resurrect or further
-    track the dying patcher (Raon ``_unregister_from_comfy`` pattern).
+    track the dying patcher.
 
     Args:
         patcher: The ModelPatcher being evicted.
@@ -179,8 +270,11 @@ def evict_patcher(patcher, cache_dict: dict, key: str) -> list:
         2. ``patcher.unpatch_model(unpatch_weights=True, destroy=True)`` — null
            handler refs, evict the model cache entry, free tensors.
         3. ``cache_dict.pop(key)`` — remove the patcher-cache entry itself.
-        4. ``gc.collect()`` — prompt the release of nulled references.
-        5. ``model_management.soft_empty_cache()`` — release cached VRAM.
+        4. :func:`release_model_bundles` — neutralize the model bundle
+           registered under ``key`` (ComfyUI's output cache still holds it
+           strongly, so the heavy fields must be nulled explicitly).
+        5. ``gc.collect()`` — prompt the release of nulled references.
+        6. ``model_management.soft_empty_cache()`` — release cached VRAM.
 
     Args:
         patcher: The ModelPatcher to evict (may be a dead object reference).
@@ -208,6 +302,13 @@ def evict_patcher(patcher, cache_dict: dict, key: str) -> list:
             cache_dict.pop(key, None)
     except Exception as e:
         errors.append(f"cache pop failed: {e}")
+
+    # ComfyUI's execution cache still holds the loader node's output bundle
+    # strongly, so popping the patcher entry alone leaks the weights.
+    try:
+        release_model_bundles(key)
+    except Exception as e:
+        errors.append(f"release_model_bundles failed: {e}")
 
     try:
         gc.collect()

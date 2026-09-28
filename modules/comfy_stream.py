@@ -6,9 +6,9 @@ modules are silently left on CPU by ``partially_unload`` and have no way back,
 producing "Input type CUDA... weight type CPU..." crashes (see plan
 2026-08-26-native-lowvram-streaming-transformers-tree.md §1).
 
-This module makes our tree fluent in that protocol, mirroring the proven
-ComfyUI-Raon-OpenTTS approach (native.py `_ComfyLinear/_ComfyEmbedding/
-_ComfyConv1d`):
+This module makes our tree fluent in that protocol. See
+``docs/2026-08-26-native-lowvram-streaming-transformers-tree.md` for the
+design:
 
 - ``make_streaming(cls, compute_fn)`` builds a subclass whose forward acquires
   weights through ``comfy.ops.cast_bias_weight(..., offloadable=True)``;

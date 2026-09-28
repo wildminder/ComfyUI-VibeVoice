@@ -13,7 +13,7 @@ import pytest
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 PYPROJECT_PATH = os.path.join(ROOT_DIR, "pyproject.toml")
-README_PATH = os.path.join(ROOT_DIR, "README.md")
+CHANGELOG_PATH = os.path.join(ROOT_DIR, "CHANGELOG.md")
 
 
 def _read(path: str) -> str:
@@ -34,7 +34,7 @@ def _parse_top_changelog_version(readme: str) -> str:
     # is the most recent release. Strip the leading 'v'.
     m = re.search(r"<summary>.*?<strong>\s*v([0-9]+\.[0-9]+\.[0-9]+)", readme, re.IGNORECASE | re.DOTALL)
     if not m:
-        raise AssertionError("Could not find a changelog version (vX.Y.Z) in README.md")
+        raise AssertionError("Could not find a changelog version (vX.Y.Z) in CHANGELOG.md")
     return m.group(1).strip()
 
 
@@ -46,14 +46,14 @@ class TestVersionSync:
         assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), f"Bad version: {version}"
 
     def test_readme_changelog_version_present(self):
-        version = _parse_top_changelog_version(_read(README_PATH))
+        version = _parse_top_changelog_version(_read(CHANGELOG_PATH))
         assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), f"Bad version: {version}"
 
     def test_versions_match(self):
         pyproject_version = _parse_pyproject_version(_read(PYPROJECT_PATH))
-        readme_version = _parse_top_changelog_version(_read(README_PATH))
+        readme_version = _parse_top_changelog_version(_read(CHANGELOG_PATH))
         assert pyproject_version == readme_version, (
             f"Version mismatch: pyproject.toml={pyproject_version} "
-            f"README changelog={readme_version}. Keep pyproject.toml as the "
-            f"source of truth and update the README changelog top entry."
+            f"CHANGELOG={readme_version}. Keep pyproject.toml as the "
+            f"source of truth and update the CHANGELOG top entry."
         )

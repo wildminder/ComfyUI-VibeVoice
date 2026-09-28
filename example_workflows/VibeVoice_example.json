@@ -1,57 +1,19 @@
 {
   "id": "b91265e5-1b03-4b63-8dc3-4abd9a030e08",
   "revision": 0,
-  "last_node_id": 14,
-  "last_link_id": 44,
+  "last_node_id": 37,
+  "last_link_id": 110,
   "nodes": [
-    {
-      "id": 3,
-      "type": "SaveAudio",
-      "pos": [
-        -1040,
-        -1130
-      ],
-      "size": [
-        270,
-        112
-      ],
-      "flags": {},
-      "order": 6,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "link": 27
-        }
-      ],
-      "outputs": [],
-      "properties": {
-        "Node name for S&R": "SaveAudio",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.52",
-        "ue_properties": {
-          "widget_ue_connectable": {
-            "filename_prefix": true,
-            "audioUI": true
-          },
-          "version": "7.0.1"
-        }
-      },
-      "widgets_values": [
-        "audio/VibeVoice"
-      ]
-    },
     {
       "id": 13,
       "type": "MarkdownNote",
       "pos": [
-        -1898.1748046875,
-        -1409.22314453125
+        -2700,
+        -1130
       ],
       "size": [
-        1035.619873046875,
-        211.96694946289062
+        640,
+        450
       ],
       "flags": {},
       "order": 0,
@@ -61,72 +23,169 @@
       "title": "Note",
       "properties": {},
       "widgets_values": [
-        "# ComfyUI-VibeVoice\n\nVibeVoice is a novel framework by Microsoft for generating expressive, long-form, multi-speaker conversational audio. It excels at creating natural-sounding dialogue, podcasts, and more, with consistent voices for up to 4 speakers.\n\n**✨ Key Features:**\n*   **Multi-Speaker TTS:** Generate conversations with up to 4 distinct voices in a single audio output.\n*   **High-Fidelity Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.\n*   **Hybrid Generation Mode:** Mix and match cloned voices with high-quality, zero-shot generated voices in the same script.\n*   **Flexible Scripting:** Use simple `[1]` tags or the classic `Speaker 1:` format to write your dialogue.\n*   **Advanced Attention Mechanisms:** Choose between `eager`, `sdpa`, `flash_attention_2`, and the high-performance `sage` attention for fine-tuned control over speed and compatibility.\n*   **Robust 4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage.\n*   **Automatic Model Management:** Models are downloaded automatically and managed efficiently by ComfyUI to save VRAM."
+        "# ComfyUI-VibeVoice\n\nVibeVoice is a novel framework by Microsoft for generating expressive, long-form, multi-speaker conversational audio. It excels at creating natural-sounding dialogue, podcasts, and more, with consistent voices for up to 4 speakers.\n\n**✨ Key Features:**\n*   **Multi-Speaker TTS:** Generate conversations with up to 4 distinct voices in a single audio output.\n*   **High-Fidelity Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.\n*   **Hybrid Generation Mode:** Mix and match cloned voices with high-quality, zero-shot generated voices in the same script.\n*   **Flexible Scripting:** Use simple `[1]` tags or the classic `Speaker 1:` format to write your dialogue.\n*   **Advanced Attention Mechanisms:** Choose between `eager`, `sdpa`, `flash_attention_2`, and the high-performance `sage` attention for fine-tuned control over speed and compatibility.\n*   **Robust 4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage.\n*   **Automatic Model Management:** Models are downloaded automatically and managed efficiently by ComfyUI to save VRAM.\n\n---\n\n## Nodes\n\n*   **VibeVoice TTS** — script + up to 4 voice inputs in, audio out.\n*   **VibeVoice ASR** — audio in, timestamped speaker segments out.\n*   **VibeVoice Load External Model** — optional. Loads a GGUF or quantized\n    safetensors file instead of the auto-downloaded one. Leave it unconnected to\n    use the standard model.\n*   **Load Audio** — reference clips for voice cloning. Any sample rate; it is\n    resampled for you.\n\nCloning = connect `Load Audio` to a speaker input. Generated voice = leave it\nempty."
       ],
-      "color": "#233",
-      "bgcolor": "#355"
+      "widgets_values_named": {
+        "text": "# ComfyUI-VibeVoice\n\nVibeVoice is a novel framework by Microsoft for generating expressive, long-form, multi-speaker conversational audio. It excels at creating natural-sounding dialogue, podcasts, and more, with consistent voices for up to 4 speakers.\n\n**✨ Key Features:**\n*   **Multi-Speaker TTS:** Generate conversations with up to 4 distinct voices in a single audio output.\n*   **High-Fidelity Voice Cloning:** Use any audio file (`.wav`, `.mp3`) as a reference for a speaker's voice.\n*   **Hybrid Generation Mode:** Mix and match cloned voices with high-quality, zero-shot generated voices in the same script.\n*   **Flexible Scripting:** Use simple `[1]` tags or the classic `Speaker 1:` format to write your dialogue.\n*   **Advanced Attention Mechanisms:** Choose between `eager`, `sdpa`, `flash_attention_2`, and the high-performance `sage` attention for fine-tuned control over speed and compatibility.\n*   **Robust 4-Bit Quantization:** Run the large language model component in 4-bit mode to significantly reduce VRAM usage.\n*   **Automatic Model Management:** Models are downloaded automatically and managed efficiently by ComfyUI to save VRAM.\n\n---\n\n## Nodes\n\n*   **VibeVoice TTS** — script + up to 4 voice inputs in, audio out.\n*   **VibeVoice ASR** — audio in, timestamped speaker segments out.\n*   **VibeVoice Load External Model** — optional. Loads a GGUF or quantized\n    safetensors file instead of the auto-downloaded one. Leave it unconnected to\n    use the standard model.\n*   **Load Audio** — reference clips for voice cloning. Any sample rate; it is\n    resampled for you.\n\nCloning = connect `Load Audio` to a speaker input. Generated voice = leave it\nempty."
+      },
+      "color": "#222",
+      "bgcolor": "#000"
     },
     {
-      "id": 4,
-      "type": "LoadAudio",
+      "id": 14,
+      "type": "MarkdownNote",
       "pos": [
-        -1900,
-        -1130
+        -2700,
+        -250
       ],
       "size": [
-        272.9800720214844,
-        136
+        620,
+        340
       ],
       "flags": {},
       "order": 1,
       "mode": 0,
       "inputs": [],
+      "outputs": [],
+      "title": "Note",
+      "properties": {},
+      "widgets_values": [
+        "## Models\n\nDownloaded automatically on first run, or place them manually in `/models/tts/VibeVoice`.\n\n| Model | Type | Size | Link |\n|---|---|---|---|\n| VibeVoice-1.5B | TTS | 3.0 GB | [HF](https://huggingface.co/microsoft/VibeVoice-1.5B) |\n| VibeVoice-7B | TTS | 17.4 GB | [HF](https://huggingface.co/vibevoice/VibeVoice-7B) |\n| VibeVoice-Realtime-0.5B | TTS (realtime) | 1.5 GB | [HF](https://huggingface.co/microsoft/VibeVoice-Realtime-0.5B) |\n| VibeVoice-ASR-HF | ASR | 17.4 GB | [HF](https://huggingface.co/microsoft/VibeVoice-ASR-HF) |\n\nQuantized weights also work: point **VibeVoice Load External Model** at a\nGGUF (`.gguf`) or a quantized safetensors file. GGUF keeps the raw blocks\nresident, so it uses less VRAM at some cost to speed."
+      ],
+      "widgets_values_named": {
+        "text": "## Models\n\nDownloaded automatically on first run, or place them manually in `/models/tts/VibeVoice`.\n\n| Model | Type | Size | Link |\n|---|---|---|---|\n| VibeVoice-1.5B | TTS | 3.0 GB | [HF](https://huggingface.co/microsoft/VibeVoice-1.5B) |\n| VibeVoice-7B | TTS | 17.4 GB | [HF](https://huggingface.co/vibevoice/VibeVoice-7B) |\n| VibeVoice-Realtime-0.5B | TTS (realtime) | 1.5 GB | [HF](https://huggingface.co/microsoft/VibeVoice-Realtime-0.5B) |\n| VibeVoice-ASR-HF | ASR | 17.4 GB | [HF](https://huggingface.co/microsoft/VibeVoice-ASR-HF) |\n\nQuantized weights also work: point **VibeVoice Load External Model** at a\nGGUF (`.gguf`) or a quantized safetensors file. GGUF keeps the raw blocks\nresident, so it uses less VRAM at some cost to speed."
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 24,
+      "type": "easy showAnything",
+      "pos": [
+        -1020,
+        -350
+      ],
+      "size": [
+        440,
+        360
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 100
+        }
+      ],
       "outputs": [
         {
-          "name": "AUDIO",
-          "type": "AUDIO",
-          "links": []
+          "name": "output",
+          "type": "*",
+          "links": null
         }
       ],
       "properties": {
-        "Node name for S&R": "LoadAudio",
-        "cnr_id": "comfy-core",
-        "ver": "0.3.52",
-        "ue_properties": {
-          "widget_ue_connectable": {
-            "audio": true,
-            "audioUI": true,
-            "upload": true
-          },
-          "version": "7.0.1"
-        }
+        "Node name for S&R": "easy showAnything"
       },
       "widgets_values": [
-        "male_rickmorty.mp3",
-        null,
-        null
-      ]
+        "[\n  {\n    \"speaker\": 0,\n    \"text\": \"I ask your forgiveness for the crimes he committed against your family. And I ask you not to judge a daughter by the sins of her father.\",\n    \"start\": 0.0,\n    \"end\": 9.01\n  }\n]"
+      ],
+      "widgets_values_named": {
+        "text": "[\n  {\n    \"speaker\": 0,\n    \"text\": \"I ask your forgiveness for the crimes he committed against your family. And I ask you not to judge a daughter by the sins of her father.\",\n    \"start\": 0.0,\n    \"end\": 9.01\n  }\n]"
+      }
+    },
+    {
+      "id": 17,
+      "type": "SaveAudioAdvanced",
+      "pos": [
+        -1040,
+        -1130
+      ],
+      "size": [
+        270,
+        150
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 51
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveAudioAdvanced"
+      },
+      "widgets_values": [
+        "audio/vibevoice",
+        "flac"
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "audio/vibevoice",
+        "format": "flac"
+      }
+    },
+    {
+      "id": 12,
+      "type": "MarkdownNote",
+      "pos": [
+        -2700,
+        -600
+      ],
+      "size": [
+        630,
+        250
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Note",
+      "properties": {},
+      "widgets_values": [
+        "### Scripting and Voice Modes\n\n#### Speaker Tagging\nYou can assign lines to speakers in two ways. Both are treated identically.\n\n*   **Modern Format (Recommended):** `[1] This is the first speaker.`\n*   **Classic Format:** `Speaker 1: This is the first speaker.`\n\nYou can also add an optional colon to the modern format (e.g., `[1]: ...`). The node handles all variations consistently.\n\n#### Hybrid Voice Generation\nThis is a powerful feature that lets you mix cloned voices and generated (zero-shot) voices.\n\n*   **To Clone a Voice:** Connect a `Load Audio` node to the speaker's input (e.g., `speaker_1_voice`).\n*   **To Generate a Voice:** Leave the speaker's input empty. The model will create a unique, high-quality voice for that speaker."
+      ],
+      "widgets_values_named": {
+        "text": "### Scripting and Voice Modes\n\n#### Speaker Tagging\nYou can assign lines to speakers in two ways. Both are treated identically.\n\n*   **Modern Format (Recommended):** `[1] This is the first speaker.`\n*   **Classic Format:** `Speaker 1: This is the first speaker.`\n\nYou can also add an optional colon to the modern format (e.g., `[1]: ...`). The node handles all variations consistently.\n\n#### Hybrid Voice Generation\nThis is a powerful feature that lets you mix cloned voices and generated (zero-shot) voices.\n\n*   **To Clone a Voice:** Connect a `Load Audio` node to the speaker's input (e.g., `speaker_1_voice`).\n*   **To Generate a Voice:** Leave the speaker's input empty. The model will create a unique, high-quality voice for that speaker."
+      },
+      "color": "#222",
+      "bgcolor": "#000"
     },
     {
       "id": 8,
       "type": "LoadAudio",
       "pos": [
-        -1901.10009765625,
-        -948.7998046875
+        -2020,
+        -610
       ],
       "size": [
-        274.080078125,
-        136
+        370,
+        170
       ],
       "flags": {},
-      "order": 2,
+      "order": 3,
       "mode": 0,
       "inputs": [],
       "outputs": [
         {
           "name": "AUDIO",
           "type": "AUDIO",
-          "links": []
+          "links": [
+            102
+          ]
         }
       ],
       "properties": {
@@ -144,84 +203,140 @@
       },
       "widgets_values": [
         "male_stewie.mp3",
-        null,
         null
-      ]
+      ],
+      "widgets_values_named": {
+        "audio": "male_stewie.mp3",
+        "upload": null
+      },
+      "color": "#332922",
+      "bgcolor": "#593930"
     },
     {
-      "id": 12,
-      "type": "MarkdownNote",
+      "id": 4,
+      "type": "LoadAudio",
       "pos": [
-        -1915.701904296875,
-        -762.380126953125
+        -2020,
+        -840
       ],
       "size": [
-        312.85455322265625,
-        292.8734130859375
-      ],
-      "flags": {},
-      "order": 3,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Note",
-      "properties": {},
-      "widgets_values": [
-        "### Scripting and Voice Modes\n\n#### Speaker Tagging\nYou can assign lines to speakers in two ways. Both are treated identically.\n\n*   **Modern Format (Recommended):** `[1] This is the first speaker.`\n*   **Classic Format:** `Speaker 1: This is the first speaker.`\n\nYou can also add an optional colon to the modern format (e.g., `[1]: ...`). The node handles all variations consistently.\n\n#### Hybrid Voice Generation\nThis is a powerful feature that lets you mix cloned voices and generated (zero-shot) voices.\n\n*   **To Clone a Voice:** Connect a `Load Audio` node to the speaker's input (e.g., `speaker_1_voice`).\n*   **To Generate a Voice:** Leave the speaker's input empty. The model will create a unique, high-quality voice for that speaker."
-      ],
-      "color": "#233",
-      "bgcolor": "#355"
-    },
-    {
-      "id": 14,
-      "type": "MarkdownNote",
-      "pos": [
-        -1048.3660888671875,
-        -960.8771362304688
-      ],
-      "size": [
-        280.797607421875,
-        487.02728271484375
+        370,
+        170
       ],
       "flags": {},
       "order": 4,
       "mode": 0,
       "inputs": [],
-      "outputs": [],
-      "title": "Note",
-      "properties": {},
-      "widgets_values": [
-        "## Models\n\nWill be downloaded on the first run, or download them manually and place them into the directory: /models/tts/VibeVoice\n\n| Model | Context Length | Generation Length |  Weight |\n|-------|----------------|----------|----------|\n| VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/microsoft/VibeVoice-1.5B) |\n| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/microsoft/VibeVoice-Large) |\n\n## Support \n\n- Don't know how to update PyTorch?\n- Need help with ComfyUI?\n- Need technical support?\n\n### Or do you just have questions? Then join the [@TokenDiffusion Hub](https://t.me/TokenDiff_hub) group\n\n### AI news [TokenDiffusion](https://t.me/TokenDiff)"
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            101,
+            110
+          ]
+        }
       ],
-      "color": "#233",
-      "bgcolor": "#355"
+      "properties": {
+        "Node name for S&R": "LoadAudio",
+        "cnr_id": "comfy-core",
+        "ver": "0.3.52",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "audio": true,
+            "audioUI": true,
+            "upload": true
+          },
+          "version": "7.0.1"
+        }
+      },
+      "widgets_values": [
+        "female_daenerys.mp3",
+        null
+      ],
+      "widgets_values_named": {
+        "audio": "female_daenerys.mp3",
+        "upload": null
+      },
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 23,
+      "type": "VibeVoiceLoadExternalModel",
+      "pos": [
+        -2020,
+        -1130
+      ],
+      "size": [
+        370,
+        210
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VibeVoice Model",
+          "type": "VIBEVOICE_MODEL",
+          "links": [
+            109
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VibeVoiceLoadExternalModel"
+      },
+      "widgets_values": [
+        "VibeVoice-7B-fp8_e4m3.safetensors",
+        "Auto-detect",
+        "sage",
+        false,
+        "auto"
+      ],
+      "widgets_values_named": {
+        "model_file": "VibeVoice-7B-fp8_e4m3.safetensors",
+        "config_name": "Auto-detect",
+        "attention_mode": "sage",
+        "quantize_llm_4bit": false,
+        "dtype": "auto"
+      },
+      "color": "#332922",
+      "bgcolor": "#593930"
     },
     {
       "id": 11,
       "type": "VibeVoiceTTS",
       "pos": [
-        -1570,
+        -1580,
         -1130
       ],
       "size": [
-        475.3999938964844,
-        662.9000244140625
+        500,
+        690
       ],
       "flags": {},
-      "order": 5,
+      "order": 7,
       "mode": 0,
       "inputs": [
+        {
+          "name": "external_model",
+          "shape": 7,
+          "type": "VIBEVOICE_MODEL",
+          "link": 109
+        },
         {
           "name": "speaker_1_voice",
           "shape": 7,
           "type": "AUDIO",
-          "link": null
+          "link": 101
         },
         {
           "name": "speaker_2_voice",
           "shape": 7,
           "type": "AUDIO",
-          "link": null
+          "link": 102
         },
         {
           "name": "speaker_3_voice",
@@ -238,10 +353,10 @@
       ],
       "outputs": [
         {
-          "name": "AUDIO",
+          "name": "Audio",
           "type": "AUDIO",
           "links": [
-            27
+            51
           ]
         }
       ],
@@ -270,27 +385,163 @@
         "VibeVoice-1.5B",
         "[1] I can't believe you did it again. I waited for two hours. Two hours! Not a single call, not a text. Do you have any idea how embarrassing that was, just sitting there alone?\n[2] Look, I know, I'm sorry, alright? Work was a complete nightmare. My boss dropped a critical deadline on me at the last minute. I didn't even have a second to breathe, let alone check my phone.\n",
         false,
-        "flash_attention_2",
+        "sage",
         1.3,
         10,
-        471935335072093,
+        471935335072090,
         "fixed",
         true,
         0.95,
         0.95,
         0,
+        false,
+        false,
+        "auto",
+        "auto",
+        "jp-Spk1_woman"
+      ],
+      "widgets_values_named": {
+        "model_name": "VibeVoice-1.5B",
+        "text": "[1] I can't believe you did it again. I waited for two hours. Two hours! Not a single call, not a text. Do you have any idea how embarrassing that was, just sitting there alone?\n[2] Look, I know, I'm sorry, alright? Work was a complete nightmare. My boss dropped a critical deadline on me at the last minute. I didn't even have a second to breathe, let alone check my phone.\n",
+        "quantize_llm_4bit": false,
+        "attention_mode": "sage",
+        "cfg_scale": 1.3,
+        "inference_steps": 10,
+        "seed": 471935335072090,
+        "control_after_generate": "fixed",
+        "do_sample": true,
+        "temperature": 0.95,
+        "top_p": 0.95,
+        "top_k": 0,
+        "max_new_tokens": false,
+        "force_offload": false,
+        "device": "auto",
+        "dtype": "auto",
+        "voice_preset": "jp-Spk1_woman"
+      },
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 32,
+      "type": "VibeVoiceASR",
+      "pos": [
+        -1580,
+        -360
+      ],
+      "size": [
+        500,
+        410
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 110
+        },
+        {
+          "name": "external_model",
+          "shape": 7,
+          "type": "VIBEVOICE_MODEL",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Transcription",
+          "type": "STRING",
+          "links": []
+        },
+        {
+          "name": "Segments (JSON)",
+          "type": "STRING",
+          "links": [
+            100
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VibeVoiceASR"
+      },
+      "widgets_values": [
+        "VibeVoice-ASR-HF",
+        "",
+        32768,
+        0,
+        1,
+        false,
+        1,
+        "cuda",
+        "auto",
+        "sage",
         false
       ],
+      "widgets_values_named": {
+        "model_name": "VibeVoice-ASR-HF",
+        "context_info": "",
+        "max_new_tokens": 32768,
+        "temperature": 0,
+        "top_p": 1,
+        "do_sample": false,
+        "num_beams": 1,
+        "device": "cuda",
+        "dtype": "auto",
+        "attention_mode": "sage",
+        "force_offload": false
+      },
       "color": "#232",
       "bgcolor": "#353"
     }
   ],
   "links": [
     [
-      27,
+      100,
+      32,
+      1,
+      24,
+      0,
+      "STRING"
+    ],
+    [
+      101,
+      4,
+      0,
+      11,
+      1,
+      "AUDIO"
+    ],
+    [
+      102,
+      8,
+      0,
+      11,
+      2,
+      "AUDIO"
+    ],
+    [
+      109,
+      23,
+      0,
       11,
       0,
-      3,
+      "VIBEVOICE_MODEL"
+    ],
+    [
+      110,
+      4,
+      0,
+      32,
+      0,
+      "AUDIO"
+    ],
+    [
+      51,
+      11,
+      0,
+      17,
       0,
       "AUDIO"
     ]
@@ -299,15 +550,15 @@
   "config": {},
   "extra": {
     "ds": {
-      "scale": 0.8264462809917354,
+      "scale": 0.6655679081632665,
       "offset": [
-        2015.701904296875,
-        1509.22314453125
+        2939.697342785918,
+        1302.2636820037412
       ]
     },
     "ue_links": [],
     "links_added_by_ue": [],
-    "frontendVersion": "1.26.11",
+    "frontendVersion": "1.53.6",
     "VHS_latentpreview": false,
     "VHS_latentpreviewrate": 0,
     "VHS_MetadataImage": true,

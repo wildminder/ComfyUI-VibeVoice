@@ -16,7 +16,7 @@ import os
 import sys
 import logging
 
-# ── Diffusers Compatibility Patch ─────────────────────────────────────
+# -- Diffusers Compatibility Patch
 # Apply before any imports that might trigger the vendored code.
 # The vendored dpm_solver.py imports from diffusers, which may fail if
 # huggingface_hub is too new (cached_download was removed).
@@ -38,11 +38,11 @@ except ImportError:
 
     huggingface_hub.cached_download = cached_download
 
-# ── Transformers Compatibility ────────────────────────────────────────
+# -- Transformers Compatibility
 # The vendored code uses a compatibility layer (src/vibevoice/modular/transformers_compat.py)
 # to handle different transformers versions (4.x vs 5.x).
 
-# ── Pytest Guard ──────────────────────────────────────────────────────
+# -- Pytest Guard 
 # Pytest forcefully imports __init__ out-of-context during test collection.
 # This causes relative imports to crash. Detect and exit early.
 if "pytest" in sys.modules:
@@ -51,7 +51,7 @@ if "pytest" in sys.modules:
 else:
     logger = logging.getLogger(__name__)
 
-    # ── Environment Detection ─────────────────────────────────────────
+    # -- Environment Detection
     try:
         import folder_paths
         _COMFYUI_AVAILABLE = True
@@ -59,7 +59,7 @@ else:
         folder_paths = None
         _COMFYUI_AVAILABLE = False
 
-    # ── Package Imports ───────────────────────────────────────────────
+    # -- Package Imports
     from .modules.model_info import (
         AVAILABLE_VIBEVOICE_MODELS, MODEL_CONFIGS, scan_vibevoice_models,
     )
@@ -67,7 +67,7 @@ else:
         register_vibevoice_folders, register_voice_preset_folder,
     )
 
-    # ── Logger Setup ──────────────────────────────────────────────────
+    # -- Logger Setup
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if not logger.hasHandlers():
@@ -76,12 +76,12 @@ else:
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
-    # ── sys.path Registration ─────────────────────────────────────────
+    # -- sys.path Registration
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if current_dir not in sys.path:
         sys.path.append(current_dir)
 
-    # ── ComfyUI Integration ───────────────────────────────────────────
+    # -- ComfyUI Integration
     if _COMFYUI_AVAILABLE:
         # Register tts folder path with ComfyUI
         VIBEVOICE_SUBDIR_NAME = "VibeVoice"
@@ -131,7 +131,7 @@ else:
 
         logger.info(f"Discovered VibeVoice models: {sorted(list(AVAILABLE_VIBEVOICE_MODELS.keys()))}")
 
-    # ── Exports ───────────────────────────────────────────────────────
+    # -- Exports ─
     from .vibevoice_nodes import comfy_entrypoint
 
     __all__ = ['comfy_entrypoint']

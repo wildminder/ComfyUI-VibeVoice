@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 _EMBEDDING_KEY_CANDIDATES = (
     "model.language_model.embed_tokens.weight",
     "tok_embeddings.weight",
-    # modern llama.cpp / quantui-rs name for the input embedding
+    # modern name for the input embedding
     "token_embd.weight",
 )
 
@@ -184,7 +184,7 @@ def fingerprint_weights(weight_path: str, gguf_reader=None) -> Optional[WeightsF
         try:
             from .gguf_quant import open_gguf_reader
 
-            # Tolerant open: quantui-rs files with sub-block-row conv
+            # Tolerant open: files with sub-block-row conv
             # tensors crash the stock reader; auto-detect must still see
             # the embedding fingerprint (header-only either way).
             reader = open_gguf_reader(weight_path)

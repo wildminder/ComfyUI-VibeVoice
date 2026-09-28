@@ -103,6 +103,27 @@ VibeVoiceCausalLMOutputWithPast = _modeling.VibeVoiceCausalLMOutputWithPast
 VibeVoiceGenerationOutput = _modeling.VibeVoiceGenerationOutput
 
 
+class _FakeTokenizer:
+    """Minimal stand-in for VibeVoiceTextTokenizer.
+
+    generate() resolves the four control-token ids off the tokenizer and
+    refuses to run without speech_start_id / speech_end_id /
+    speech_diffusion_id (modeling_vibevoice.py:802). The guard is correct —
+    the AR loop is token-constrained to exactly these ids — so the doubles
+    have to supply them. All four are distinct and inside the 100-row
+    embedding, so the constraint mask has somewhere to put them.
+    """
+
+    speech_start_id = 90
+    speech_end_id = 91
+    speech_diffusion_id = 92
+    eos_id = 93
+
+    def __init__(self):
+        self.bos_token_id = 89
+        self.eos_token_id = 93
+
+
 def _make_model(hidden_size: int = 64):
     """Build a VibeVoiceForConditionalGeneration with a fully mocked inner model.
 
@@ -113,6 +134,12 @@ def _make_model(hidden_size: int = 64):
     # Properly initialize the nn.Module base so parameters()/device work and
     # submodule assignment is allowed.
     torch.nn.Module.__init__(model)
+    # generate() samples its next control token with torch.multinomial, so
+    # without a seed each run walks a different AR path. Seed here so a
+    # failure reproduces; the test that must actually REACH the diffusion
+    # branch pins the control stream outright rather than relying on this
+    # (see TestGenerateSemanticGuard.test_generate_reaches_the_diffusion_branch).
+    torch.manual_seed(1234)
     # Minimal attributes used by forward()/generate()
     model.config = MagicMock()
     model.config.use_return_dict = True
@@ -120,6 +147,25 @@ def _make_model(hidden_size: int = 64):
     model.config.diffusion_head_config.ddpm_num_inference_steps = 10
     model.config.acoustic_tokenizer_config = MagicMock()
     model.config.acoustic_tokenizer_config.vae_dim = 64
+    # generate() derives its AR step budget from max_position_embeddings
+    # (modeling_vibevoice.py:829). Left as a MagicMock auto-attribute,
+    # int(mock) is 1, so max_new_tokens = 1 - seq_len goes negative, clamps
+    # to 1 and max_steps collapses to 1 — the loop then draws exactly ONE
+    # control token and the whole diffusion branch (acoustic_tokenizer.decode
+    # -> semantic_tokenizer.encode -> both connectors) is never reached, so
+    # the doubles below would be inert and the seed below meaningless. Give
+    # the real width the model ships with.
+    model.config.decoder_config.max_position_embeddings = 2048
+    # sample_speech_tokens draws `torch.randn(N, config.acoustic_vae_dim)`
+    # (modeling_vibevoice.py:672); a MagicMock width raises TypeError there.
+    model.config.acoustic_vae_dim = 64
+    # generate() reads the control-token ids from the tokenizer; without it the
+    # guard at modeling_vibevoice.py:802 raises before anything else runs.
+    model.tokenizer = _FakeTokenizer()
+    # The AR loop builds a (1, vocab_size) -inf mask that admits only the four
+    # control ids, so it needs the real vocabulary width of the embedding
+    # below (100 rows), not the MagicMock config's auto-attribute.
+    model.vocab_size = 100
 
     # Mock the inner VibeVoiceModel submodules
     inner = MagicMock()
@@ -168,8 +214,14 @@ def _make_model(hidden_size: int = 64):
 
     inner.language_model = MagicMock(side_effect=_lm_forward)
 
-    # Mock acoustic_tokenizer.decode to return a waveform tensor
-    inner.acoustic_tokenizer.decode = MagicMock(return_value=torch.randn(1, 24000))
+    # Mock acoustic_tokenizer.decode to return a waveform tensor. The batch
+    # dimension must follow the latents it is handed: the AR loop fans several
+    # samples into one diffusion step, and a fixed-width mock made the encode /
+    # connector chain disagree with `sample_indices` on the runs where that
+    # happened.
+    inner.acoustic_tokenizer.decode = MagicMock(
+        side_effect=lambda latents, **kwargs: torch.randn(latents.shape[0], 24000)
+    )
 
     # Mock prediction_head forward to return noise of correct shape
     def _pred_head(noisy, timesteps, condition):
@@ -178,12 +230,83 @@ def _make_model(hidden_size: int = 64):
 
     inner.prediction_head.side_effect = _pred_head
 
-    # Mock noise_scheduler.step to return prev_sample
-    class _StepResult:
-        prev_sample = torch.randn(1, 64)
-    inner.noise_scheduler.step = MagicMock(return_value=_StepResult())
+    # Mock noise_scheduler.step to return prev_sample. The width must follow
+    # the `speech` tensor the diffusion loop hands it: sample_speech_tokens
+    # halves a 2N batch and returns `speech[:N]`, so a fixed 1-row prev_sample
+    # shrinks the latent to zero rows and the AR loop then indexes an empty
+    # audio chunk.
+    def _sched_step(eps, t, speech):
+        return types.SimpleNamespace(prev_sample=torch.randn_like(speech))
+
+    inner.noise_scheduler.step = MagicMock(side_effect=_sched_step)
+
+    # generate()'s diffusion step feeds each decoded audio chunk back through
+    # the semantic tokenizer and both connectors. Left as bare MagicMocks they
+    # return MagicMocks, which cannot be assigned into a real embedding tensor
+    # ("can't assign a MagicMock to a torch.FloatTensor"). The doubles only
+    # escaped this because the token-constrained sampling sometimes terminates
+    # before a diffusion step happens — so give the three real shapes, and the
+    # AR loop no longer depends on which token it happened to draw.
+    inner.semantic_tokenizer = MagicMock()
+
+    def _semantic_encode(audio, **kwargs):
+        n = audio.shape[0]
+        return types.SimpleNamespace(mean=torch.randn(n, 128, 4))
+
+    inner.semantic_tokenizer.encode = MagicMock(side_effect=_semantic_encode)
+    inner.acoustic_connector = MagicMock(
+        side_effect=lambda f: torch.randn(f.shape[0], hidden_size)
+    )
+    inner.semantic_connector = MagicMock(
+        side_effect=lambda f: torch.randn(f.shape[0], hidden_size)
+    )
 
     return model
+
+
+def _force_control_token(model, token_id: int):
+    """Make the token-constrained AR loop always draw ``token_id``.
+
+    generate() builds a (1, vocab_size) -inf mask admitting only the speech
+    control ids, then argmaxes the masked logits (do_sample=False). Swapping in
+    a head that returns a constant logit vector with one entry above the rest
+    therefore pins the control stream without touching the code under test, so
+    a test can reach a specific AR branch deterministically instead of hoping
+    the RNG lands there.
+
+    A constant vector rather than a weight row: pointing a real Linear's row at
+    ``token_id`` makes its logit ``sum(hidden)``, which goes negative whenever
+    the hidden state does — and then another valid control id wins the argmax
+    and the branch is skipped intermittently, which is the very flakiness this
+    exists to remove.
+    """
+
+    class _FixedHead(nn.Module):
+        def __init__(self, vocab_size, forced):
+            super().__init__()
+            self.vocab_size = vocab_size
+            self.forced = forced
+
+        def forward(self, hidden):
+            logits = torch.zeros(
+                hidden.shape[0], self.vocab_size, dtype=hidden.dtype, device=hidden.device
+            )
+            logits[:, self.forced] = 1.0
+            return logits
+
+    model.lm_head = _FixedHead(model.vocab_size, token_id)
+
+
+def _ar_step_budget(model, seq_len: int = 4, max_length_times: int = 2) -> int:
+    """The AR loop's own step budget, recomputed from generate()'s arithmetic.
+
+    ``max_new_tokens`` is derived from max_position_embeddings and
+    ``max_steps = min(max_new_tokens, max_length_times * seq_len)``
+    (modeling_vibevoice.py:829-837), with a floor of 1.
+    """
+    max_new_tokens = int(model.config.decoder_config.max_position_embeddings) - seq_len
+    max_new_tokens = max(1, min(max_new_tokens, 8192))
+    return max(1, min(max_new_tokens, max_length_times * seq_len))
 
 
 class TestForwardSemanticConnectorGuard:
@@ -270,6 +393,56 @@ class TestGenerateSemanticGuard:
             return_speech=True,
         )
         model.model.noise_scheduler.set_timesteps.assert_called_with(7)
+
+    def test_generate_reaches_the_diffusion_branch(self):
+        """The generate() doubles must actually be exercised, not merely defined.
+
+        Every other test in this class can pass while the whole diffusion
+        branch is dead: the AR loop only samples a latent when it draws
+        ``speech_diffusion_id``, and whether it does depends on the RNG state
+        at the first multinomial draw. ``_make_model`` seeds the RNG, but each
+        test then draws its own ``torch.randint`` inputs first, so the draw
+        order — and therefore whether the diffusion branch runs at all — is an
+        accident of how many random numbers the test consumed before calling
+        generate(). That is how this file flaked: the doubles were correct but
+        unverified, and the shape errors they were written to prevent only
+        surfaced on the runs that happened to reach them.
+
+        A lucky seed would only make that accident reproducible rather than
+        removed — the draw would still shift under any torch whose
+        multinomial consumes the stream differently. So this test removes the
+        sampling from the equation: it forces the control stream with a fixed
+        lm_head and turns sampling off, which makes the AR path a pure
+        function of the code under test.
+        """
+        model = _make_model()
+        _force_control_token(model, model.tokenizer.speech_diffusion_id)
+        out = model.generate(
+            input_ids=torch.randint(0, 100, (1, 4)),
+            acoustic_input_mask=torch.zeros(1, 4, dtype=torch.bool),
+            semantic_speech_tensors=None,
+            cfg_scale=1.3,
+            inference_steps=5,
+            do_sample=False,
+            return_speech=True,
+        )
+        inner = model.model
+        # One diffusion step per AR step, and the loop runs to its budget.
+        assert inner.acoustic_tokenizer.decode.call_count == _ar_step_budget(model), (
+            "expected every AR step to take the forced speech_diffusion_id "
+            "branch; the forced control stream is not reaching the loop"
+        )
+        # The semantic feedback is the part that assigns into a real tensor:
+        # next_inputs_embeds[diffusion_idx] = acoustic + semantic
+        # (modeling_vibevoice.py:1019), which a bare MagicMock cannot satisfy.
+        assert inner.semantic_tokenizer.encode.call_count == inner.acoustic_tokenizer.decode.call_count
+        assert inner.acoustic_connector.call_count == inner.acoustic_tokenizer.decode.call_count
+        assert inner.semantic_connector.call_count == inner.acoustic_tokenizer.decode.call_count
+        # decode is batch-faithful, so the assembled waveform has one chunk
+        # per diffusion step and a non-degenerate length.
+        assert out.speech_outputs[0] is not None
+        assert out.speech_outputs[0].dim() == 1
+        assert out.speech_outputs[0].shape[0] == inner.acoustic_tokenizer.decode.call_count * 24000
 
 
 # Minimal stand-in for VibeVoiceTokenizerEncoderOutput (dataclass with .mean

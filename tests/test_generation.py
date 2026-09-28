@@ -248,12 +248,35 @@ class TestLoadFromExternal:
         VIBEVOICE_PATCHER_CACHE.clear()
 
     def test_load_from_external_missing_model_raises(self):
-        """Bundle without 'model' → ValueError."""
+        """Bundle without 'model' and without a source to rebuild → ValueError.
+
+        A released bundle normally recovers via ``source_path``; this covers
+        the unrecoverable case.
+        """
         bundle = self._make_bundle()
         bundle["model"] = None
+        bundle["source_path"] = ""
 
         with pytest.raises(ValueError, match="model"):
             load_vibevoice_from_external(bundle, device="cpu")
+
+    def test_load_from_external_released_model_rebuilds(self):
+        """A released bundle is rebuilt from its recorded source."""
+        bundle = self._make_bundle()
+        bundle["model"] = None
+        rebuilt = {
+            "model": MagicMock(), "processor": MagicMock(),
+            "model_name": "ExtModel",
+        }
+        with patch(
+            "ComfyUI_VibeVoice.modules.external_loader."
+            "load_external_vibevoice_model", return_value=rebuilt
+        ) as reload_:
+            _patcher, model, processor = load_vibevoice_from_external(
+                bundle, device="cpu"
+            )
+        assert model is rebuilt["model"] and processor is rebuilt["processor"]
+        assert reload_.call_args[0][0] == "/fake/model.safetensors"
 
     def test_load_from_external_missing_processor_raises(self):
         """Bundle without 'processor' → ValueError."""

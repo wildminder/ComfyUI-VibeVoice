@@ -114,15 +114,80 @@ def _u(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(torch.uint8) if tensor.dtype != torch.uint8 else tensor
 
 
-def _f16_scale(bytes_u8: torch.Tensor) -> torch.Tensor:
-    """Interpret a (n, 2) uint8 field as float16, widen to float32."""
-    return bytes_u8.contiguous().view(torch.float16).to(torch.float32)
+# Shift constants for the k-quant nibble/bit unpacking, memoised PER DEVICE.
+# Hygiene only: these used to be re-materialised (and re-uploaded H2D) on
+# every single dequant call. They live on the q4_k/q5_k/q6_k path ONLY — the
+# q8_0 kernel below never touches them, so this is not part of any Q8_0
+# speedup. A plain module-level CPU tensor would break (or silently sync) on
+# CUDA blocks, hence the per-device memo.
+_SHIFT_SPECS = {
+    "nibble2": (0, 4),          # q4_k low nibbles, q5_k ql
+    "bits8": tuple(range(8)),   # q5_k high-bit plane
+    "shifts2": (0, 4),          # q6_k ql
+    "shifts4": (0, 2, 4, 6),    # q6_k qh
+}
+_SHIFT_CACHE: dict[tuple[str, torch.device], torch.Tensor] = {}
 
 
-def _dequant_q8_0(blocks: torch.Tensor) -> torch.Tensor:
+def _shift_const(name: str, device: torch.device) -> torch.Tensor:
+    """Broadcastable (1, 1, n, 1) uint8 shift vector, cached per device."""
+    key = (name, device)
+    cached = _SHIFT_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(
+            _SHIFT_SPECS[name], dtype=torch.uint8, device=device
+        ).reshape(1, 1, -1, 1)
+        _SHIFT_CACHE[key] = cached
+    return cached
+
+
+def _reinterpret(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Reinterpret ``t``'s bytes as ``dtype``, copying only if forced to.
+
+    ``view(dtype)`` requires stride 1 in the LAST dimension — nothing more.
+    A ``torch.split`` slice of a contiguous block tensor (``strides=(34, 1)``)
+    already satisfies that, so the ``.contiguous()`` these call sites used to
+    do was a full weight-sized copy that was immediately discarded.
+
+    That matters because ``dequantize_blocks`` runs once per GGUFLinear
+    FORWARD, not once per load: 151k times for a 7B q8_0 generate. The copy
+    was ~15% of the dequant's time (3.80 -> 3.26 ms across four decoder
+    shapes), for nothing.
+
+    The fallback keeps this safe for a caller whose last dim genuinely is not
+    stride-1, where ``view`` would raise.
+    """
+    if t.stride(-1) != 1:
+        t = t.contiguous()
+    return t.view(dtype)
+
+
+def _f16_scale(
+    bytes_u8: torch.Tensor, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Interpret a (n, 2) uint8 field as float16, widen to ``dtype``."""
+    return _reinterpret(bytes_u8, torch.float16).to(dtype)
+
+
+def _dequant_q8_0(
+    blocks: torch.Tensor, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Q8_0: ``x * d``.
+
+    The int8 payload (-128..127) is exact in fp32, and the fp16 scale widens
+    to fp32 losslessly, so computing in fp32 is EXACT — the only rounding is
+    the single one the caller applies at the final ``.to(out_dtype)``.
+
+    ``out_dtype`` is accepted (the k-quant kernels take the same signature so
+    callers can pass a compute dtype unconditionally) but is deliberately
+    ignored here too, for the reason recorded at ``_NATIVE_DTYPES`` below:
+    computing the product in a low-precision dtype rounds the scale AND the
+    product, and for a model whose utterance length is decided by a bare EOS
+    sample that divergence is audible in the output duration.
+    """
     d, x = torch.split(blocks, [2, 32], dim=-1)
-    d = _f16_scale(d)
-    x = x.contiguous().view(torch.int8).to(torch.float32)
+    d = _f16_scale(d, out_dtype)
+    x = _reinterpret(x, torch.int8).to(out_dtype)
     return x * d
 
 
@@ -146,7 +211,15 @@ def _get_scale_min_k(scales_u8: torch.Tensor):
 _QK_K = 256
 
 
-def _dequant_q4_k(blocks: torch.Tensor) -> torch.Tensor:
+def _dequant_q4_k(
+    blocks: torch.Tensor, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    # WHY the unused out_dtype: the k-quant kernels accept the same signature
+    # as _dequant_q8_0 so callers can pass a compute dtype unconditionally,
+    # but they IGNORE it and keep their fp32 math. Their 6-bit scale/min
+    # unpacking (d*q - dm) has no independent accuracy measurement in a
+    # low-precision compute dtype, so widening the numerics change is
+    # deliberately confined to the measured Q8_0 case.
     n = blocks.shape[0]
     d_b, rest = torch.split(blocks, [2, 142], dim=-1)
     dmin_b, rest = torch.split(rest, [2, 140], dim=-1)
@@ -162,13 +235,16 @@ def _dequant_q4_k(blocks: torch.Tensor) -> torch.Tensor:
 
     # (n, 8, 1, 32) >> [0, 4] -> nibbles
     qs = qs.reshape(n, -1, 1, 32)
-    shifts = torch.tensor([0, 4], dtype=torch.uint8, device=blocks.device).reshape(1, 1, 2, 1)
+    shifts = _shift_const("nibble2", blocks.device)
     qs = ((qs >> shifts) & 0x0F).reshape(n, -1, 32).to(torch.float32)
 
     return (d * qs - dm).reshape(n, _QK_K)
 
 
-def _dequant_q5_k(blocks: torch.Tensor) -> torch.Tensor:
+def _dequant_q5_k(
+    blocks: torch.Tensor, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    # out_dtype intentionally ignored — see _dequant_q4_k for the why.
     n = blocks.shape[0]
     d_b, rest = torch.split(blocks, [2, 174], dim=-1)
     dmin_b, rest = torch.split(rest, [2, 172], dim=-1)
@@ -183,8 +259,8 @@ def _dequant_q5_k(blocks: torch.Tensor) -> torch.Tensor:
     d = (d * sc.to(torch.float32)).reshape(n, -1, 1)
     dm = (dmin * mn.to(torch.float32)).reshape(n, -1, 1)
 
-    shifts4 = torch.tensor([0, 4], dtype=torch.uint8, device=blocks.device).reshape(1, 1, 2, 1)
-    shifts8 = torch.tensor([i for i in range(8)], dtype=torch.uint8, device=blocks.device).reshape(1, 1, 8, 1)
+    shifts4 = _shift_const("nibble2", blocks.device)
+    shifts8 = _shift_const("bits8", blocks.device)
 
     ql = ((qs.reshape(n, -1, 1, 32) >> shifts4) & 0x0F).reshape(n, -1, 32)
     qh = ((qh.reshape(n, -1, 1, 32) >> shifts8) & 0x01).reshape(n, -1, 32)
@@ -193,7 +269,10 @@ def _dequant_q5_k(blocks: torch.Tensor) -> torch.Tensor:
     return (d * q - dm).reshape(n, _QK_K)
 
 
-def _dequant_q6_k(blocks: torch.Tensor) -> torch.Tensor:
+def _dequant_q6_k(
+    blocks: torch.Tensor, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    # out_dtype intentionally ignored — see _dequant_q4_k for the why.
     n = blocks.shape[0]
     ql_b, rest = torch.split(blocks, [128, 82], dim=-1)
     qh_b, rest = torch.split(rest, [64, 18], dim=-1)
@@ -203,8 +282,8 @@ def _dequant_q6_k(blocks: torch.Tensor) -> torch.Tensor:
     d = _f16_scale(d_b)
     d = (d * scales).reshape(n, _QK_K // 16, 1)
 
-    shifts2 = torch.tensor([0, 4], dtype=torch.uint8, device=blocks.device).reshape(1, 1, 2, 1)
-    shifts4 = torch.tensor([0, 2, 4, 6], dtype=torch.uint8, device=blocks.device).reshape(1, 1, 4, 1)
+    shifts2 = _shift_const("shifts2", blocks.device)
+    shifts4 = _shift_const("shifts4", blocks.device)
 
     ql = ((ql_b.reshape(n, -1, 1, 64) >> shifts2) & 0x0F).reshape(n, -1, 32)
     qh = ((qh_b.reshape(n, -1, 1, 32) >> shifts4) & 0x03).reshape(n, -1, 32)
@@ -228,6 +307,52 @@ def _kernel_for(ggml_type):
     if ggml_type == T.Q6_K:
         return _dequant_q6_k
     return None
+
+
+# GGML types whose dequant math is PROVEN safe to run in the activation dtype.
+#
+# This was `frozenset({_T.Q8_0})` and was REVERTED to empty on 2026-09-28. It
+# bought ~1.5x on the dequant kernel and cost numerical fidelity that turned
+# out to be user-visible: computing `x * d` in the OUTPUT dtype rounds twice
+# instead of once (the fp16 scale is rounded to bf16 on the way in, then the
+# product is rounded again), whereas the fp32 round-trip rounds exactly once
+# at the final `.to(out_dtype)`. Measured on a real oracle-quantized 4096x3584
+# Q8_0 tensor, comparing the two paths' STORED bf16 weights (which is what the
+# model actually consumes): 22.7% of elements differ, mean rel 1.23e-3, p99
+# rel 7.5e-3.
+#
+# Why that matters here specifically: VibeVoice's standard TTS path samples
+# from ~5 valid tokens and stops ONLY on a sampled EOS token — there is no EOS
+# confidence floor, no minimum duration, no repetition guard. A ~1e-3 logit
+# shift therefore does not merely perturb the waveform, it flips draws near the
+# end of the utterance and moves the OUTPUT DURATION by tens of seconds. That
+# is exactly the 21s -> 24-27s regression reported against the q8_0 7B
+# checkpoint. A load-time micro-optimization is not worth that.
+#
+# The gate is kept (rather than deleted) so re-evaluating it is a one-token
+# change — but only with an END-TO-END output check, never a tolerance check.
+# A tolerance test cannot see this class of regression: see
+# tests/test_gguf_dequant_perf.py, which now pins bit-exactness instead.
+#
+# COST, measured (RTX 4070 Ti SUPER, q8_0, fp32 compute vs the bf16 path over
+# 3584x3584 / 5120x3584 / 11008x3584 / 18944x3584): 2.53 ms -> 3.80 ms, i.e.
+# fp32 compute is ~1.5x SLOWER. An earlier version of this comment claimed the
+# difference was "paid once at load". THAT WAS WRONG, and the number above is
+# why it matters: GGUFLinear.forward dequantizes the whole weight on EVERY
+# call, so a 7B q8_0 generate runs this kernel 151382 times. There is no
+# cache. The honest framing is that this choice costs 1.5x on the dequant
+# kernel and buys bit-exact weights, and that the real fix for the speed is a
+# dequant CACHE (which makes the choice a one-time cost) — not picking a
+# different dtype here.
+_NATIVE_DTYPES: frozenset = frozenset()
+_NATIVE_COMPUTE_DTYPES = frozenset({torch.bfloat16, torch.float16})
+
+
+def _compute_dtype_for(ggml_type, out_dtype: torch.dtype) -> torch.dtype:
+    """Dtype the kernel itself should compute in (fp32 unless proven safe)."""
+    if ggml_type in _NATIVE_DTYPES and out_dtype in _NATIVE_COMPUTE_DTYPES:
+        return out_dtype
+    return torch.float32
 
 
 def dequantize_blocks(raw: torch.Tensor, ggml_type, out_dtype: torch.dtype, shape) -> torch.Tensor:
@@ -256,7 +381,8 @@ def dequantize_blocks(raw: torch.Tensor, ggml_type, out_dtype: torch.dtype, shap
             f"{ggml_type.name} type size {ts}"
         )
     blocks = raw.reshape(-1, ts)
-    out = kernel(blocks)
+    out = kernel(blocks, _compute_dtype_for(ggml_type, out_dtype))
+    # No-op (returns self) when the kernel already produced out_dtype.
     return out.reshape(shape).to(out_dtype)
 
 
@@ -288,7 +414,7 @@ def dequantize_dense(raw_or_view: torch.Tensor, ggml_type) -> torch.Tensor:
 # 1b. Tolerant reader open (flat-block recovery)
 # ====================================================================
 
-# Files seen in the wild (e.g. quantui-rs conversions) quantize small-kernel
+# Files seen in the wild (e.g. third-party conversions) quantize small-kernel
 # conv weights — whose row (kernel-size) is BELOW the block size — as a flat
 # C-order pool of whole blocks. The bytes are self-consistent, but gguf-py's
 # GGUFReader validates each row against the block size at OPEN time and
@@ -318,8 +444,8 @@ def open_gguf_reader(weight_path):
 
     Tries the stock :class:`gguf.GGUFReader` first; every spec-conformant
     file takes that path unchanged. When the stock reader rejects the file
-    because a quantized tensor's row is below its block size (quantui-rs
-    writes conv kernels as a flat pool of whole blocks), re-opens with a
+    because a quantized tensor's row is below its block size (some converters
+    write conv kernels as a flat pool of whole blocks), re-opens with a
     byte-shape mapping that flattens ONLY those tensors. Tensor ``.shape``
     still reports the header dims, so key mapping / logical shapes / config
     detection are unaffected; ``.data`` for the affected tensors is a flat
@@ -365,8 +491,10 @@ def open_gguf_reader(weight_path):
 # 1c. Dequantize a reader tensor (dense fallback for non-Linear targets)
 # ====================================================================
 
-def dequantize_reader_tensor(reader_tensor) -> torch.Tensor:
-    """Dequantize one reader tensor to a LOGICAL-shaped fp32 torch tensor.
+def dequantize_reader_tensor(
+    reader_tensor, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Dequantize one reader tensor to a LOGICAL-shaped torch tensor.
 
     Used for quantized GGUF tensors that cannot become quant-resident
     ``GGUFLinear`` weights (embeddings, conv heads): they are materialized
@@ -375,10 +503,16 @@ def dequantize_reader_tensor(reader_tensor) -> torch.Tensor:
 
     Handles BOTH byte layouts the reader may hand back:
     * row-mapped (spec-conformant): blocks shaped ``(..., n_blocks*ts)``;
-    * flat pool (quantui-rs recovery): a single ``(n_bytes,)`` row whose
+    * flat pool (recovery): a single ``(n_bytes,)`` row whose
       block count follows from the logical element count.
 
-    Returns an owned CPU tensor (the mmap view is copied), fp32.
+    Returns an owned CPU tensor (the mmap view is copied).
+
+    Args:
+        reader_tensor: a tensor from an open ``GGUFReader``.
+        dtype: target dtype for the result. fp32 by default. Callers that
+            install into a model should pass the destination parameter dtype,
+            so the fp32 intermediate is never materialized at all.
     """
     import numpy as np
 
@@ -391,7 +525,7 @@ def dequantize_reader_tensor(reader_tensor) -> torch.Tensor:
         if t.tensor_type == _T.BF16 and tensor.dtype == torch.uint8:
             tensor = tensor.view(torch.bfloat16)
         shape = tuple(int(s) for s in reversed(t.shape))
-        return tensor.reshape(shape).clone().to(torch.float32)
+        return tensor.reshape(shape).clone().to(dtype)
 
     if t.tensor_type not in SUPPORTED_GGML_TYPES:
         raise UnsupportedGGMLType(t.tensor_type, f"{t.name}")
@@ -410,7 +544,7 @@ def dequantize_reader_tensor(reader_tensor) -> torch.Tensor:
     if raw.dtype != torch.uint8:
         raw = raw.view(torch.uint8)
     shape = tuple(int(s) for s in reversed(t.shape))
-    return dequantize_blocks(raw, t.tensor_type, torch.float32, shape)
+    return dequantize_blocks(raw, t.tensor_type, dtype, shape)
 
 
 @dataclass
@@ -441,7 +575,7 @@ class GGUFTensor:
         import numpy as np
 
         data = reader_tensor.data
-        # Flat-block recovery (quantui-rs files): a tensor whose rows are
+        # Flat-block recovery (non-spec files): a tensor whose rows are
         # below the block size was opened with a FLAT byte shape; the raw
         # pool is exactly what the resident Linear stores either way, and
         # dequantize_blocks() reshapes by element count, so nothing here
@@ -480,6 +614,48 @@ class GGUFTensor:
 # ====================================================================
 
 
+# Forward-path instrumentation: how many GGUFLinear forwards took the resident
+# fast path vs the streamed (hook/offload) path. Zeroed once per external load
+# by modules/external_loader.py and reported at the end of a generation run by
+# log_gguf_forward_counters(), so a slow run can be attributed from the log.
+_FORWARD_COUNTERS = {"fast": 0, "streamed": 0}
+
+
+def gguf_forward_counters() -> dict:
+    """Snapshot of the per-load GGUFLinear forward counters."""
+    return dict(_FORWARD_COUNTERS)
+
+
+def reset_gguf_forward_counters() -> None:
+    """Zero both GGUFLinear forward counters (used at load time / between tests)."""
+    _FORWARD_COUNTERS["fast"] = 0
+    _FORWARD_COUNTERS["streamed"] = 0
+
+
+def log_gguf_forward_counters(tag: str) -> None:
+    """Log the per-load GGUF forward counters AFTER a generation run.
+
+    WHY this is not emitted at load time: the counters only describe something
+    once forwards have run, so a readout taken inside
+    ``load_external_vibevoice_model`` is structurally always ``fast=0
+    streamed=0`` — indistinguishable from the "hook-poisoning ruled out"
+    answer, and actively misleading. The loaders now only reset the counters;
+    the generation paths report them at the end of the run, where the numbers
+    describe the work that was actually done.
+
+    No-ops when no GGUFLinear forward happened, so non-GGUF models do not get
+    a meaningless line per generation.
+    """
+    counters = gguf_forward_counters()
+    if counters["fast"] == 0 and counters["streamed"] == 0:
+        return
+    logger.info(
+        "GGUF forward diagnostics: stage=%s gguf_forward_fast=%d "
+        "gguf_forward_streamed=%d",
+        tag, counters["fast"], counters["streamed"],
+    )
+
+
 class GGUFLinear(torch.nn.Module):
     """Drop-in ``nn.Linear`` replacement holding RAW GGML block bytes.
 
@@ -497,6 +673,10 @@ class GGUFLinear(torch.nn.Module):
     # Native comfy streaming (plan 2026-08-26): core may offload this module;
     # forward pulls raw bytes back through cast_bias_weight.
     comfy_cast_weights = True
+    # Read-only DEFAULT, kept at class level so core's `hasattr(m,
+    # "weight_function")` checks and our own getattr(..., None) keep their
+    # current meaning for an instance that never built its own list. Every
+    # instance shadows these in __init__ — see the WHY there.
     weight_function = []
     bias_function = []
 
@@ -515,6 +695,14 @@ class GGUFLinear(torch.nn.Module):
             torch.nn.Parameter(torch.empty(out_features), requires_grad=False)
             if bias else None
         )
+        # Per-INSTANCE hook lists (defensive). WHY: core MUTATES this
+        # attribute — comfy/model_patcher.py:1022 rebinds it per instance and
+        # :1057 / :1227 APPEND to whatever list it finds. A class-level list
+        # is shared by every GGUFLinear in the model, so one module's append
+        # would force the slow streamed path on ALL of them. This is a latent
+        # hazard fix, NOT the measured cause of any user-visible slowdown.
+        self.weight_function = []
+        self.bias_function = []
         # Documentation/core-interop marker: raw uint8 blocks are moved,
         # never recast (our streamed forward handles pulls itself).
         self.weight_comfy_model_dtype = torch.uint8
@@ -552,7 +740,12 @@ class GGUFLinear(torch.nn.Module):
 
         wf = getattr(self, "weight_function", None)
         if (self.weight.device != x.device) or (wf and len(wf) > 0):
+            # The streamed branch counts itself in _forward_streamed, so the
+            # "streamed" total stays exact whether it is reached from here
+            # or called directly. Counting it here too would double-count.
             return self._forward_streamed(x)
+
+        _FORWARD_COUNTERS["fast"] += 1
 
         w = dequantize_blocks(
             self.weight, self.ggml_type, x.dtype,
@@ -571,6 +764,7 @@ class GGUFLinear(torch.nn.Module):
         blocks. Core's own partial-unload contract attaches LowVramPatch
         callables whose job is exactly "move tensor to device, keep dtype";
         we honor those directly."""
+        _FORWARD_COUNTERS["streamed"] += 1
         w_raw = self._pull_to_device(self.weight, x.device)
         bias = self.bias
         if bias is not None and bias.device != x.device:
@@ -582,6 +776,13 @@ class GGUFLinear(torch.nn.Module):
         return torch.nn.functional.linear(x, w, bias)
 
     def _pull_to_device(self, tensor, device):
+        # A fully resident tensor with no hooks is already where it needs to
+        # be: return the SAME object without touching `.to()`. Any `.to()` on
+        # a resident uint8 weight would be a no-op copy at best and a
+        # realloc at worst.
+        fns = getattr(self, "weight_function", None)
+        if not fns and tensor.device == device:
+            return tensor
         if tensor.device != device:
             tensor = tensor.to(device)
         # Honor core's LowVramPatch-style callables (move-to-device,
@@ -639,7 +840,7 @@ class UnmappedKeyError(ValueError):
 
 _LLAMACPP_TO_HF = {
     "tok_embeddings.weight": "model.language_model.embed_tokens.weight",
-    # modern llama.cpp / quantui-rs name for the input embedding
+    # modern name for the input embedding
     "token_embd.weight": "model.language_model.embed_tokens.weight",
     "output.weight": "lm_head.weight",
     "output_norm.weight": "model.language_model.norm.weight",
@@ -672,7 +873,7 @@ def detect_key_scheme(keys) -> str:
     'llamacpp': names follow llama.cpp conversion conventions
     ('blk.N.', 'tok_embeddings.', 'output.').
     'mixed': both conventions appear. Real converters do produce these
-    (quantui-rs keeps HF names for everything but the lm_head, which it
+    (some exporters keep HF names for everything but the lm_head, which they
     renames llama.cpp-style to 'output.weight'); map_keys resolves such
     files with a majority vote instead of rejecting them.
     """
@@ -722,7 +923,7 @@ def map_keys(keys, scheme: str = None) -> dict:
         scheme: Force a scheme; auto-detected when omitted. A 'mixed'
             census is resolved by majority vote — the dominant convention
             is kept and the minority keys are mapped through the other
-            convention's alias table (quantui-rs 7B exports are 1204 HF
+            convention's alias table (some 7B exports are 1204 HF
             keys + llamacpp 'output.weight'). An ambiguous 50/50 mix or
             an unknown minority key still raises.
 
@@ -753,7 +954,7 @@ def map_keys(keys, scheme: str = None) -> dict:
     for k in keys:
         if scheme == "hf":
             # HF-majority files may still carry a handful of llamacpp-style
-            # aliases (quantui-rs writes the lm_head as 'output.weight').
+            # aliases (the lm_head is written as 'output.weight').
             if _re.match(r"^(model\.|lm_head\.|transformer\.)", k):
                 mapping[k] = k
                 continue
