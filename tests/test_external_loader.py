@@ -248,6 +248,9 @@ class TestLoadExternalModel:
 
         mocks = {}
         with patch.object(
+            external_loader, "iter_safetensors_tensors",
+            return_value=iter(list(fake_state_dict.items())),
+        ) as m_iter, patch.object(
             external_loader.comfy.utils, "load_torch_file", return_value=fake_state_dict
         ) as m_load_torch, patch.object(
             external_loader.VibeVoiceLoader, "_load_config", return_value=fake_config
@@ -279,6 +282,7 @@ class TestLoadExternalModel:
                 "processor": fake_processor,
                 "model": fake_model,
                 "load_torch": m_load_torch,
+                "iter_tensors": m_iter,
                 "load_config": m_load_config,
                 "load_tokenizer": m_load_tokenizer,
                 "load_processor": m_load_processor,
@@ -307,40 +311,53 @@ class TestLoadExternalModel:
         assert "state_dict" not in result, (
             "bundle must not retain the state dict (dead RAM, RC-4)")
 
-    def test_load_external_model_calls_load_torch_file_with_cpu(self, weight_file):
-        """load_torch_file is called with device=cpu."""
+    def test_dense_route_consumes_the_file_tensor_iterator(self, weight_file):
+        """The dense route streams from the shared file iterator.
+
+        It used to build a whole CPU state dict and then ``model.to(cuda)``,
+        which page-faults the file mapping on the way to VRAM. Every route now
+        hands a per-tensor generator to ``_stream_apply_dense``.
+        """
         _, mocks = self._run(weight_file)
 
-        mocks["load_torch"].assert_called_once()
-        call_args, call_kwargs = mocks["load_torch"].call_args
-        # device may be positional or keyword
-        device = call_kwargs.get("device")
-        if device is None and len(call_args) > 1:
-            device = call_args[1]
-        assert device == torch.device("cpu")
+        mocks["iter_tensors"].assert_called_once_with(weight_file)
+        # No batch read of the whole file into host memory.
+        mocks["load_torch"].assert_not_called()
 
-    def test_load_external_model_loads_state_dict_into_model(self, weight_file):
-        """model.load_state_dict is called with the loaded state dict, strict=False."""
-        _, mocks = self._run(weight_file)
+    def test_load_external_model_assigns_per_tensor_into_model(self, weight_file):
+        """Weights land through the streaming assign, not load_state_dict."""
+        from ComfyUI_VibeVoice.modules.loader import VibeVoiceLoader
 
-        fake_model = mocks["model"]
-        fake_model.load_state_dict.assert_called_once()
-        args, kwargs = fake_model.load_state_dict.call_args
-        assert args[0] is mocks["state_dict"]
-        assert kwargs.get("strict") is False
+        seen = {}
+        real = VibeVoiceLoader._stream_apply_dense
 
-    def test_external_load_uses_assign_and_reties(self, weight_file):
-        """Plan 2026-08-18 D2: external path delegates to _apply_state_dict."""
+        def _spy(model, tensor_pairs, **kw):
+            seen["pairs"] = list(tensor_pairs)
+            seen["kwargs"] = kw
+            return real(model, tensor_pairs, **kw)
+
         with patch.object(
-            external_loader.VibeVoiceLoader, "_apply_state_dict",
-            return_value=([], []),
-        ) as m_apply:
+            external_loader.VibeVoiceLoader, "_stream_apply_dense",
+            staticmethod(_spy),
+        ):
             self._run(weight_file)
 
-        m_apply.assert_called_once()
-        # The in-memory state dict is passed to the shared helper.
-        args, _ = m_apply.call_args
-        assert args[1] is not None  # state_dict argument present
+        assert [k for k, _ in seen["pairs"]] == ["model.language_model.weight"]
+        # A device is always requested, so nothing is left as a file view.
+        assert seen["kwargs"].get("target_device") is not None
+
+    def test_external_load_uses_the_streaming_assign(self, weight_file):
+        """The external path never falls back to the batch state-dict assign."""
+        with patch.object(
+            external_loader.VibeVoiceLoader, "_apply_state_dict",
+        ) as m_apply, patch.object(
+            external_loader.VibeVoiceLoader, "_stream_apply_dense",
+            return_value=([], []),
+        ) as m_stream:
+            self._run(weight_file)
+
+        m_apply.assert_not_called()
+        m_stream.assert_called_once()
 
     def test_load_external_model_applies_dtype(self, weight_file):
         """Plan 2026-08-18 D4/RC-3: conditional cast helper is invoked with the final dtype."""
@@ -470,6 +487,9 @@ class TestLoadExternalASRModel:
 
         mocks = {}
         with patch.object(
+            external_loader, "iter_safetensors_tensors",
+            return_value=iter(list(fake_state_dict.items())),
+        ) as m_iter, patch.object(
             external_loader.comfy.utils, "load_torch_file", return_value=fake_state_dict
         ) as m_load_torch, patch.object(
             external_loader, "_load_asr_config", return_value=fake_config
@@ -500,6 +520,7 @@ class TestLoadExternalASRModel:
                 "processor": fake_processor,
                 "model": fake_model,
                 "load_torch": m_load_torch,
+                "iter_tensors": m_iter,
                 "load_config": m_load_config,
                 "load_tokenizer": m_load_tokenizer,
                 "load_processor": m_load_processor,
@@ -532,24 +553,18 @@ class TestLoadExternalASRModel:
         mock_asr.assert_called_once()
         assert result["is_asr"] is True
 
-    def test_asr_calls_load_torch_file_with_cpu(self, weight_file):
-        """ASR branch loads the state dict onto CPU."""
+    def test_asr_consumes_the_file_tensor_iterator(self, weight_file):
+        """The ASR branch streams exactly like the TTS branch."""
         _, mocks = self._run(weight_file)
-        mocks["load_torch"].assert_called_once()
-        call_args, call_kwargs = mocks["load_torch"].call_args
-        device = call_kwargs.get("device")
-        if device is None and len(call_args) > 1:
-            device = call_args[1]
-        assert device == torch.device("cpu")
+        mocks["iter_tensors"].assert_called_once_with(weight_file)
+        mocks["load_torch"].assert_not_called()
 
-    def test_asr_loads_state_dict_into_model(self, weight_file):
-        """ASR model.load_state_dict is called with strict=False."""
+    def test_asr_assigns_per_tensor_into_model(self, weight_file):
+        """ASR weights land through the streaming assign, not load_state_dict."""
         _, mocks = self._run(weight_file)
         fake_model = mocks["model"]
-        fake_model.load_state_dict.assert_called_once()
-        args, kwargs = fake_model.load_state_dict.call_args
-        assert args[0] is mocks["state_dict"]
-        assert kwargs.get("strict") is False
+        fake_model.load_state_dict.assert_not_called()
+        assert mocks["iter_tensors"].call_count == 1
 
     def test_asr_applies_dtype(self, weight_file):
         """Plan 2026-08-18 D4/RC-3: ASR branch uses the conditional cast helper."""
@@ -690,7 +705,7 @@ class TestWarnIfLowbitQuantization:
         with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
             warn_if_lowbit_quantization(path)
 
-        assert any("naive int cast" in r.message for r in caplog.records)
+        assert any("NO dequantization scale" in r.message for r in caplog.records)
 
     def test_proper_quant_no_warning(self, tmp_path, caplog):
         """Proper quant with scales must NOT warn."""
@@ -908,6 +923,9 @@ class TestLoaderReconciliationWiring:
         fake_model.to.return_value = fake_model
 
         with patch.object(
+            external_loader, "iter_safetensors_tensors",
+            return_value=iter([("w", torch.zeros(1))]),
+        ), patch.object(
             external_loader.comfy.utils, "load_torch_file",
             return_value={"w": torch.zeros(1)},
         ), patch(

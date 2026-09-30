@@ -599,7 +599,14 @@ class TestVibeVoiceLoaderLoadStateDict:
 class TestStreamApplyDense:
     """Direct unit tests for VibeVoiceLoader._stream_apply_dense."""
 
-    def test_assigns_params_and_buffers_as_clones(self):
+    def test_assigns_params_and_buffers_preserving_file_views(self):
+        """Default keeps the source tensor, so a file view stays a file view.
+
+        Every production caller now passes a ``target_device``, and a
+        ``.to(device)`` already produces private storage — the clone only
+        matters for the no-device path, which is why the default is
+        ``preserve_file_views=True``.
+        """
         model = _TwoParam()
         model.register_buffer("pos", torch.zeros(3))
         w = torch.ones(2, 2)
@@ -613,9 +620,35 @@ class TestStreamApplyDense:
         assert unexpected == []
         assert missing == []
         assert torch.equal(model.layer1.weight.data, w)
-        # Clone semantics: the model owns private storage, not the source.
-        assert model.layer1.weight.data_ptr() != w.data_ptr()
+        assert model.layer1.weight.data_ptr() == w.data_ptr()
         assert torch.equal(model.pos, torch.ones(3))
+
+    def test_preserve_file_views_false_clones_into_private_storage(self):
+        model = _TwoParam()
+        w = torch.ones(2, 2)
+        VibeVoiceLoader._stream_apply_dense(
+            model, iter([("layer1.weight", w)]), preserve_file_views=False
+        )
+
+        assert torch.equal(model.layer1.weight.data, w)
+        assert model.layer1.weight.data_ptr() != w.data_ptr()
+
+    def test_target_device_cuda_places_params_on_the_accelerator(self):
+        if not torch.cuda.is_available():
+            pytest.skip("no GPU in this environment")
+        dev = torch.device("cuda", 0)
+        model = _TwoParam()
+        w = torch.ones(2, 2)
+        VibeVoiceLoader._stream_apply_dense(
+            model, iter([("layer1.weight", w), ("layer2.weight", w)]),
+            target_device=dev,
+        )
+
+        assert model.layer1.weight.device.type == "cuda"
+        assert model.layer2.weight.device.type == "cuda"
+        assert torch.equal(model.layer1.weight.data.cpu(), w)
+        # A .to(device) is already private storage; no extra clone needed.
+        assert model.layer1.weight.data_ptr() != w.data_ptr()
 
     def test_shape_mismatch_raises_friendly_error(self):
         model = _TwoParam()

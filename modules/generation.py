@@ -38,12 +38,7 @@ def resolve_generation_family(
     model_name: str,
     external_model: dict | None = None,
 ) -> str:
-    """Return exactly ``tts`` or ``streaming_tts`` for generation routing.
-
-    This policy function performs no model loading, filesystem access, tensor
-    creation, or class inspection. External bundle flags are authoritative;
-    named models use the shared model-family inference rules.
-    """
+    """Return exactly ``tts`` or ``streaming_tts`` for generation routing."""
     if external_model is not None:
         if external_model.get("is_asr"):
             raise ValueError(
@@ -70,14 +65,7 @@ def resolve_generation_family(
 
 
 class ExternalVibeVoiceModelHandler(torch.nn.Module):
-    """Handler for an externally-loaded (pre-instantiated) VibeVoice model.
-
-    Unlike :class:`~modules.loader.VibeVoiceModelHandler`, whose ``load_model``
-    loads weights from disk on demand, this handler already holds the loaded
-    model and processor. The patcher's ``patch_model`` sees
-    ``self.model.model is not None`` and skips the lazy-load branch, proceeding
-    directly to the single host-to-device transfer.
-    """
+    """Handler for an externally-loaded (pre-instantiated) VibeVoice model."""
 
     def __init__(
         self,
@@ -108,16 +96,10 @@ class ExternalVibeVoiceModelHandler(torch.nn.Module):
                 return total
         except Exception:
             pass
-        # Fallback: assume ~4 GB if the size cannot be determined.
         return int(4.0 * (1024**3))
 
     def load_model(self, device, attention_mode: str = "sdpa"):
-        """No-op: the model is already loaded.
-
-        The patcher only calls this when ``self.model is None``; for an external
-        handler the model is pre-set, so this branch is never reached. Kept for
-        interface compatibility with :class:`VibeVoiceModelHandler`.
-        """
+        """No-op: the model is already loaded."""
         logger.debug(
             f"ExternalVibeVoiceModelHandler.load_model called but model is "
             f"already loaded for '{self.model_pack_name}'"
@@ -130,33 +112,7 @@ def load_vibevoice_from_external(
     dtype: str = DTYPE_AUTO,
     attention_mode: str = "sdpa",
 ) -> Tuple[VibeVoicePatcher, Any, Any]:
-    """Wrap an externally-loaded VibeVoice model bundle in a patcher.
-
-    The bundle (produced by
-    :func:`~modules.external_loader.load_external_vibevoice_model`) already
-    contains an instantiated model + processor on CPU. This function wraps them
-    in an :class:`ExternalVibeVoiceModelHandler` + :class:`VibeVoicePatcher` and
-    loads the model to GPU via ComfyUI's memory management.
-
-    Args:
-        model_bundle: The ``VIBEVOICE_MODEL`` dict. Required keys:
-            ``model``, ``processor``, ``model_name``. Optional:
-            ``is_streaming``, ``source_path``, ``config``, ``state_dict``.
-        device: Device to load on ("auto", "cuda", "cpu", "mps", etc.).
-        dtype: Data type for model ("auto", "bf16", "fp16", "fp32").
-        attention_mode: Attention implementation.
-
-    Returns:
-        Tuple of (patcher, model, processor).
-
-    Raises:
-        ValueError: If the bundle is missing required keys.
-        RuntimeError: If the model fails to load to GPU.
-    """
-    # A bundle whose heavy fields were released still carries everything
-    # needed to rebuild it, so recover instead of failing. The loader node's
-    # output is cached by ComfyUI and can outlive the registry entry that
-    # backed it.
+    """Wrap an externally-loaded VibeVoice model bundle in a patcher and load to VRAM."""
     if model_bundle.get("model") is None and model_bundle.get("source_path"):
         from .external_loader import load_external_vibevoice_model
 
@@ -168,7 +124,6 @@ def load_vibevoice_from_external(
             dtype_str=model_bundle.get("dtype_str") or "auto",
         )
 
-    # Validate required bundle keys (Phase 5.3 guard).
     for required_key in ("model", "processor", "model_name"):
         if model_bundle.get(required_key) is None:
             raise ValueError(
@@ -181,19 +136,12 @@ def load_vibevoice_from_external(
     model_name = model_bundle["model_name"]
     source_path = model_bundle.get("source_path", "")
 
-    # Resolve attention mode with fallback logic (no quantization on the
-    # external path — quantization is applied at load time by the loader node).
-    #
-    # Plan 2026-08-20 (P1): when the bundle records the attention mode the
-    # weights were actually BUILT with (loader-resolved), prefer it — the TTS
-    # node's own widget must not fork a second patcher for the same weights.
     bundle_attention = model_bundle.get("attention_mode")
     if isinstance(bundle_attention, str) and bundle_attention:
         actual_attention_mode = bundle_attention
     else:
         actual_attention_mode = resolve_attention_mode(attention_mode, False)
 
-    # Setup device
     if device == DEVICE_CPU:
         load_device = torch.device(DEVICE_CPU)
         offload_device = torch.device(DEVICE_CPU)
@@ -201,15 +149,8 @@ def load_vibevoice_from_external(
         load_device = get_torch_device(device)
         offload_device = get_offload_device()
 
-    # Resolve dtype
     target_dtype = resolve_dtype(dtype, load_device)
 
-    # Build cache key (namespaced so it never collides with dropdown loaders).
-    # Plan 2026-08-20 (RC-2/B2): the key carries full file identity — weight
-    # file name + mtime_ns + size, config selector, RESOLVED attention mode,
-    # 4-bit flag, and dtype — from the bundle's recorded build fields. Hand-
-    # built bundles without those fields fall back to stat'ing source_path /
-    # widget values, keeping a valid (if less specific) key.
     bundle_use_llm_4bit = bool(model_bundle.get("use_llm_4bit", False))
     bundle_dtype_str = model_bundle.get("dtype_str") or dtype
     cache_key = identity_for_external(
@@ -220,14 +161,7 @@ def load_vibevoice_from_external(
         dtype_str=bundle_dtype_str,
     )
 
-    # Register the bundle under its patcher key so eviction can NEUTRALIZE it.
-    # ComfyUI's output cache keeps the node-output bundle strongly alive, so
-    # dropping our own patcher entry would not free the weights otherwise.
-    # A reused-patcher run re-registers the same live dict (no-op replace).
     register_model_bundle(cache_key, model_bundle)
-
-    # Unload-before-load gate (plan 2026-08-20, C2/RC-1): if a DIFFERENT model
-    # is active for this family, fully release it before touching the caches.
     evict_if_changed(FAMILY_TTS, cache_key, (VIBEVOICE_PATCHER_CACHE,))
 
     if cache_key not in VIBEVOICE_PATCHER_CACHE:
@@ -238,30 +172,16 @@ def load_vibevoice_from_external(
             attention_mode=actual_attention_mode,
             source_path=source_path,
         )
-        # Keep the handler's key in sync with the patcher-cache key so the
-        # destroy path evicts the right entry (plan 2026-08-20, §4.2).
         model_handler.cache_key = cache_key
 
-        # Route selection is a single pure function (modules/patcher.py). The
-        # bundle's weight_family is the ONLY input that can open the dynamic
-        # branch, and the loader already recorded its own decision in
-        # dynamic_vram_route; AND-ing the two means a hand-built bundle without
-        # the key still works, and a bundle that says False can never be forced
-        # dynamic by a device that merely looks CUDA-capable.
         patcher_cls = select_patcher_class(
             model_bundle.get("weight_family"), load_device, legacy_cls=VibeVoicePatcher
         )
-        if not bool(model_bundle.get("dynamic_vram_route", True)):
-            patcher_cls = VibeVoicePatcher
         patcher = patcher_cls(
             model_handler,
             attention_mode=actual_attention_mode,
             load_device=load_device,
             offload_device=offload_device,
-            # size/dtype are load-bearing, not decoration: core honours size in
-            # model_size() (comfy/model_patcher.py:406-411) and load_models_gpu
-            # budgets from it (comfy/model_management.py:800-809), and the
-            # dynamic patcher's patch_model honours dtype.
             size=model_handler.size,
             dtype=target_dtype,
         )
@@ -272,16 +192,10 @@ def load_vibevoice_from_external(
         )
 
     patcher = VIBEVOICE_PATCHER_CACHE[cache_key]
-    # SAMPLED: this is where core's patcher load() actually runs, and on
-    # the dynamic route it is where the pinned host staging buffer is
-    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
-    # "+7GB that stays resident" was measured only in a standalone
-    # probe; this line is what makes it observable in live ComfyUI.
+
     with measured_load("load-to-device"):
         load_to_device(patcher)
-    # Host-RAM census (one env-gated line): what this load left resident
-    # after the H2D — file views vs private copies, the eager branch's
-    # patcher.backup stash, and the vbar ranges core allocated.
+
     report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     loaded_model = patcher.model.model
     loaded_processor = patcher.model.processor
@@ -303,31 +217,11 @@ def load_vibevoice_model(
     quantize_4bit: bool = False,
     force_reload: bool = False,
 ) -> Tuple[VibeVoicePatcher, Any, Any]:
-    """Load or retrieve cached VibeVoice model.
-
-    Args:
-        model_name: Name of the model to load.
-        device: Device to load on ("auto", "cuda", "cpu", "mps", etc.).
-        dtype: Data type for model ("auto", "bf16", "fp16", "fp32").
-        attention_mode: Attention implementation ("eager", "sdpa", "flash_attention_2", "sage").
-        quantize_4bit: Whether to quantize the LLM to 4-bit NF4.
-        force_reload: Force reload even if cached.
-
-    Returns:
-        Tuple of (patcher, model, processor).
-
-    Raises:
-        RuntimeError: If model fails to load.
-    """
-    # Resolve attention mode with fallback logic
+    """Load or retrieve cached VibeVoice model."""
     actual_attention_mode = resolve_attention_mode(attention_mode, quantize_4bit)
-    # Backends measured to diverge on the realtime path are dropped here, where
-    # the model family is known, so the exclusion reaches the cache key and the
-    # patcher as well as the loader (plan 2026-09-26, step S3.2).
     if is_model_type(model_name, "streaming_tts"):
         actual_attention_mode = resolve_realtime_attention_mode(actual_attention_mode)
 
-    # Setup device
     if device == DEVICE_CPU:
         load_device = torch.device(DEVICE_CPU)
         offload_device = torch.device(DEVICE_CPU)
@@ -335,16 +229,9 @@ def load_vibevoice_model(
         load_device = get_torch_device(device)
         offload_device = get_offload_device()
 
-    # Resolve dtype
     target_dtype = resolve_dtype(dtype, load_device)
-
-    # Build cache key
     cache_key = f"{model_name}_attn_{actual_attention_mode}_q4_{int(quantize_4bit)}"
 
-    # Unload-before-load gate (plan 2026-08-20, C3/RC-1/RC-5): switching
-    # models (dropdown <-> dropdown or dropdown <-> external — both share the
-    # "tts" family) fully releases the previous model BEFORE the new weights
-    # are loaded. Same-key calls are a strict no-op.
     evict_if_changed(FAMILY_TTS, cache_key, (VIBEVOICE_PATCHER_CACHE,))
 
     if cache_key not in VIBEVOICE_PATCHER_CACHE or force_reload:
@@ -358,12 +245,6 @@ def load_vibevoice_model(
             dtype_str=dtype,
         )
 
-        # Standard-directory dropdown loader: no external bundle, hence no
-        # weight_family / dynamic_vram_route to AND with. 2026-09-30: the
-        # selector no longer reads the family label, so this route takes the
-        # dynamic class exactly like the external ones when core resolved one
-        # for this device — and the loader preserves the aimdo file views on
-        # the same predicate (modules/loader.py, same device expression).
         patcher_cls = select_patcher_class(None, load_device, legacy_cls=VibeVoicePatcher)
         patcher = patcher_cls(
             model_handler,
@@ -377,13 +258,10 @@ def load_vibevoice_model(
         logger.debug(f"Created new patcher for {model_name} with attn={actual_attention_mode}, q4={quantize_4bit}")
 
     patcher = VIBEVOICE_PATCHER_CACHE[cache_key]
-    # SAMPLED: this is where core's patcher load() actually runs, and on
-    # the dynamic route it is where the pinned host staging buffer is
-    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
-    # "+7GB that stays resident" was measured only in a standalone
-    # probe; this line is what makes it observable in live ComfyUI.
+
     with measured_load("load-to-device"):
         load_to_device(patcher)
+
     report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     model = patcher.model.model
     processor = patcher.model.processor
@@ -411,42 +289,7 @@ def generate_audio(
     top_k: int = 0,
     max_new_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, int]:
-    """Generate audio using the VibeVoice model.
-
-    Args:
-        model: VibeVoice model instance.
-        processor: VibeVoice processor instance.
-        text: Multi-speaker script text.
-        voice_samples: List of numpy audio arrays for each speaker.
-        speaker_ids: List of 1-based speaker IDs.
-        cfg_scale: Classifier-Free Guidance scale.
-        inference_steps: Number of diffusion steps.
-        seed: Random seed (0 for random).
-        do_sample: Whether to use sampling methods.
-        temperature: Sampling temperature.
-        top_p: Nucleus sampling threshold.
-        top_k: Top-K sampling (0 to disable).
-        max_new_tokens: Hard cap on generated speech tokens (utterance length budget).
-            None = auto (2x prompt length — ``max_length_times=2``, the
-            value ``model.generate`` uses when the caller passes nothing).
-            Passed through to ``model.generate`` so the non-streaming AR loop
-            terminates; when the processor tokenizer exposes ``speech_end_id``
-            it also stops on the EOS speech token.
-
-    Returns:
-        Tuple of (output audio tensor [1, 1, T], sample_rate).
-
-    Raises:
-        ValueError: If script is empty or invalid, or if a streaming
-            (realtime) model/processor is passed (those require the
-            canonical VibeVoice TTS realtime family path).
-        RuntimeError: If generation fails.
-    """
-    # Guard: streaming (realtime) models/processors require the canonical
-    # VibeVoice TTS realtime family path and cached-prompt adapter. The
-    # non-streaming path below calls processor(text=..., voice_samples=...),
-    # which VibeVoiceStreamingProcessor does not support by design. Detect by
-    # class name to avoid importing the vendored chain (diffusers-dependent).
+    """Generate audio using the VibeVoice model."""
     _streaming_class_names = {
         "VibeVoiceStreamingProcessor",
         "VibeVoiceStreamingForConditionalGenerationInference",
@@ -460,18 +303,14 @@ def generate_audio(
             "Use the canonical VibeVoice TTS realtime family path for this model."
         )
 
-    # Parse script using our parser (supports both "[N] text" and "Speaker N: text" formats)
     parsed_lines_0_based, speaker_ids_1_based = parse_script_1_based(text)
     if not parsed_lines_0_based:
         raise ValueError("Script is empty or invalid. Please provide text to generate.")
 
-    # Preprocess voice samples — filter out None values (speakers without voice input)
-    # and ensure each sample is a valid 1-D numpy array.
     voice_samples_np = []
     for vs in voice_samples:
         processed = preprocess_comfy_audio(vs)
         if processed is not None:
-            # Ensure 1-D array (squeeze extra dimensions but keep the sample axis)
             processed = np.asarray(processed, dtype=np.float32)
             if processed.ndim == 0:
                 logger.warning("Voice sample is a scalar (0-d array), skipping")
@@ -489,21 +328,13 @@ def generate_audio(
             "as a voice sample for the speaker(s)."
         )
 
-    # Set seed
     set_seed(seed)
 
-    # Convert parsed lines to "Speaker N: text" format for the processor.
-    # The vendored processor's _parse_script() only recognizes the "Speaker N: text"
-    # format, but our parse_script_1_based() also supports "[N] text". We normalize
-    # to the processor's expected format to support both input styles.
-    # parsed_lines_0_based contains (0-based speaker_id, text) tuples; convert back
-    # to 1-based for the "Speaker N:" prefix.
     normalized_script = "\n".join(
         f"Speaker {speaker_id + 1}:{speaker_text}"
         for speaker_id, speaker_text in parsed_lines_0_based
     )
 
-    # Build model inputs — pass the normalized script to the processor
     inputs = processor(
         text=[normalized_script],
         voice_samples=[voice_samples_np],
@@ -512,27 +343,20 @@ def generate_audio(
         return_attention_mask=True,
     )
 
-    # Validate input tensors
     for key, value in inputs.items():
         if isinstance(value, torch.Tensor):
             if torch.any(torch.isnan(value)) or torch.any(torch.isinf(value)):
                 logger.error(f"Input tensor '{key}' contains NaN or Inf values")
                 raise ValueError(f"Invalid values in input tensor: {key}")
 
-    # Move inputs to the compute device. NOT `model.device`: that property is
-    # derived from the first parameter's residency, which under partial
-    # offload is CPU even while compute happens on the load device (BUG-012).
+    compute_device = model_management.get_torch_device()
     inputs = {
-        k: v.to(model_management.get_torch_device()) if isinstance(v, torch.Tensor) else v
+        k: v.to(compute_device) if isinstance(v, torch.Tensor) else v
         for k, v in inputs.items()
     }
 
-    # Set inference steps (non-streaming model stores this on the instance)
     model.set_ddpm_inference_steps(num_steps=inference_steps)
 
-    # Map processor output keys to the model's generate() signature.
-    # The processor returns `speech_input_mask`; the non-streaming model's
-    # generate() expects `acoustic_input_mask`.
     gen_inputs = {
         "input_ids": inputs.get("input_ids"),
         "attention_mask": inputs.get("attention_mask"),
@@ -542,9 +366,6 @@ def generate_audio(
         "cfg_scale": cfg_scale,
         "inference_steps": inference_steps,
         "return_speech": True,
-        # Option C: pass the processor tokenizer so generate() can resolve
-        # `speech_end_id` and terminate the AR loop on the EOS speech token.
-        # Also forward the sampling controls + utterance-length budget.
         "tokenizer": processor.tokenizer,
         "do_sample": do_sample,
         "temperature": temperature,
@@ -552,36 +373,16 @@ def generate_audio(
         "top_k": top_k,
         "max_new_tokens": max_new_tokens,
     }
-    # Drop None values so the model uses its own defaults where appropriate.
     gen_inputs = {k: v for k, v in gen_inputs.items() if v is not None}
 
-    # Generate
     with torch.no_grad():
-        # Standard ComfyUI progress bar. The initial total is only an estimate
-        # (diffusion steps); the vendored AR loop reports its real budget
-        # (max_steps) through `progress_callback`, and `update_absolute(value,
-        # total=...)` re-sets the bar's total dynamically on the first callback.
-        # Drives both the frontend bar and the standard tqdm console bar.
         pbar = ProgressBarWithConsole(inference_steps)
 
         def _progress(current: int, total: int) -> None:
-            # Responsive cancellation: raises InterruptProcessingException when
-            # the user pressed cancel (checked once per AR step).
             model_management.throw_exception_if_processing_interrupted()
             pbar.update_absolute(current, total=total)
 
         try:
-            # SAMPLED (2026-09-30): the live 1.5B run showed machine RAM
-            # 20.8 -> 27.3GB while EVERY process counter stayed flat, and the
-            # growth happened while this window was running — the load-phase
-            # lines cannot see it. The line carries start_sys/end_sys (machine
-            # used) beside the process counters, so this one line says whether
-            # the growth is in the ComfyUI process or machine-wide (file
-            # cache / other processes). [vvpull] then says WHICH path served
-            # each weight (vbar = core's file->VRAM paging; nonvbar = the
-            # cast-buffer path that can copy a file view host-side) and how
-            # many bytes moved — the number that distinguishes "one 5GB
-            # paging pass" from "5GB re-read every AR step".
             from .comfy_stream import pull_stats_line, reset_pull_stats
 
             reset_pull_stats()
@@ -595,20 +396,11 @@ def generate_audio(
             logger.info("VibeVoice generation interrupted by user")
             raise
         finally:
-            # Guarantee the final 100% event even when the AR loop stopped
-            # early (EOS before max_steps) or generation raised.
             pbar.update_absolute(pbar.total)
             pbar.close()
 
-    # After the forwards, not at load time: this is the only point where the
-    # fast/streamed split says anything about this run. No-op for non-GGUF.
     log_gguf_forward_counters("tts_generate")
 
-    # Post-process output.
-    # Guard: the vendored AR loop appends None for any sample that never emitted
-    # a speech_diffusion_id token (e.g. corrupt / over-quantized weights, or an
-    # empty generation). Without this guard, `outputs.speech_outputs[0].ndim`
-    # raises an opaque AttributeError on None.
     speech_outputs = outputs.speech_outputs
     if not speech_outputs or speech_outputs[0] is None:
         raise RuntimeError(
@@ -626,29 +418,16 @@ def generate_audio(
         output_waveform = output_waveform.unsqueeze(0)
 
     sample_rate = 24000
-    # ComfyUI's AUDIO contract is CPU float32. A bf16/fp16 model decodes in its
-    # compute dtype, so cast before handing the waveform back.
     return output_waveform.detach().to(device="cpu", dtype=torch.float32), sample_rate
 
 
 def force_offload_model(patcher: VibeVoicePatcher, model_name: str, warm: bool = False) -> None:
-    """Force offload a VibeVoice model from VRAM.
-
-    Args:
-        patcher: The VibeVoicePatcher instance.
-        model_name: Name of the model (for logging).
-        warm: When True, retain the model/processor tensors on the intermediate
-            device (NTH-004 warm re-attach) instead of fully freeing them, so a
-            subsequent load re-attaches from memory rather than reloading from disk.
-    """
+    """Force offload a VibeVoice model from VRAM."""
     logger.info(f"Force offloading VibeVoice model '{model_name}' from VRAM...")
     if patcher.is_loaded:
         if warm:
             patcher.unpatch_model(unpatch_weights=True, warm=True)
         else:
-            # Plan 2026-08-18 D5: the user-requested cold offload keeps its
-            # destructive semantics via the explicit flag (the default
-            # unpatch_model is now non-destructive, RC-6).
             patcher.unpatch_model(unpatch_weights=True, destroy=True)
     model_management.unload_all_models()
     gc.collect()

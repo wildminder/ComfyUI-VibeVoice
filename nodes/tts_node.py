@@ -70,14 +70,13 @@ class VibeVoiceTTSNode(io.ComfyNode):
 
     @classmethod
     def define_schema(cls) -> io.Schema:
-        # Standard TTS models first, then realtime models; ASR is excluded.
         model_names = list(get_tts_family_models().keys())
         if not model_names:
             model_names.append("No models found in models/tts/VibeVoice")
 
         try:
             voice_preset_options = [PRESET_NONE, *list_voice_presets().keys()]
-        except Exception as exc:  # Asset discovery must not break schema creation.
+        except Exception as exc:
             logger.warning("Could not discover realtime voice presets: %s", exc)
             voice_preset_options = [PRESET_NONE]
 
@@ -234,7 +233,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 io.Audio.Input("speaker_2_voice", optional=True, tooltip="Reference audio for 'Speaker 2' or '[2]' in the script."),
                 io.Audio.Input("speaker_3_voice", optional=True, tooltip="Reference audio for 'Speaker 3' or '[3]' in the script."),
                 io.Audio.Input("speaker_4_voice", optional=True, tooltip="Reference audio for 'Speaker 4' or '[4]' in the script."),
-                # Appended: realtime cached voice prompt (standard models ignore it)
+                # Realtime cached voice prompt
                 io.Combo.Input(
                     "voice_preset",
                     options=voice_preset_options,
@@ -257,42 +256,19 @@ class VibeVoiceTTSNode(io.ComfyNode):
         attention_mode: Optional[str] = None,
         quantize_llm_4bit: Optional[bool] = None,
     ) -> bool | str:
-        """Validate inputs, allowing dynamically-discovered custom TTS models.
-
-        The signature declares only the inputs this rule inspects. ComfyUI
-        core (execution.py) calls the validator once per input present in the
-        prompt and emits one error per failing call, so a ``**kwargs``
-        signature repeats a single message once per widget.
-        """
-        # dtype x attention_mode: the sage kernels hard-assert fp16/bf16, and
-        # nothing in the load path cross-checks the two independent widgets.
-        # A linked external_model is exempt — the external loader node owns
-        # the effective dtype/attention for the bundle it already validated.
+        """Validate inputs, allowing dynamically-discovered custom TTS models."""
         if external_model is _EXTERNAL_UNSET:
             message = check_dtype_attention_compatible(
                 dtype, attention_mode, bool(quantize_llm_4bit)
             )
             if message is not None:
                 return message
-            # Declaring `attention_mode` opts it out of core's own combo
-            # membership check (execution.py only range-checks inputs the
-            # validator does not declare), so re-check it here: a stale
-            # workflow must be rejected, not silently downgraded to eager by
-            # resolve_attention_mode — a backend swap changes the audio.
             if attention_mode is not None and attention_mode not in get_available_attention_modes():
                 return (
                     f"attention_mode '{attention_mode}' is not available. "
                     f"Choose one of: {', '.join(get_available_attention_modes())}"
                 )
 
-        # An externally-loaded model bypasses the model_name dropdown entirely.
-        # NOTE: During prompt validation ComfyUI resolves *linked* inputs to
-        # None (no execution cache exists yet — see execution.get_input_data /
-        # mark_missing), so the value cannot be inspected here. We therefore
-        # detect that the external_model input is *connected* by it being
-        # passed at all: a linked input is always passed (resolved to None),
-        # while an unconnected optional input is absent from the prompt
-        # entirely and leaves the sentinel default in place.
         if external_model is not _EXTERNAL_UNSET:
             return True
 
@@ -309,7 +285,6 @@ class VibeVoiceTTSNode(io.ComfyNode):
             return str(exc)
 
         if family == "streaming_tts":
-            # Old saved prompts have no voice_preset key; the default covers it.
             if not voice_preset or voice_preset == PRESET_NONE:
                 return _MISSING_PRESET_MESSAGE
         return True
@@ -340,11 +315,8 @@ class VibeVoiceTTSNode(io.ComfyNode):
         voice_preset: str = PRESET_NONE,
     ) -> io.NodeOutput:
         """Execute standard or realtime VibeVoice TTS generation."""
-
-        # Resolve the family before loading so ASR / unknown inputs fail fast.
         family = resolve_generation_family(model_name, external_model)
 
-        # Load model — external bundle overrides the model_name dropdown.
         if external_model is not None:
             patcher, model, processor = load_vibevoice_from_external(
                 external_model,
@@ -352,7 +324,6 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 dtype=dtype,
                 attention_mode=attention_mode,
             )
-            # Use the bundle's model name for offload cache keying.
             model_name = external_model.get("model_name", model_name)
         else:
             patcher, model, processor = load_vibevoice_model(
@@ -363,8 +334,6 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 quantize_4bit=quantize_llm_4bit,
             )
 
-        # Loaded-class safety net: renamed local checkpoints can disagree with
-        # name-based classification. Only tts -> streaming_tts is repaired.
         loaded_classification = classify_loaded_tts_pair(model, processor)
         if loaded_classification == "mismatch":
             raise ValueError(
@@ -434,9 +403,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
             logger.info(f"Audio generation complete. Sample rate: {sample_rate}Hz")
 
             if force_offload:
-                # NTH-004: warm re-attach — keep tensors on the intermediate device
-                # so a subsequent run re-attaches from memory instead of reloading.
-                force_offload_model(patcher, model_name, warm=True)
+                force_offload_model(patcher, model_name, warm=False)
 
             return io.NodeOutput(output_audio, ui=ui.PreviewAudio(output_audio, cls=cls))
 
@@ -486,11 +453,9 @@ class VibeVoiceTTSNode(io.ComfyNode):
             4: speaker_4_voice,
         }
 
-        # Parse script to get speaker IDs
         from ..modules.audio_utils import parse_script_1_based
         _, speaker_ids_1_based = parse_script_1_based(text)
 
-        # Build voice samples list in order of speaker IDs
         voice_samples = [speaker_inputs.get(sid) for sid in speaker_ids_1_based]
 
         return generate_audio(

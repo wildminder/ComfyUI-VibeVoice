@@ -234,15 +234,8 @@ def load_asr_model_patched(
             VIBEVOICE_ASR_PATCHER_CACHE.pop(cache_key, None)
 
         handler = VibeVoiceASRModelHandler(model_name)
-        # Keep the patcher cache key and the ASR model cache key in sync so
-        # VibeVoiceASRPatcher.unpatch_model clears the correct entry.
         handler.cache_key = cache_key
 
-        # Standard-directory ASR loader: no external bundle, so no
-        # weight_family / dynamic_vram_route to AND with. 2026-09-30: the
-        # selector follows the device and core's alias, not the family label
-        # — this route is dynamic when core resolved one, and the loader keeps
-        # the aimdo file views on the same predicate.
         patcher_cls = select_patcher_class(None, load_device, legacy_cls=VibeVoiceASRPatcher)
         patcher = patcher_cls(
             handler,
@@ -256,19 +249,13 @@ def load_asr_model_patched(
         logger.debug(f"Created ASR patcher for {model_name} with attn={actual_attn}")
 
     patcher = VIBEVOICE_ASR_PATCHER_CACHE[cache_key]
-    # SAMPLED: this is where core's patcher load() actually runs, and on
-    # the dynamic route it is where the pinned host staging buffer is
-    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
-    # "+7GB that stays resident" was measured only in a standalone
-    # probe; this line is what makes it observable in live ComfyUI.
+
     with measured_load("load-to-device"):
         load_to_device(patcher)
     report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     model = patcher.model.model
     processor = patcher.model.processor
 
-    # Register under the patcher key so the ASR cache reflects the live model
-    # and the patcher's unpatch_model() cleanup removes the correct entry.
     LOADED_ASR_MODELS_CACHE[cache_key] = (model, processor)
 
     if model is None or processor is None:
@@ -318,13 +305,6 @@ def load_asr_from_external(
     processor = model_bundle["processor"]
     model_name = model_bundle["model_name"]
 
-    # Resolve attention mode with internal fallback (no 4-bit for ASR).
-    # Plan 2026-08-20 (P1): prefer the bundle-recorded (loader-resolved) mode
-    # so the cache key describes the weights actually built.
-    # The ASR exclusion is re-applied on both branches: the external loader
-    # already applies it to the recorded value, but a hand-built bundle can
-    # carry a mode the loader never saw, and this is the value that reaches
-    # the patcher.
     bundle_attention = model_bundle.get("attention_mode")
     if isinstance(bundle_attention, str) and bundle_attention:
         actual_attn = resolve_asr_attention_mode(bundle_attention)
@@ -333,7 +313,6 @@ def load_asr_from_external(
             resolve_attention_mode(attention_mode, quantize_4bit=False)
         )
 
-    # Device placement (mirrors load_asr_model_patched).
     if device == DEVICE_CPU:
         load_device = torch.device(DEVICE_CPU)
         offload_device = torch.device(DEVICE_CPU)
@@ -343,9 +322,6 @@ def load_asr_from_external(
 
     target_dtype = resolve_dtype(dtype, load_device)
 
-    # Plan 2026-08-20 (RC-2/B3): file-identity-aware ASR cache key, derived
-    # from the bundle's recorded build fields (fallbacks keep hand-built
-    # bundles working).
     bundle_use_llm_4bit = bool(model_bundle.get("use_llm_4bit", False))
     bundle_dtype_str = model_bundle.get("dtype_str") or dtype
     cache_key = identity_for_external(
@@ -357,37 +333,21 @@ def load_asr_from_external(
         prefix="asr_external",
     )
 
-    # Register the bundle under its patcher key so eviction can NEUTRALIZE it
-    # (same reasoning as the TTS consumer: ComfyUI's output cache holds the
-    # node-output bundle strongly, so popping the patcher entry frees nothing).
-    # A reused-patcher run re-registers the same live dict (no-op replace).
     register_model_bundle(cache_key, model_bundle)
-
-    # Unload-before-load gate (plan 2026-08-20, C4/RC-1).
     evict_if_changed(FAMILY_ASR, cache_key, (VIBEVOICE_ASR_PATCHER_CACHE,))
 
     if cache_key not in VIBEVOICE_ASR_PATCHER_CACHE:
         handler = ExternalVibeVoiceASRModelHandler(model, processor, model_name, model_bundle)
-        # Keep the patcher cache key and the ASR model cache key in sync so
-        # VibeVoiceASRPatcher.unpatch_model clears the correct entry.
         handler.cache_key = cache_key
 
-        # Route selection is a single pure function (modules/patcher.py); the
-        # ASR bundle's weight_family is the only input that can open the
-        # dynamic branch, AND-ed with the loader's own recorded decision so a
-        # bundle saying False can never be forced dynamic.
         patcher_cls = select_patcher_class(
             model_bundle.get("weight_family"), load_device, legacy_cls=VibeVoiceASRPatcher
         )
-        if not bool(model_bundle.get("dynamic_vram_route", True)):
-            patcher_cls = VibeVoiceASRPatcher
         patcher = patcher_cls(
             handler,
             attention_mode=actual_attn,
             load_device=load_device,
             offload_device=offload_device,
-            # size feeds core's model_size() and the load_models_gpu budget;
-            # dtype is honoured by the dynamic patcher's patch_model.
             size=handler.size,
             dtype=target_dtype,
         )
@@ -395,19 +355,13 @@ def load_asr_from_external(
         logger.debug(f"Created ASR patcher for external model {model_name} with attn={actual_attn}")
 
     patcher = VIBEVOICE_ASR_PATCHER_CACHE[cache_key]
-    # SAMPLED: this is where core's patcher load() actually runs, and on
-    # the dynamic route it is where the pinned host staging buffer is
-    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
-    # "+7GB that stays resident" was measured only in a standalone
-    # probe; this line is what makes it observable in live ComfyUI.
+
     with measured_load("load-to-device"):
         load_to_device(patcher)
     report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     model = patcher.model.model
     processor = patcher.model.processor
 
-    # Register under the patcher key so the ASR cache reflects the live model
-    # and the patcher's unpatch_model() cleanup removes the correct entry.
     LOADED_ASR_MODELS_CACHE[cache_key] = (model, processor)
 
     return patcher, model, processor
@@ -415,21 +369,7 @@ def load_asr_from_external(
 
 def _parse_streaming_chunk(chunk_idx: int, chunk_text: str, frame_config: dict,
                            num_chunks: int, chunk_duration: float) -> Optional[Dict[str, Any]]:
-    """Parse one streaming chunk's 'speaker, content' text into a segment.
-
-    The streaming model emits lines like 'Speaker 0: hello world' (or
-    'speaker: ...'). Returns None for silence/empty chunks.
-
-    Args:
-        chunk_idx: Zero-based chunk index.
-        chunk_text: Decoded chunk text (special tokens already stripped).
-        frame_config: The processor's streaming frame config.
-        num_chunks: Total chunk count (for end-time clamping).
-        chunk_duration: Chunk duration in seconds (without lookahead).
-
-    Returns:
-        Dict with keys: speaker, text, start, end — or None.
-    """
+    """Parse one streaming chunk's 'speaker, content' text into a segment."""
     import re
     text = chunk_text.strip()
     if not text:
@@ -459,17 +399,7 @@ def _transcribe_streaming(
     max_new_tokens: int,
     temperature: float,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Transcribe via the chunked streaming protocol (ASR-Streaming checkpoints).
-
-    Drives :meth:`model.streaming_generate <VibeVoiceASRForConditionalGeneration.streaming_generate>`
-    (ported from upstream): prompt prefill, then per-chunk
-    ``[speech_start, features, speech_end]`` embeds followed by chunk text
-    terminated by ``<|text_chunk_end|>``. Chunks accumulate into segments and
-    drive the standard progress bar (one step per chunk, interruption-checked
-    between chunks).
-    """
-    # The model runs at a fixed 24 kHz (the tokenizers' trained rate); resample
-    # the incoming audio (the processor does the same for its own pipeline).
+    """Transcribe via the chunked streaming protocol (ASR-Streaming checkpoints)."""
     target_sr = frame_config["sample_rate"]
     if sample_rate != target_sr:
         audio_array = resample_audio(audio_array, orig_sr=sample_rate, target_sr=target_sr)
@@ -488,9 +418,6 @@ def _transcribe_streaming(
     chunk_duration = frame_config["chunk_duration"]
     total_chunks_est = max(1, math.ceil(duration / chunk_duration)) if chunk_duration else 1
 
-    # Chunk-count-based progress: exact total is known only inside the
-    # generator, so the bar starts with the estimate and is re-based when the
-    # real count arrives with the first yield.
     pbar = ProgressBarWithConsole(total_chunks_est)
     segments: List[Dict[str, Any]] = []
     texts: List[str] = []
@@ -524,8 +451,6 @@ def _transcribe_streaming(
         pbar.update_absolute(pbar.total)
         pbar.close()
 
-    # After the forwards, not at load time: this is the only point where the
-    # fast/streamed split says anything about this run. No-op for non-GGUF.
     log_gguf_forward_counters("asr_streaming")
 
     raw_text = "\n".join(texts)
@@ -535,22 +460,7 @@ def _transcribe_streaming(
 
 
 def _asr_processor_kind(processor: Any) -> str:
-    """Classify a processor for transcription-branch selection.
-
-    Returns one of:
-    - ``"native"``: the transformers builtin ``VibeVoiceAsrProcessor``
-      (checkpoint microsoft/VibeVoice-ASR-HF) — single-pass chat-template
-      transcription.
-    - ``"vendored"``: the ``src/vibevoice`` processor (streaming family and
-      original VibeVoice-ASR checkpoints).
-    - ``"unknown"``: anything else (plain test stubs) — legacy JSON-prompt
-      path.
-
-    Classification goes by the processor class's module, NOT
-    ``hasattr``/``getattr`` defaults: MagicMock-based processor stubs report
-    every attribute, which would hijack the native and streaming branches in
-    tests.
-    """
+    """Classify a processor for transcription-branch selection."""
     mod = getattr(type(processor), "__module__", "")
     if mod.startswith("transformers."):
         return "native"
@@ -571,28 +481,13 @@ def _transcribe_native(
     do_sample: bool,
     num_beams: int,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Transcribe via the HF-native protocol (microsoft/VibeVoice-ASR-HF).
-
-    Single-pass batch transcription through the transformers builtins:
-    ``apply_transcription_request`` builds the chat-template inputs (audio
-    placeholder expansion + optional hotword context), standard ``generate()``
-    produces the JSON-style output, and ``decode(return_format="parsed")``
-    splits it into ``Start/End/Speaker/Content`` segments. This is the same
-    7B ASR model as microsoft/VibeVoice-ASR, in its native form.
-    """
-    # The native feature extractor does NOT resample: it raises when the
-    # incoming rate differs from its declared rate (e.g. "trained using a
-    # sampling rate of 24000 ... not 44100"). Resample first — the same
-    # inbuilt conversion the vendored ASR processor performs on its
-    # ``target_sample_rate`` — and stop passing sampling_rate downstream so
-    # the extractor sees only its own rate.
+    """Transcribe via the HF-native protocol (microsoft/VibeVoice-ASR-HF)."""
     feature_extractor = getattr(processor, "feature_extractor", None)
     target_sr = getattr(feature_extractor, "sampling_rate", 24000)
     if sample_rate != target_sr:
         audio_array = resample_audio(audio_array, orig_sr=sample_rate, target_sr=target_sr)
         sample_rate = target_sr
 
-    # Build inputs (audio already at the extractor's rate).
     inputs = processor.apply_transcription_request(
         audio=np.ascontiguousarray(audio_array),
         prompt=context_info,
@@ -635,8 +530,6 @@ def _transcribe_native(
 
         raw_text = processor.decode(generated_ids, skip_special_tokens=True)[0]
 
-        # Parsed decode returns a list of dicts (or the raw string on parse
-        # failure); map onto our segment schema.
         segments: List[Dict[str, Any]] = []
         parsed = processor.decode(generated_ids, return_format="parsed")[0]
         if isinstance(parsed, list):
@@ -666,7 +559,6 @@ def _transcribe_native(
         pbar.update_absolute(pbar.total)
         pbar.close()
 
-    # After the forwards, not at load time — see log_gguf_forward_counters.
     log_gguf_forward_counters("asr_transcribe_native")
 
 
@@ -681,45 +573,18 @@ def transcribe_audio(
     do_sample: bool = True,
     num_beams: int = 1,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Transcribe audio using the VibeVoice ASR model.
-
-    Args:
-        model: VibeVoiceASRForConditionalGeneration instance.
-        processor: VibeVoiceASRProcessor instance.
-        audio_input: ComfyUI audio dict with 'waveform' and 'sample_rate'.
-        context_info: Optional hotwords/context info to improve accuracy.
-        max_new_tokens: Maximum tokens to generate.
-        temperature: Temperature for sampling (0 = greedy).
-        top_p: Top-p for nucleus sampling.
-        do_sample: Whether to use sampling.
-        num_beams: Number of beams for beam search (1 = no beam search).
-
-    Returns:
-        Tuple of (raw_text, segments) where segments is a list of dicts with
-        keys: speaker, text, start, end.
-
-    Raises:
-        ValueError: If audio input is invalid.
-        RuntimeError: If transcription fails.
-    """
-    # Extract audio tensor
+    """Transcribe audio using the VibeVoice ASR model."""
     waveform, sample_rate = extract_audio_tensor(audio_input, name="audio_input")
     if waveform is None:
         raise ValueError("Audio input is required for ASR transcription")
 
-    # Convert to numpy array for the processor
-    import numpy as np
     if waveform.dim() > 1:
-        # Take first channel and convert to 1D
         audio_array = waveform[0].cpu().numpy() if waveform.dim() == 2 else waveform[0, 0].cpu().numpy()
     else:
         audio_array = waveform.cpu().numpy()
 
     audio_array = audio_array.astype(np.float32)
 
-    # HF-native checkpoints (microsoft/VibeVoice-ASR-HF) use the transformers
-    # processor: single-pass chat-template transcription with native
-    # parsed-segment decoding.
     if _asr_processor_kind(processor) == "native":
         return _transcribe_native(
             model=model,
@@ -734,13 +599,6 @@ def transcribe_audio(
             num_beams=num_beams,
         )
 
-    # Streaming checkpoints (VibeVoice-ASR-Streaming-*) speak an exclusive
-    # chunked protocol ("transcribe streamingly with keys: speaker, content"
-    # + <|text_chunk_end|>-delimited per-chunk text) and produce garbage under
-    # the JSON-prompt generate() path used for non-streaming ASR checkpoints.
-    # The frame config in the processor's preprocessor_config.json is the
-    # marker (same detection the upstream streaming demo uses); only a real
-    # vendored processor is inspected (see _asr_processor_kind).
     if _asr_processor_kind(processor) == "vendored":
         frame_config = getattr(processor, "streaming_frame_config", None)
         if frame_config is not None:
@@ -755,7 +613,6 @@ def transcribe_audio(
                 temperature=temperature,
             )
 
-    # Process audio through the processor
     inputs = processor(
         audio=audio_array,
         sampling_rate=sample_rate,
@@ -765,14 +622,12 @@ def transcribe_audio(
         context_info=context_info,
     )
 
-    # Move inputs to model device
     device = next(model.parameters()).device
     inputs = {
         k: v.to(device) if isinstance(v, torch.Tensor) else v
         for k, v in inputs.items()
     }
 
-    # Prepare generation config
     generation_config = {
         "max_new_tokens": max_new_tokens,
         "pad_token_id": getattr(processor, "pad_id", None),
@@ -788,13 +643,8 @@ def transcribe_audio(
             generation_config["temperature"] = temperature
             generation_config["top_p"] = top_p
 
-    # Remove None values
     generation_config = {k: v for k, v in generation_config.items() if v is not None}
 
-    # Standard ComfyUI progress bar. HF generate() reports per-token progress
-    # through a streamer (greedy/sampling only; beam search falls back to a
-    # single 0->100% bar because plain token streamers are beam-incompatible).
-    # Drives both the frontend bar and the standard tqdm console bar.
     pbar = ProgressBarWithConsole(max_new_tokens)
     use_streamer = generation_config.get("num_beams", 1) <= 1
     streamer = _ASRProgressStreamer(pbar, total=max_new_tokens) if use_streamer else None
@@ -807,11 +657,9 @@ def transcribe_audio(
                 **({"streamer": streamer} if streamer is not None else {}),
             )
 
-        # Decode output (exclude input tokens)
         input_length = inputs["input_ids"].shape[1]
         generated_ids = output_ids[0, input_length:]
 
-        # Remove padding/eos tokens from the end
         if hasattr(processor, "tokenizer") and hasattr(processor.tokenizer, "eos_token_id"):
             eos_id = processor.tokenizer.eos_token_id
             if eos_id is not None:
@@ -819,10 +667,8 @@ def transcribe_audio(
                 if len(eos_positions) > 0:
                     generated_ids = generated_ids[:eos_positions[0] + 1]
 
-        # Decode to text
         raw_text = processor.decode(generated_ids, skip_special_tokens=True)
 
-        # Parse structured output
         try:
             segments = processor.post_process_transcription(raw_text)
         except Exception as e:
@@ -839,37 +685,20 @@ def transcribe_audio(
         logger.error(f"ASR transcription failed: {e}")
         raise RuntimeError(f"Transcription failed: {e}")
     finally:
-        # Guarantee the final 100% event even when generation stopped early
-        # (EOS before max_new_tokens) or raised.
         pbar.update_absolute(pbar.total)
         pbar.close()
 
-    # After the forwards, not at load time — see log_gguf_forward_counters.
     log_gguf_forward_counters("asr_transcribe_audio")
 
 
 def force_offload_asr_model(model_name: str, patcher=None) -> None:
-    """Force offload ASR model from VRAM.
-
-    When ``patcher`` is provided (the patched path introduced for CRIT-001), the
-    patcher's ``unpatch_model`` is used so the model leaves the unified VRAM
-    system cleanly and the ASR cache entry is cleared. When omitted, the legacy
-    direct-load cache is cleared (backwards-compatible path).
-
-    Args:
-        model_name: Name of the model (for logging).
-        patcher: Optional :class:`VibeVoiceASRPatcher` instance to offload.
-    """
+    """Force offload ASR model from VRAM."""
     logger.info(f"Force offloading VibeVoice ASR model '{model_name}' from VRAM...")
     if patcher is not None:
         if patcher.is_loaded:
-            # Plan 2026-08-18 D5: user-requested force offload keeps its
-            # destructive semantics via the explicit flag (the default
-            # unpatch_model is now non-destructive, RC-6).
             patcher.unpatch_model(unpatch_weights=True, destroy=True)
         model_management.unload_all_models()
     else:
-        # Legacy path (no patcher): clear the direct ASR cache.
         cleanup_asr_models()
     gc.collect()
     model_management.soft_empty_cache()

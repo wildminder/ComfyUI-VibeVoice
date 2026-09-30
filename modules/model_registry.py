@@ -6,25 +6,6 @@ per family (``"tts"`` / ``"asr"``) and for fully releasing a superseded model
 BEFORE any allocation for a replacement begins.
 
 Single-active-bundle semantics: at most one live bundle per cache key.
-
-Design notes:
-
-- ``comfy.model_management`` is imported lazily inside the functions so this
-  module stays importable under the CPU-only test stubs (conftest) and never
-  participates in an import cycle with ``modules.patcher`` / ``modules.loader``
-  (patcher caches are passed in by the callers).
-- Every destructive sub-step is individually exception-guarded: a failure in
-  one step must never block the remaining release steps (a half-released model
-  is still better than a leaked one, and warnings surface the failure).
-- The BUNDLE registry exists because the patcher cache is NOT the only holder
-  of the weights. The external loader node returns the model bundle as a node
-  OUTPUT (``nodes/external_loader_node.VibeVoiceModel.Output``), and ComfyUI's
-  execution cache keeps that dict STRONGLY (``execution.CacheEntry.outputs``)
-  until the node leaves the prompt or re-executes. So popping our own
-  patcher-cache entry frees nothing: the cached bundle still references the
-  live ``nn.Module`` and its GPU/CPU tensors. Eviction must therefore
-  NEUTRALIZE the bundle (null its heavy fields) — see
-  :func:`register_model_bundle` / :func:`release_model_bundles`.
 """
 
 import gc
@@ -40,26 +21,15 @@ FAMILY_ASR = "asr"
 # family -> cache_key of the currently active model.
 _ACTIVE_KEYS: dict = {}
 
-# Fields of a model bundle that hold the heavy references (the instantiated
-# nn.Module and its processor). Nulling exactly these two drops the weights
-# while leaving the plain-string identity fields debuggable.
+# Fields of a model bundle that hold heavy references.
 _BUNDLE_HEAVY_FIELDS = ("model", "processor")
 
-# patcher cache_key -> the ONE live model bundle registered for that key.
-# Popping/clearing this dict alone frees nothing (ComfyUI's output cache owns
-# a strong ref to the bundle); release_model_bundles() nulls the heavy fields
-# of the bundle it removes.
+# patcher cache_key -> the live model bundle registered for that key.
 _BUNDLE_REGISTRY: dict = {}
 
 
 def _neutralize_bundle(bundle) -> None:
-    """Null a bundle's heavy fields, per-field guarded, never raising.
-
-    The identity fields (``model_name``, ``source_path``, ``attention_mode``,
-    ``use_llm_4bit``, ``dtype_str``, ``is_asr``, ...) are intentionally left
-    intact so the dict ComfyUI keeps cached stays small and inspectable — and
-    so a still-connected consumer of a DIFFERENT key keeps working.
-    """
+    """Null a bundle's heavy fields, per-field guarded, never raising."""
     if bundle is None:
         return
     for field in _BUNDLE_HEAVY_FIELDS:
@@ -72,17 +42,7 @@ def _neutralize_bundle(bundle) -> None:
 
 
 def register_model_bundle(cache_key: str, bundle) -> None:
-    """Record the live model bundle for ``cache_key``.
-
-    Single-slot-per-key semantics: if a DIFFERENT bundle was already registered
-    under ``cache_key`` it is neutralized first, then replaced. That self-heals
-    the external -> external re-execution case, where the loader node produces
-    a brand-new bundle dict for weights that are already cached. Re-registering
-    the SAME dict (the reused-patcher path) is a no-op replace — the live
-    bundle is never neutralized out from under its own consumer.
-
-    Never raises: registration is bookkeeping and must not break loading.
-    """
+    """Record the live model bundle for ``cache_key``."""
     try:
         previous = _BUNDLE_REGISTRY.get(cache_key)
         if previous is not None and previous is not bundle:
@@ -95,17 +55,7 @@ def register_model_bundle(cache_key: str, bundle) -> None:
 
 
 def release_model_bundles(cache_key: str) -> int:
-    """Neutralize the bundle registered under ``cache_key`` and drop it.
-
-    Only the given key is touched, so a consumer still connected to a DIFFERENT
-    key is never collateral damage.
-
-    Args:
-        cache_key: The patcher-cache key whose bundle is being evicted.
-
-    Returns:
-        ``1`` if a bundle was released, ``0`` if nothing was registered.
-    """
+    """Neutralize the bundle registered under ``cache_key`` and drop it."""
     try:
         bundle = _BUNDLE_REGISTRY.pop(cache_key, None)
     except Exception as e:
@@ -120,20 +70,10 @@ def release_model_bundles(cache_key: str) -> int:
 
 
 def get_live_bundle(cache_key: str):
-    """Return the bundle registered under ``cache_key`` if it is still usable.
-
-    "Live" means the heavy fields have not been retired, i.e. the weights are
-    still resident. Used by the loader node to recognise a cache hit: an
-    identical re-execution can reuse the already-built model instead of
-    building a second copy of it (see
-    :func:`~nodes.external_loader_node.VibeVoiceExternalLoaderNode.execute`).
-
-    Returns the bundle, or ``None`` when nothing is registered or the
-    registration has already been neutralized.
-    """
+    """Return the bundle registered under ``cache_key`` if it is still usable."""
     try:
         bundle = _BUNDLE_REGISTRY.get(cache_key)
-    except Exception as e:  # pragma: no cover - defensive
+    except Exception as e:
         logger.warning(
             f"model_registry.get_live_bundle({cache_key!r}) failed: {e}"
         )
@@ -143,23 +83,18 @@ def get_live_bundle(cache_key: str):
     try:
         if bundle.get("model") is None:
             return None
-    except Exception:  # pragma: no cover - a non-dict registration
+    except Exception:
         return None
     return bundle
 
 
 def clear_bundle_registry() -> None:
-    """Forget all bundle registrations (test isolation helper)."""
+    """Forget all bundle registrations."""
     _BUNDLE_REGISTRY.clear()
 
 
 def set_active(family: str, cache_key: str) -> None:
-    """Record ``cache_key`` as the active model for ``family``.
-
-    Args:
-        family: One of :data:`FAMILY_TTS` / :data:`FAMILY_ASR`.
-        cache_key: The patcher-cache key identifying the active model.
-    """
+    """Record ``cache_key`` as the active model for ``family``."""
     _ACTIVE_KEYS[family] = cache_key
 
 
@@ -169,7 +104,7 @@ def get_active(family: str) -> "str | None":
 
 
 def clear_active_keys() -> None:
-    """Forget all active-key bookkeeping (test isolation helper)."""
+    """Forget all active-key bookkeeping."""
     _ACTIVE_KEYS.clear()
 
 
@@ -181,31 +116,7 @@ def identity_for_external(
     dtype_str: str = "auto",
     prefix: str = "external",
 ) -> str:
-    """Build the file-identity-aware cache key for an externally-loaded model.
-
-    The key captures everything that changes the built weights: the weight
-    file itself (name + mtime_ns + size), the architecture config selector,
-    the RESOLVED attention mode, the 4-bit flag, and the requested dtype.
-    Different weight files (even sharing a config_name) never collide, and
-    re-running the same file + settings yields the identical key so the cached
-    patcher is reused without a reload.
-
-    Uses only the file's *basename* so no filesystem separators (:, /, \\)
-    leak into the key.
-
-    Args:
-        weight_path: Absolute path to the weight file. May be unreadable
-            (e.g. hand-built test bundles); the identity then degrades to a
-            stable placeholder instead of raising.
-        config_name: Architecture config selector (e.g. "VibeVoice-1.5B").
-        attention_mode: The RESOLVED attention mode (post-fallback).
-        use_llm_4bit: Whether the LLM was quantized to 4-bit.
-        dtype_str: The requested dtype string ("auto"/"bf16"/"fp16"/"fp32").
-        prefix: Key namespace ("external" for TTS, "asr_external" for ASR).
-
-    Returns:
-        Deterministic cache-key string.
-    """
+    """Build the file-identity-aware cache key for an externally-loaded model."""
     basename = os.path.basename(weight_path) if weight_path else ""
     mtime_ns = "0"
     size = "0"
@@ -215,7 +126,6 @@ def identity_for_external(
             mtime_ns = str(stat.st_mtime_ns)
             size = str(stat.st_size)
     except OSError:
-        # Unreadable/missing file: degrade to placeholders (deterministic).
         pass
 
     return (
@@ -228,23 +138,11 @@ def identity_for_external(
 
 
 def unregister_from_comfy(patcher) -> list:
-    """Remove ``patcher`` from ComfyUI's loaded-model registry.
-
-    Iterates ``comfy.model_management.current_loaded_models`` and drops every
-    entry whose wrapped model IS ``patcher``, detaching both finalizers first
-    so neither ComfyUI's GC hooks nor the entry itself can resurrect or further
-    track the dying patcher.
-
-    Args:
-        patcher: The ModelPatcher being evicted.
-
-    Returns:
-        The list of removed ``LoadedModel`` entries (for logging/tests).
-    """
+    """Remove ``patcher`` from ComfyUI's loaded-model registry."""
     removed = []
     try:
         import comfy.model_management as model_management
-    except Exception as e:  # pragma: no cover - defensive
+    except Exception as e:
         logger.warning(f"model_registry.unregister_from_comfy: cannot import comfy.model_management: {e}")
         return removed
 
@@ -262,8 +160,6 @@ def unregister_from_comfy(patcher) -> list:
             survivors.append(loaded)
             continue
 
-        # Detach both finalizers before dropping the entry so their callbacks
-        # never fire against the destroyed patcher/model.
         for attr in ("model_finalizer", "_patcher_finalizer"):
             finalizer = getattr(loaded, attr, None)
             if finalizer is not None:
@@ -291,29 +187,7 @@ def unregister_from_comfy(patcher) -> list:
 
 
 def evict_patcher(patcher, cache_dict: dict, key: str) -> list:
-    """Atomically and destructively evict one patcher.
-
-    Ordered release sequence (each step individually exception-guarded):
-
-        1. :func:`unregister_from_comfy` — drop from ComfyUI's registry.
-        2. ``patcher.unpatch_model(unpatch_weights=True, destroy=True)`` — null
-           handler refs, evict the model cache entry, free tensors.
-        3. ``cache_dict.pop(key)`` — remove the patcher-cache entry itself.
-        4. :func:`release_model_bundles` — neutralize the model bundle
-           registered under ``key`` (ComfyUI's output cache still holds it
-           strongly, so the heavy fields must be nulled explicitly).
-        5. ``gc.collect()`` — prompt the release of nulled references.
-        6. ``model_management.soft_empty_cache()`` — release cached VRAM.
-
-    Args:
-        patcher: The ModelPatcher to evict (may be a dead object reference).
-        cache_dict: The patcher cache dict holding ``key`` (or ``None``).
-        key: The cache key under which ``patcher`` is stored.
-
-    Returns:
-        List of human-readable error strings for steps that failed (empty on
-        full success). Eviction never raises.
-    """
+    """Atomically and destructively evict one patcher."""
     errors = []
 
     try:
@@ -332,8 +206,6 @@ def evict_patcher(patcher, cache_dict: dict, key: str) -> list:
     except Exception as e:
         errors.append(f"cache pop failed: {e}")
 
-    # ComfyUI's execution cache still holds the loader node's output bundle
-    # strongly, so popping the patcher entry alone leaks the weights.
     try:
         release_model_bundles(key)
     except Exception as e:
@@ -357,24 +229,7 @@ def evict_patcher(patcher, cache_dict: dict, key: str) -> list:
 
 
 def evict_if_changed(family: str, new_key: str, patcher_caches) -> list:
-    """Evict the previous active model of ``family`` when the key changed.
-
-    Single-active-model-per-family gate: call this BEFORE building/loading a
-    new model. When the recorded active key differs from ``new_key`` (including
-    the no-active-yet case), every patcher in ``patcher_caches`` whose key is
-    not ``new_key`` is destroyed via :func:`evict_patcher`, and ``new_key``
-    becomes the active key. A same-key call is a strict no-op.
-
-    Args:
-        family: :data:`FAMILY_TTS` or :data:`FAMILY_ASR`.
-        new_key: Cache key of the model about to be loaded.
-        patcher_caches: Iterable of patcher-cache dicts to sweep (only the
-            given dicts are touched — TTS eviction can never touch ASR caches
-            and vice versa).
-
-    Returns:
-        The list of evicted cache keys (empty when nothing changed).
-    """
+    """Evict the previous active model of ``family`` when the key changed."""
     active = get_active(family)
     if active == new_key:
         return []

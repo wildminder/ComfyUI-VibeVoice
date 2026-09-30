@@ -64,18 +64,7 @@ def resolve_orig_dtype(name):
 
 
 def assert_convrot_backend() -> str:
-    """Fail fast unless comfy-kitchen exposes the ConvRot INT8 capabilities.
-
-    Prefers an accelerated backend (cuda/triton); falls back to `eager`
-    (deterministic CPU execution used by the test suite).
-
-    Returns:
-        The name of the backend that will execute ConvRot layers.
-
-    Raises:
-        RuntimeError: When comfy-kitchen is missing or no available backend
-            lists both required capabilities.
-    """
+    """Fail fast unless comfy-kitchen exposes the ConvRot INT8 capabilities."""
     try:
         import comfy_kitchen
     except ImportError as e:
@@ -104,28 +93,19 @@ def assert_convrot_backend() -> str:
 class QuantLayerInfo:
     prefix: str
     group_size: int
-    in_features: int = 0   # 0 = not recorded; skip strict shape check
+    in_features: int = 0
     out_features: int = 0
     has_bias: bool = False
-    # False for PLAIN rowwise layers (no offline rotation): dequantized back
-    # to orig_dtype at load time instead of module replacement.
     convrot: bool = True
     orig_dtype: str = ""
     rowwise_dtype: "torch.dtype | None" = None
-    # True for fp8 layers executed RESIDENT (fp8 storage + scalar scale stay
-    # in VRAM; per-matmul dequant via comfy-kitchen). Requires a scalar
-    # per-tensor scale and an available kitchen fp8 backend; otherwise the
-    # layer falls back to dequant-at-load (plan 2026-08-27, D1/D3).
     resident_fp8: bool = False
 
 
 class ConvRotInt8Linear(nn.Module):
     """Drop-in nn.Linear replacement executing kitchen's INT8 ConvRot path."""
 
-    # Dtype-cast filter marker: int8 weight + fp32 scale must never be recast.
     _quant_resident = True
-    # Native comfy streaming (plan 2026-08-26): core may offload this module;
-    # forward pulls the int8 weight back through cast_bias_weight.
     comfy_cast_weights = True
     weight_function = []
     bias_function = []
@@ -136,8 +116,6 @@ class ConvRotInt8Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.convrot_groupsize = group_size
-        # Meta-safe: parameters start empty-shaped correctly; storage is
-        # assigned later by the loader (assign semantics).
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=torch.int8),
             requires_grad=False,
@@ -145,8 +123,6 @@ class ConvRotInt8Linear(nn.Module):
         self.weight_scale = nn.Parameter(
             torch.empty(out_features, 1, dtype=torch.float32), requires_grad=False
         )
-        # Documentation/core-interop marker: int8 storage is moved, never
-        # recast (our streamed forward handles pulls itself).
         self.weight_comfy_model_dtype = torch.int8
         self.bias = (
             nn.Parameter(torch.empty(out_features), requires_grad=False)
@@ -156,8 +132,6 @@ class ConvRotInt8Linear(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
-        # comfy_quant is metadata, not a tensor parameter; consume it here so
-        # it never surfaces as an unexpected key.
         state_dict.pop(f"{prefix}{QUANT_META_SUFFIX}", None)
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
@@ -188,19 +162,7 @@ class ConvRotInt8Linear(nn.Module):
         )
 
     def _forward_streamed(self, x):
-        """Paged path: pull the raw int8 weight through core's cast machinery.
-
-        2026-09-30 (see :meth:`modules.fp8_quant.FP8Linear._forward_streamed`
-        for the full reasoning): the old bare ``.to(x.device)`` existed to
-        dodge ``cast_bias_weight``'s DEFAULT activation-dtype cast, but core's
-        own quantized layers pass the weight dtype explicitly
-        (comfy/ops.py:1722). With ``dtype=torch.int8`` the int8 storage
-        survives and, under ModelPatcherDynamic, the returned tensor is the
-        vbar window (comfy/model_patcher.py:1993) so the bytes page
-        disk->VRAM instead of being copied whole per offloaded forward.
-        ``bias_dtype`` stays separate (comfy/ops.py:350-351); the uncast is a
-        stream sync / vbar unpin only (comfy/ops.py:444-462).
-        """
+        """Paged path: pull the raw int8 weight through core's cast machinery."""
         import comfy.ops
         import comfy_kitchen
 
@@ -253,31 +215,8 @@ def validate_group_size(group_size: int, in_features: int) -> None:
 
 
 def scan_checkpoint_quantization(weights_path) -> dict:
-    """Read every ``*.comfy_quant`` key from a safetensors file.
-
-    Recognized layer kinds:
-    - ``{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": G}``
-      → rotated ConvRot INT8 resident (module replacement + kitchen kernels).
-    - ``{"format": "int8_tensorwise", "per_row": true}`` (no convrot flag)
-      → plain rowwise int8; dequantized back to ``orig_dtype`` at load time.
-    - ``{"format": "float8_e4m3fn" | "float8_e5m2", "orig_dtype": ...}``
-      → rowwise fp8. With a SCALAR per-tensor scale and an available
-      comfy-kitchen fp8 backend the layer is marked ``resident_fp8`` (fp8
-      stays resident, dequantized per matmul); anything else (per-row
-      scales, no backend) falls back to dequant-at-load.
-
-    Returns:
-        {} for a plain float checkpoint; otherwise mapping of layer prefix ->
-        :class:`QuantLayerInfo`.
-
-    Raises:
-        UnsupportedQuantFormat: On formats this nodepack cannot execute
-            (never silently misreads INT8/fp8 weights as floats).
-    """
+    """Read every ``*.comfy_quant`` key from a safetensors file."""
     from safetensors import safe_open
-
-    # fp8 residency is a per-file decision: probe the kitchen backend ONCE.
-    # Lazy import keeps convrot_quant importable without fp8_quant's deps.
     from .fp8_quant import probe_fp8_backend
 
     fp8_backend = probe_fp8_backend()
@@ -315,21 +254,17 @@ def scan_checkpoint_quantization(weights_path) -> dict:
                 continue
 
             if fmt == CONVROT_FORMAT:
-                # int8_tensorwise WITHOUT the rotation flag: plain rowwise.
                 prefix = key[: -len(f".{QUANT_META_SUFFIX}")]
                 orig = str(meta.get("orig_dtype", ""))
-                resolve_orig_dtype(orig)  # fail fast on unknown targets
+                resolve_orig_dtype(orig)
                 quant_map[prefix] = _rowwise_info(
                     f, key_names, prefix, meta,
-                    rowwise_dtype=None,  # int8 storage
+                    rowwise_dtype=None,
                     orig_dtype=orig,
                 )
                 continue
 
             if fmt == "int8_blockwise":
-                # Per-group-of-input scales: scale shape [out, in / group_size].
-                # Metadata carries NO rotation flag -> treated as unrotated;
-                # executed via dequant-at-load.
                 prefix = key[: -len(f".{QUANT_META_SUFFIX}")]
                 orig = str(meta.get("orig_dtype", ""))
                 resolve_orig_dtype(orig)
@@ -345,9 +280,6 @@ def scan_checkpoint_quantization(weights_path) -> dict:
                 prefix = key[: -len(f".{QUANT_META_SUFFIX}")]
                 orig = str(meta.get("orig_dtype", ""))
                 resolve_orig_dtype(orig)
-                # Residency requires a per-TENSOR scale: the kitchen kernel
-                # dequantizes with one scalar. [out, 1] per-row scales keep
-                # the legacy dequant-at-load path.
                 s_key = f"{prefix}.weight_scale"
                 scalar_scale = False
                 if fp8_backend is not None and s_key in key_names:

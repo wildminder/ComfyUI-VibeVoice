@@ -283,32 +283,49 @@ class TestStreamingBatchParity:
 # ====================================================================
 
 class TestStreamingStructuralGuarantees:
-    def test_quant_safetensors_map_once_for_scales_only(
+    def test_quant_safetensors_read_scales_without_mapping_the_file(
             self, tmp_path, stubbed_load_env):
-        """Pass-1 maps the file ONCE through core's reader (aimdo: zero-copy
-        file-backed views, dict dropped after the tiny scales are cloned out);
-        the stream then assigns views directly. No WEIGHT materialization —
-        the old safe_open per-scale pre-read committed ~1x file in private
-        on Windows (measured, tests/probe_external_fp8_full_path.py)."""
+        """Pass 1 must NOT open a mapping of the checkpoint.
+
+        ``safe_open`` maps the whole file, and on Windows the first read
+        through that mapping commits ~1x file size as private, untouched
+        memory that stays pinned for as long as the tensor lives (measured:
+        +9,050 MB on the real 9.47 GB fp8 checkpoint — see
+        tests/probe_external_fp8_full_path.py). The header already records
+        each tensor's byte range, so the scales come from those ranges and
+        the file is never mapped to get them.
+        """
+        import safetensors
+
+        from ComfyUI_VibeVoice.modules.external_loader import (
+            read_safetensors_tensors_by_name,
+        )
+
         run, _ = stubbed_load_env
         p = _save_mixed(tmp_path / "noload.safetensors")
 
-        calls = []
-        real = comfy.utils.load_torch_file
+        def _forbidden(*a, **kw):
+            raise AssertionError("the scale pre-read must not map the file")
 
-        def _spy(path, **kw):
-            calls.append(str(path))
-            return real(path, **kw)
+        with patch.object(safetensors, "safe_open", side_effect=_forbidden):
+            scales = read_safetensors_tensors_by_name(
+                str(p),
+                ["model.language_model.layers.0.self_attn.q_proj.weight_scale"],
+            )
+        assert scales, "the scale pre-read returned nothing"
 
-        with patch.object(comfy.utils, "load_torch_file", side_effect=_spy):
-            bundle = run(p)
-
-        # Exactly one mapping (pass-1); no dense full-dict read.
-        assert calls == [str(p)]
+        bundle = run(p)
         assert bundle["weight_family"] == "convrot_int8"
 
-    def test_dense_safetensors_still_use_batch_loader(
-            self, tmp_path, stubbed_load_env):
+    def test_dense_safetensors_stream_per_tensor(self, tmp_path, stubbed_load_env):
+        """The dense route streams too — no full-file state dict is built.
+
+        Building the whole CPU dict and then ``model.to(device)`` is what made
+        BF16/FP16 checkpoints page-fault the file mapping on the way to VRAM.
+        Every route now assigns per-tensor through the same streaming assign.
+        """
+        from ComfyUI_VibeVoice.modules.loader import VibeVoiceLoader
+
         run, _ = stubbed_load_env
         g = torch.Generator().manual_seed(3)
         dense = {
@@ -319,18 +336,23 @@ class TestStreamingStructuralGuarantees:
         p = tmp_path / "dense.safetensors"
         save_file(dense, str(p))
 
-        calls = []
-        real = comfy.utils.load_torch_file
+        consumed = []
+        real_apply = VibeVoiceLoader._stream_apply_dense
 
-        def _spy(path, **kw):
-            calls.append(str(path))
-            return real(path, **kw)
+        def _spy_apply(model, tensor_pairs, **kw):
+            consumed.append(type(tensor_pairs).__name__)
+            return real_apply(model, tensor_pairs, **kw)
 
-        with patch.object(comfy.utils, "load_torch_file", side_effect=_spy):
+        with patch.object(EL.VibeVoiceLoader, "_stream_apply_dense",
+                          staticmethod(_spy_apply)):
             bundle = run(p)
 
-        assert calls == [str(p)]
         assert bundle["weight_family"] == "dense"
+        # A generator, not a dict: the dense route consumes the file the same
+        # per-tensor way the quant route does.
+        assert consumed == ["generator"]
+        embed = bundle["model"].model.language_model.embed_tokens.weight
+        assert torch.equal(embed.data, dense["model.language_model.embed_tokens.weight"])
 
     def test_zero_kitchen_dequant_calls_and_fp8_byte_accounting(
             self, tmp_path, stubbed_load_env):
@@ -937,9 +959,9 @@ class TestASRStreaming:
 
         assert bundle["is_asr"] is True
         assert bundle["weight_family"] == "convrot_int8"
-        # The ASR quant path maps the file exactly once (pass-1 scale
-        # pre-read through core's aimdo arm) — no full-dict weight read.
-        assert calls == [str(p)]
+        # The ASR quant route assigns per-tensor from the file generator and
+        # never builds a full-dict weight read.
+        assert calls == []
         q = bundle["model"].model.language_model.layers[0].self_attn.q_proj
         assert isinstance(q, ConvRotInt8Linear)
         assert q.weight.dtype == torch.int8

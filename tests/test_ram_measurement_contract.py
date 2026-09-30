@@ -116,23 +116,38 @@ class TestTheDenseRouteIsSampled:
     Asserted against the SOURCE: a real load is a multi-GB event and the
     wiring is a static property — the wrapper is a call the loader makes, so
     the call being absent IS the regression.
+
+    The dense route used to be two phases (``dense-read-state-dict`` then
+    ``dense-bind-state-dict``). Streaming merged them into one: the bind now
+    happens per-tensor, so a single wrapper around the stream is both the read
+    and the bind.
     """
 
-    def test_the_dense_file_read_is_sampled(self):
+    def test_the_dense_stream_is_sampled(self):
         source = inspect.getsource(external_loader)
-        assert 'measured_load("dense-read-state-dict")' in source, (
-            "reading a dense checkpoint into host RAM is a whole-file event "
-            "that resolves before the post-H2D census runs; without a sampled "
-            "block the dense 1.5B route has no observable peak"
+        assert 'measured_load("dense-stream-apply")' in source, (
+            "streaming a dense checkpoint onto the device is a whole-file "
+            "event that resolves before the post-H2D census runs; without a "
+            "sampled block the dense 1.5B route has no observable peak"
         )
 
-    def test_the_dense_bind_into_the_model_is_sampled(self):
-        source = inspect.getsource(external_loader)
-        assert 'measured_load("dense-bind-state-dict")' in source, (
-            "the bind is where the state dict's bytes are either kept as aimdo "
-            "views or become host copies — the exact question the 1.5B "
-            "retention turns on, and it is over before the census runs"
-        )
+    def test_the_dense_stream_is_the_only_dense_read(self):
+        """The batch read/bind pair is gone from both loader branches.
+
+        ``dense-read-state-dict`` / ``dense-bind-state-dict`` only survive in
+        the unreachable ConvRot batch fallback; a live dense load must not go
+        through it, or the whole-tree ``model.to()`` comes back with it.
+        """
+        from ComfyUI_VibeVoice.modules import external_loader as EL
+
+        for fn in (EL.load_external_vibevoice_model,
+                   EL.load_external_vibevoice_asr_model):
+            src = inspect.getsource(fn)
+            dense = src[src.index("_stream_apply_dense_safetensors("):]
+            dense = dense.split("cast_model_to_dtype_if_needed")[0]
+            assert "dense-read-state-dict" not in dense
+            assert "dense-bind-state-dict" not in dense
+            assert "_load_weight_state_dict(" not in dense
 
     @pytest.mark.parametrize("module", [generation, asr_generation])
     def test_the_h2d_phase_that_grows_core_pin_buffers_is_sampled(self, module):

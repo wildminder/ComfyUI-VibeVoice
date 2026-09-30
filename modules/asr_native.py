@@ -33,37 +33,22 @@ MIN_TRANSFORMERS_VERSION = "5.3.0"
 # Composite sub-configs that may ONLY run eager attention. The acoustic and
 # semantic tokenizer encoders are ConvNext-based; an explicit sdpa/flash
 # request raises "does not support ... scaled_dot_product_attention" inside
-# their forward. Same rule as the from_pretrained kwargs in
-# ``modules/asr_loader.py``, expressed on config OBJECTS here: the native
-# ctor takes no ``attn_implementation`` and VibeVoiceAsrConfig has no
-# ``set_attn_implementation``, but the ctor builds its submodules from these
-# very config objects (``AutoModelForCausalLM.from_config(text_config)`` /
-# ``AutoModel.from_config(acoustic_tokenizer_encoder_config)``), so writing
-# them before construction is what makes the routing survive.
+# their forward.
 _LM_ONLY = ("acoustic_tokenizer_encoder_config", "semantic_tokenizer_encoder_config")
 
-# The only attention implementation the ConvNext encoders accept.
 _EAGER_ONLY = "eager"
 
 # ------------------------------------------------------------------
 # Packaged assets
 # ------------------------------------------------------------------
 
-# Architecture config (the same file _PACKAGED_CONFIG_FILES points at).
 PACKAGED_ASR_CONFIG_FILE = "default_VibeVoice-ASR_config.json"
 
-# The small processor assets. A native VibeVoiceAsrProcessor cannot be built
-# from a partial set: with only a tokenizer AutoProcessor silently returns a
-# TokenizersBackend, and without the chat template
-# apply_transcription_request() raises. All four ship together.
 PACKAGED_TOKENIZER_FILE = "tokenizer.json"
 PACKAGED_TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
 PACKAGED_PROCESSOR_CONFIG_FILE = "processor_config.json"
 PACKAGED_CHAT_TEMPLATE_FILE = "chat_template.jinja"
 
-# The processor assets that are read verbatim from the packaged directory
-# (everything except the ~7 MB tokenizer, which is resolved separately so a
-# user-supplied tokenizer next to the weight file still wins).
 PROCESSOR_ASSET_FILES = (
     PACKAGED_TOKENIZER_CONFIG_FILE,
     PACKAGED_PROCESSOR_CONFIG_FILE,
@@ -72,29 +57,18 @@ PROCESSOR_ASSET_FILES = (
 
 
 def _packaged_configs_dir() -> str:
-    """Return the packaged configs directory.
-
-    Imported lazily: ``external_loader`` dispatches into this module, so a
-    module-level import would close an import cycle.
-    """
     from . import external_loader
 
     return external_loader._packaged_configs_dir()
 
 
 def packaged_asset_path(filename: str) -> str:
-    """Return the absolute path of a packaged asset (whether or not it exists)."""
+    """Return the absolute path of a packaged asset."""
     return os.path.normpath(os.path.join(_packaged_configs_dir(), filename))
 
 
 def packaged_processor_assets() -> dict:
-    """Return ``{filename: path}`` for the three small processor assets.
-
-    Raises:
-        FileNotFoundError: If any of them is missing from the node folder, so
-            a broken install fails with the file name instead of a downstream
-            processor construction error.
-    """
+    """Return ``{filename: path}`` for the three small processor assets."""
     missing = [name for name in PROCESSOR_ASSET_FILES if not os.path.exists(packaged_asset_path(name))]
     if missing:
         raise FileNotFoundError(
@@ -105,23 +79,7 @@ def packaged_processor_assets() -> dict:
 
 
 def resolve_asset_file(filename: str, asset_dir: str) -> str:
-    """Resolve an asset file next to the weight file, else from the node folder.
-
-    Mirrors the sidecar-first rule of
-    :func:`external_loader.resolve_sidecar_config`: a user-supplied file in
-    ``asset_dir`` always beats the packaged copy, and the packaged copy is
-    read in place (never copied into the user's model directory).
-
-    Args:
-        filename: Asset file name, e.g. ``"tokenizer.json"``.
-        asset_dir: Directory next to the weight file (may be empty).
-
-    Returns:
-        Absolute path to the file to read.
-
-    Raises:
-        FileNotFoundError: If the asset is in neither location.
-    """
+    """Resolve an asset file next to the weight file, else from the node folder."""
     if asset_dir:
         local = os.path.join(asset_dir, filename)
         if os.path.exists(local):
@@ -157,17 +115,7 @@ def read_text_asset(path: str) -> str:
 
 
 def import_native_processor_classes():
-    """Import the transformers classes a native ASR processor is built from.
-
-    Returns:
-        Tuple of ``(VibeVoiceAsrProcessor,
-        VibeVoiceAcousticTokenizerFeatureExtractor, Qwen2TokenizerFast)``.
-
-    Raises:
-        RuntimeError: If the installed transformers predates native
-            VibeVoice-ASR support (the ``ImportError`` is chained so the
-            original message stays readable).
-    """
+    """Import the transformers classes a native ASR processor is built from."""
     try:
         import transformers
         from transformers import Qwen2TokenizerFast, VibeVoiceAsrProcessor
@@ -188,24 +136,7 @@ def import_native_processor_classes():
 
 
 def _resolve_feature_extractor_kwargs(preprocessor_path: str) -> dict:
-    """Return the feature-extractor kwargs: packaged defaults + sidecar overlay.
-
-    The packaged ``processor_config.json["feature_extractor"]`` is the base
-    (sampling_rate 24000, normalize_audio true, target_dB_FS -25, eps 1e-6 —
-    the values the checkpoint was trained with); the optional sidecar that
-    :func:`external_loader.resolve_sidecar_preprocessor` returned is overlaid
-    on top key by key. An empty path means "no overlay", never a crash.
-
-    Args:
-        preprocessor_path: Resolved preprocessor sidecar path (may be empty).
-
-    Returns:
-        Keyword arguments for the feature extractor.
-
-    Raises:
-        FileNotFoundError: If the packaged processor config carries no
-            ``feature_extractor`` section (broken install).
-    """
+    """Return the feature-extractor kwargs: packaged defaults + sidecar overlay."""
     packaged = read_json_asset(
         packaged_asset_path(PACKAGED_PROCESSOR_CONFIG_FILE)
     ).get("feature_extractor")
@@ -220,41 +151,7 @@ def _resolve_feature_extractor_kwargs(preprocessor_path: str) -> dict:
 
 
 def build_native_asr_processor(tokenizer_dir: str, preprocessor_path: str = ""):
-    """Build a native ``transformers.VibeVoiceAsrProcessor`` from components.
-
-    ``AutoProcessor.from_pretrained`` is deliberately NOT used. It is
-    directory-based, and a weight directory that carries no processor assets
-    fails SILENTLY in shape — measured on transformers 5.3.0, reading a
-    directory holding only ``tokenizer.json`` returns a ``TokenizersBackend``
-    (not a processor at all); adding ``tokenizer_config.json`` raises
-    ``OSError: Can't load feature extractor``; adding ``processor_config.json``
-    yields a processor whose ``apply_transcription_request`` then raises
-    ``ValueError: Cannot use apply_chat_template because this processor does
-    not have a chat template`` until ``chat_template.jinja`` is present too.
-    A native model also cannot be paired with the vendored processor: the
-    vendored one emits ``{input_ids, acoustic_input_mask, speech,
-    vae_tok_len}`` while the native forward takes ``(input_ids,
-    attention_mask, input_values, padding_mask)``.
-
-    So the same four files are read directly — sidecar-first, packaged as
-    fallback — and the objects are constructed by hand. Nothing is ever
-    written into the user's model directory.
-
-    Args:
-        tokenizer_dir: Directory searched first for the tokenizer assets (the
-            weight file's own directory; may be empty).
-        preprocessor_path: Path returned by
-            :func:`external_loader.resolve_sidecar_preprocessor`. Overlays the
-            packaged feature-extractor settings; empty means no overlay.
-
-    Returns:
-        A ``transformers.VibeVoiceAsrProcessor``.
-
-    Raises:
-        RuntimeError: If the installed transformers has no native ASR
-            processor, or the constructed object is not one.
-        FileNotFoundError: If a required asset is in neither location.
-    """
+    """Build a native ``transformers.VibeVoiceAsrProcessor`` from components."""
     (
         processor_cls,
         feature_extractor_cls,
@@ -265,8 +162,6 @@ def build_native_asr_processor(tokenizer_dir: str, preprocessor_path: str = ""):
     tokenizer_config = read_json_asset(
         resolve_asset_file(PACKAGED_TOKENIZER_CONFIG_FILE, tokenizer_dir)
     )
-    # tokenizer_file is ours to set; a sidecar config that also names one must
-    # not collide with that keyword argument.
     tokenizer_config.pop("tokenizer_file", None)
 
     processor_config = read_json_asset(
@@ -294,9 +189,6 @@ def build_native_asr_processor(tokenizer_dir: str, preprocessor_path: str = ""):
         audio_duration_token=processor_config["audio_duration_token"],
     )
 
-    # asr_generation._asr_processor_kind classifies by class module, so a
-    # silently wrong object type routes transcription into the vendored
-    # branch and only fails deep inside generation. Fail at load time.
     if not isinstance(processor, processor_cls):
         raise RuntimeError(
             f"Native VibeVoice-ASR processor construction returned "
@@ -308,42 +200,11 @@ def build_native_asr_processor(tokenizer_dir: str, preprocessor_path: str = ""):
 
 # ------------------------------------------------------------------
 # Model class selection
-#
-# Two ASR families share the node's "VibeVoice-ASR" branch and need
-# DIFFERENT classes, so the checkpoint's own ``model_type`` decides:
-#
-#   native  ("vibevoice_asr")  -> transformers' VibeVoiceAsrConfig /
-#                                 VibeVoiceAsrForConditionalGeneration
-#                                 (checkpoint keys ``language_model.model.*``)
-#   vendored ("vibevoice")     -> src/vibevoice's VibeVoiceASRConfig /
-#                                 VibeVoiceASRForConditionalGeneration
-#                                 (checkpoint keys ``model.language_model.*``)
-#
-# Guessing wrong is silent in both directions: the vendored config's
-# ``__init__`` reads ``decoder_config`` / ``acoustic_tokenizer_config`` keys
-# that a native config does not carry (they land in ``**kwargs`` and the Qwen2
-# default hidden size survives), and the vendored model nests everything under
-# ``self.model``, producing ``model.language_model.*`` keys for a checkpoint
-# that stores ``language_model.model.*``.
-#
-# ``transformers`` is imported LAZILY, inside the functions below: a
-# module-scope import would add a multi-second cost to every
-# ``import external_loader`` and would make the version guard impossible to
-# exercise without uninstalling transformers.
 # ------------------------------------------------------------------
 
 
 def import_native_asr_classes():
-    """Import the transformers classes a native ASR checkpoint needs.
-
-    Returns:
-        Tuple of ``(AutoConfig, VibeVoiceAsrForConditionalGeneration)``.
-
-    Raises:
-        RuntimeError: If the installed transformers predates native
-            VibeVoice-ASR support (the ``ImportError`` is chained so the
-            original message stays readable).
-    """
+    """Import the transformers classes a native ASR checkpoint needs."""
     try:
         from transformers import AutoConfig, VibeVoiceAsrForConditionalGeneration
     except ImportError as e:
@@ -365,18 +226,7 @@ def native_asr_available() -> bool:
 
 
 def is_native_asr_config_path(path) -> bool:
-    """Return True when ``path`` holds a native (``model_type "vibevoice_asr"``) config.
-
-    Reads only the JSON — no transformers import, no model build — so the
-    loader can pick a class before doing any heavy work.
-
-    Args:
-        path: Path to a ``config.json`` file, or to a directory holding one.
-
-    Returns:
-        True on a readable config declaring the native model_type; False on
-        any other model_type, a missing file, or unreadable/invalid JSON.
-    """
+    """Return True when ``path`` holds a native config."""
     if not path:
         return False
     config_file = os.path.join(path, "config.json") if os.path.isdir(path) else path
@@ -391,32 +241,13 @@ def is_native_asr_config_path(path) -> bool:
 
 
 def load_native_asr_config(path):
-    """Load a native ASR config through ``AutoConfig``.
-
-    Args:
-        path: Path to a ``config.json`` file, or to a directory holding one.
-
-    Returns:
-        A ``VibeVoiceAsrConfig`` instance.
-
-    Raises:
-        RuntimeError: If the installed transformers is too old.
-    """
+    """Load a native ASR config through ``AutoConfig``."""
     AutoConfig, _ = import_native_asr_classes()
     return AutoConfig.from_pretrained(path)
 
 
 def apply_native_attn_implementation(config, mode: str) -> None:
-    """Route ``mode`` to the language model and pin the encoders to eager.
-
-    Writes ``_attn_implementation`` on the root config and on ``text_config``
-    (the language model), and ``"eager"`` on every ConvNext encoder sub-config
-    present.
-
-    Args:
-        config: A native ASR config (the root config, not a sub-config).
-        mode: Requested attention implementation, e.g. ``"sdpa"``.
-    """
+    """Route ``mode`` to the language model and pin the encoders to eager."""
     config._attn_implementation = mode
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
@@ -433,34 +264,11 @@ def instantiate_native_asr_model(
     final_load_dtype: torch.dtype,
     use_meta: bool = True,
 ):
-    """Build a ``VibeVoiceAsrForConditionalGeneration`` from a native config.
-
-    Native counterpart of the vendored instantiation in
-    :mod:`modules.external_loader`: applies the attention routing and the
-    dtype to the config objects, then constructs the class directly
-    (bypassing ``from_pretrained``) so the state dict can be bound
-    afterwards. By default construction runs under a ``torch.device("meta")``
-    context — zero RAM, zero random init; the weights are bound afterwards by
-    the shared assign-loading path.
-
-    Args:
-        config: A native ASR config.
-        attn_implementation: Requested attention implementation.
-        final_load_dtype: torch.dtype for the model.
-        use_meta: Construct under a meta device context (default True).
-
-    Returns:
-        Model instance (weights not yet loaded).
-
-    Raises:
-        RuntimeError: If the installed transformers is too old.
-    """
+    """Build a ``VibeVoiceAsrForConditionalGeneration`` from a native config."""
     _, model_cls = import_native_asr_classes()
 
     apply_native_attn_implementation(config, attn_implementation)
 
-    # Dtype on the root AND on text_config: the submodules are built FROM
-    # text_config, so a dtype recorded only on the root is not inherited.
     set_config_dtype(config, final_load_dtype)
     text_config = getattr(config, "text_config", None)
     if text_config is not None:

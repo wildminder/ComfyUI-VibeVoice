@@ -32,7 +32,7 @@ from ..src.vibevoice.processor.vibevoice_tokenizer_processor import VibeVoiceTok
 from ..src.vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceTextTokenizerFast
 
 from .model_info import AVAILABLE_VIBEVOICE_MODELS, MODEL_CONFIGS
-from .base_loader import BaseVibeVoiceLoader
+from .base_loader import BaseVibeVoiceLoader, place_tensor_on_device
 from .attention_utils import (
     SAGE_ATTENTION_AVAILABLE,
     ATTENTION_MODES,
@@ -125,7 +125,6 @@ def mark_optional_absent(
     return known
 
 
-
 def _recompute_rope_buffers(model) -> int:
     """Recompute RoPE ``inv_freq`` buffers destroyed by meta-init (v2.3.2 fix).
 
@@ -164,7 +163,6 @@ def _recompute_rope_buffers(model) -> int:
             if rope_type == "default" and hasattr(module, "compute_default_rope_parameters"):
                 inv_freq, _ = module.compute_default_rope_parameters(config, device="cpu")
             else:
-                # Non-default rope types resolve through the shared init table.
                 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
                 rope_init_fn = ROPE_INIT_FUNCTIONS.get(rope_type)
                 if rope_init_fn is None:
@@ -181,7 +179,7 @@ def _recompute_rope_buffers(model) -> int:
                     "original_inv_freq", inv_freq.clone(), persistent=False
                 )
             recomputed += 1
-        except Exception as e:  # pragma: no cover - defensive
+        except Exception as e:
             logger.warning(
                 f"Could not recompute RoPE inv_freq for "
                 f"{module.__class__.__name__}: {e}"
@@ -192,25 +190,7 @@ def _recompute_rope_buffers(model) -> int:
 
 
 def _assert_shapes_compatible(model, state_dict, max_reported: int = 5) -> None:
-    """Raise a friendly error when checkpoint shapes contradict the model.
-
-    Plan 2026-08-27 (D8): a config/weights family mismatch would otherwise
-    surface as torch's raw ``size mismatch`` RuntimeError deep inside
-    ``load_state_dict``. Comparing the shapes of keys present in BOTH the
-    checkpoint and the model first lets us name the offending keys and hint
-    at the likely cause (wrong config_name) before any load work begins.
-    Meta parameters still carry their shape, so this works on meta-
-    initialized models. Missing / unexpected keys are NOT compared —
-    ``strict=False`` handles those separately.
-
-    Args:
-        model: Instantiated model (meta- or eager-initialized).
-        state_dict: Checkpoint state dict.
-        max_reported: How many mismatched keys to enumerate in the message.
-
-    Raises:
-        ValueError: When at least one shared key has a contradictory shape.
-    """
+    """Raise a friendly error when checkpoint shapes contradict the model."""
     model_tensors = dict(model.named_parameters(remove_duplicate=False))
     model_tensors.update(dict(model.named_buffers()))
 
@@ -230,12 +210,7 @@ def _assert_shapes_compatible(model, state_dict, max_reported: int = 5) -> None:
 
 
 def _shape_mismatch_error(model, mismatches, max_reported: int = 5):
-    """Build the friendly config/weights-mismatch ValueError.
-
-    Shared by the batch pre-check (``_assert_shapes_compatible``) and the
-    per-tensor streaming loader, which raises on the FIRST mismatch it sees
-    instead of collecting them all.
-    """
+    """Build the friendly config/weights-mismatch ValueError."""
     lines = [
         f"  {key}: checkpoint shape {ckpt} vs model shape {mdl}"
         for key, ckpt, mdl in mismatches[:max_reported]
@@ -256,17 +231,7 @@ LOADED_MODELS_CACHE = {}
 
 
 def cleanup_old_models(keep_cache_key: str = None) -> None:
-    """Remove all cached models except the one matching keep_cache_key.
-
-    Plan 2026-08-20 (C5): the patcher loop routes through
-    ``model_registry.evict_patcher`` — a behavior superset of the previous
-    inline destroy (it also unregisters the patcher from ComfyUI's
-    ``model_management.current_loaded_models``). The ``LOADED_MODELS_CACHE``
-    loop and ``keep_cache_key`` semantics are unchanged.
-
-    Args:
-        keep_cache_key: Cache key to preserve. If None, all are cleared.
-    """
+    """Remove all cached models except the one matching keep_cache_key."""
     from .utils import VIBEVOICE_PATCHER_CACHE
     from .model_registry import evict_patcher
 
@@ -280,9 +245,6 @@ def cleanup_old_models(keep_cache_key: str = None) -> None:
         if key != keep_cache_key:
             patcher = VIBEVOICE_PATCHER_CACHE.get(key)
             try:
-                # Explicit destructive free via the registry primitive:
-                # unregister from ComfyUI -> destroy -> pop cache -> gc ->
-                # soft_empty_cache (each step individually guarded).
                 evict_patcher(patcher, VIBEVOICE_PATCHER_CACHE, key)
             except Exception as e:
                 logger.warning(f"Error cleaning up patcher {key}: {e}")
@@ -311,16 +273,10 @@ class VibeVoiceModelHandler(torch.nn.Module):
         self.model_pack_name = model_pack_name
         self.attention_mode = attention_mode
         self.use_llm_4bit = use_llm_4bit
-        # DF-004/AUD-008: the user-selected dtype is threaded into the loader
-        # so the final dtype is applied ON CPU during load (before the single
-        # H2D transfer), instead of being re-resolved to "auto" here.
         self.dtype_str = dtype_str
         self.cache_key = f"{self.model_pack_name}_attn_{attention_mode}_q4_{int(use_llm_4bit)}"
         self.model = None
         self.processor = None
-        # Device attribute — ComfyUI's ModelPatcher reads/writes this to track
-        # which device the model is currently on. Initialized to CPU; will be
-        # updated by ModelPatcher.load() when the model is moved to GPU.
         self.device = None
 
         info = AVAILABLE_VIBEVOICE_MODELS.get(model_pack_name, {})
@@ -328,17 +284,7 @@ class VibeVoiceModelHandler(torch.nn.Module):
         self.size = int(size_gb * (1024**3))
 
     def load_model(self, device, attention_mode: str = "eager"):
-        """Load the model and processor into memory.
-
-        Device contract (DF-003 fix): the loader builds the model entirely on
-        CPU and this handler performs NO device move. The single host-to-
-        device transfer is owned by ``VibeVoicePatcher.patch_model``.
-
-        Args:
-            device: Target device (used for dtype-auto resolution inside the
-                loader; NOT used for placement here).
-            attention_mode: Attention implementation to use.
-        """
+        """Load the model and processor into memory."""
         self.model, self.processor = VibeVoiceLoader.load_model(
             self.model_pack_name,
             device,
@@ -346,18 +292,10 @@ class VibeVoiceModelHandler(torch.nn.Module):
             use_llm_4bit=self.use_llm_4bit,
             dtype_str=self.dtype_str,
         )
-        # Plan 2026-08-18, Phase 6 (D7/RC-7): refine the size estimate from
-        # the real parameters now that the model is loaded. The __init__
-        # estimate is config-based (size_gb) and can be inaccurate for
-        # quantized / merged / GGUF checkpoints.
         self._refine_size()
 
     def _refine_size(self) -> None:
-        """Refine ``self.size`` from the real parameters after a load.
-
-        Only overwrites when a positive byte total can be computed; otherwise
-        the config-based estimate from ``__init__`` is kept.
-        """
+        """Refine ``self.size`` from the real parameters after a load."""
         try:
             total = sum(
                 p.numel() * p.element_size() for p in self.model.parameters()
@@ -365,7 +303,6 @@ class VibeVoiceModelHandler(torch.nn.Module):
             if total > 0:
                 self.size = total
         except Exception:
-            # Keep the config-based estimate if the size cannot be computed.
             pass
 
 
@@ -374,15 +311,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
     @staticmethod
     def _resolve_model_paths(model_name: str) -> tuple:
-        """Resolve model paths based on the model type.
-
-        Args:
-            model_name: Name of the model to resolve paths for.
-
-        Returns:
-            Tuple of (model_path, config_path, preprocessor_config_path, tokenizer_dir).
-            model_path is None for standalone (state_dict) models.
-        """
+        """Resolve model paths based on the model type."""
         model_info = AVAILABLE_VIBEVOICE_MODELS[model_name]
         model_type = model_info["type"]
 
@@ -392,7 +321,6 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         tokenizer_dir = None
 
         if model_type == "official":
-            # Delegate directory resolution + lazy download to the shared base.
             model_path = BaseVibeVoiceLoader._resolve_official_model_dir(model_name)
             BaseVibeVoiceLoader._ensure_downloaded(
                 repo_id=model_info.get("repo_id", ""),
@@ -410,7 +338,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             tokenizer_dir = model_path
 
         elif model_type == "standalone":
-            model_path = None  # None when loading from state_dict
+            model_path = None
             config_path = os.path.splitext(model_info["path"])[0] + ".config.json"
             preprocessor_config_path = os.path.splitext(model_info["path"])[0] + ".preprocessor.json"
             tokenizer_dir = os.path.dirname(model_info["path"])
@@ -419,21 +347,8 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
     @staticmethod
     def _load_config(config_path: str, model_name: str):
-        """Load VibeVoice config from path, with fallback to packaged default.
-
-        Automatically detects whether the config is for a streaming model
-        (VibeVoiceStreamingConfig) or a standard model (VibeVoiceConfig)
-        based on the model_type field in the config JSON.
-
-        Args:
-            config_path: Path to config.json.
-            model_name: Model name (for fallback selection).
-
-        Returns:
-            VibeVoiceStreamingConfig or VibeVoiceConfig instance.
-        """
+        """Load VibeVoice config from path, with fallback to packaged default."""
         if os.path.exists(config_path):
-            # Read the config to detect model type
             with open(config_path, 'r', encoding='utf-8') as f:
                 config_data = json.load(f)
             model_type = config_data.get("model_type", "")
@@ -457,29 +372,12 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
     @staticmethod
     def _load_tokenizer(tokenizer_dir: str, model_name: str) -> "VibeVoiceTextTokenizerFast":
-        """Load the VibeVoice text tokenizer.
-
-        Acquisition order: tokenizer.json in the model directory → packaged
-        tokenizer loaded DIRECTLY from the node folder (never copied into the
-        user's model directory) → download from HuggingFace as last resort.
-
-        Args:
-            tokenizer_dir: Directory to find/create tokenizer.json.
-            model_name: Model name (for logging).
-
-        Returns:
-            VibeVoiceTextTokenizerFast instance.
-
-        Raises:
-            RuntimeError: If tokenizer.json cannot be obtained.
-        """
+        """Load the VibeVoice text tokenizer."""
         tokenizer_file_path = os.path.join(tokenizer_dir, "tokenizer.json")
 
         if not os.path.exists(tokenizer_file_path):
             logger.debug(f"'tokenizer.json' not found in model directory: {tokenizer_dir}")
 
-            # Packaged fallback: load straight from the node folder. The
-            # user's model directory stays untouched.
             packaged_configs_dir = os.path.join(
                 os.path.dirname(__file__), "..", "src", "vibevoice", "configs"
             )
@@ -489,7 +387,6 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 logger.debug("Using pre-packaged tokenizer directly from the node folder...")
                 return VibeVoiceTextTokenizerFast(tokenizer_file=packaged_tokenizer_path)
 
-            # Download from HuggingFace if still missing
             repos_to_try = ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"]
             download_successful = False
             last_error = None
@@ -528,16 +425,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         preprocessor_config_path: str,
         is_streaming: bool = False,
     ):
-        """Load the VibeVoice processor with tokenizer and audio processor.
-
-        Args:
-            tokenizer: VibeVoiceTextTokenizerFast instance.
-            preprocessor_config_path: Path to preprocessor_config.json.
-            is_streaming: If True, use VibeVoiceStreamingProcessor.
-
-        Returns:
-            VibeVoiceStreamingProcessor or VibeVoiceProcessor instance.
-        """
+        """Load the VibeVoice processor with tokenizer and audio processor."""
         processor_config_data = {}
         if os.path.exists(preprocessor_config_path):
             with open(preprocessor_config_path, 'r', encoding='utf-8') as f:
@@ -569,40 +457,14 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         final_load_dtype: torch.dtype,
         use_meta: bool = True,
     ):
-        """Instantiate the model class directly, bypassing from_pretrained().
-
-        Fast-load contract (plan 2026-08-18, D1 — RC-1 elimination): by
-        default the construction runs inside a ``torch.device("meta")``
-        context, so every parameter/buffer allocation is virtual — zero RAM
-        and zero random-init CPU work. The vendored models are meta-safe:
-        the DPM scheduler computes its tables with numpy, and the
-        ``.to(dtype)`` calls in ``__init__`` are guarded by ``is_meta``
-        checks (verified by tests/test_meta_init_feasibility.py). Weights
-        are bound afterwards by ``_apply_state_dict`` (assign semantics).
-
-        ``use_meta=False`` is the escape hatch that restores the previous
-        eager (random-init) construction.
-
-        Args:
-            config: VibeVoiceConfig or VibeVoiceStreamingConfig instance.
-            is_streaming: If True, use streaming model class.
-            attn_implementation: Attention implementation string.
-            final_load_dtype: torch.dtype for the model.
-            use_meta: Construct under a meta device context (default True).
-
-        Returns:
-            Model instance (weights not yet loaded).
-        """
-        # Set attention implementation on the decoder config
+        """Instantiate the model class directly, bypassing from_pretrained()."""
         if hasattr(config, 'decoder_config'):
             config.decoder_config._attn_implementation = attn_implementation
 
-        # Set dtype on config (version-safe: transformers v5 deprecated torch_dtype)
         set_config_dtype(config, final_load_dtype)
         if hasattr(config, 'decoder_config'):
             set_config_dtype(config.decoder_config, final_load_dtype)
 
-        # Instantiate directly — meta context by default (zero alloc, zero RNG)
         ctx = torch.device("meta") if use_meta else contextlib.nullcontext()
         with ctx:
             if is_streaming:
@@ -614,65 +476,36 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
     @staticmethod
     def _resolve_checkpoint_path(model_path, model_type, model_info):
-        """Resolve the checkpoint file path(s) from a model directory or standalone path.
-
-        For directory-based models (official, local_dir), checks in priority order:
-        1. model.safetensors (single safetensors file)
-        2. model.safetensors.index.json (sharded safetensors)
-        3. pytorch_model.bin (single PyTorch checkpoint)
-        4. pytorch_model.bin.index.json (sharded PyTorch checkpoint)
-
-        For standalone models: returns the path directly.
-
-        Args:
-            model_path: Path to model directory (for official/local_dir) or None.
-            model_type: "official", "local_dir", or "standalone".
-            model_info: Model info dict (for standalone path).
-
-        Returns:
-            Tuple of (checkpoint_path, is_sharded).
-            - checkpoint_path: Path to single checkpoint file or index file.
-            - is_sharded: True if the checkpoint is sharded.
-
-        Raises:
-            FileNotFoundError: If no checkpoint file is found in the directory.
-        """
-        # Standalone models: path is already a file
+        """Resolve the checkpoint file path(s) from a model directory or standalone path."""
         if model_type == "standalone":
             ckpt_path = model_info["path"]
             if not os.path.isfile(ckpt_path):
                 raise FileNotFoundError(f"Standalone checkpoint not found: {ckpt_path}")
             return ckpt_path, False
 
-        # Directory-based models: resolve checkpoint file from directory
         if model_path is None or not os.path.isdir(model_path):
             raise FileNotFoundError(f"Model directory not found: {model_path}")
 
-        # Check for single safetensors file
         single_safetensors = os.path.join(model_path, "model.safetensors")
         if os.path.isfile(single_safetensors):
             logger.debug(f"Found single safetensors checkpoint: {single_safetensors}")
             return single_safetensors, False
 
-        # Check for sharded safetensors
         sharded_safetensors_index = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.isfile(sharded_safetensors_index):
             logger.debug(f"Found sharded safetensors checkpoint: {sharded_safetensors_index}")
             return sharded_safetensors_index, True
 
-        # Check for single PyTorch checkpoint
         single_bin = os.path.join(model_path, "pytorch_model.bin")
         if os.path.isfile(single_bin):
             logger.debug(f"Found single PyTorch checkpoint: {single_bin}")
             return single_bin, False
 
-        # Check for sharded PyTorch checkpoint
         sharded_bin_index = os.path.join(model_path, "pytorch_model.bin.index.json")
         if os.path.isfile(sharded_bin_index):
             logger.debug(f"Found sharded PyTorch checkpoint: {sharded_bin_index}")
             return sharded_bin_index, True
 
-        # No checkpoint found
         raise FileNotFoundError(
             f"No checkpoint file found in model directory: {model_path}. "
             f"Expected one of: model.safetensors, model.safetensors.index.json, "
@@ -681,52 +514,13 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
     @staticmethod
     def _load_sharded_state_dict(index_path, model_dir, device):
-        """Load and merge a sharded checkpoint by delegating to the shared base.
-
-        Retained with the original signature (``index_path`` is identified from
-        ``model_dir`` by the base) so existing callers/tests are unaffected.
-
-        Args:
-            index_path: Path to the index file (model.safetensors.index.json
-                        or pytorch_model.bin.index.json).
-            model_dir: Directory containing the shard files.
-            device: Target device for loading.
-
-        Returns:
-            Merged state dict containing all parameters from all shards.
-        """
+        """Load and merge a sharded checkpoint by delegating to the shared base."""
         return BaseVibeVoiceLoader.load_state_dict_sharded(model_dir, device)
 
     @staticmethod
     def _apply_state_dict(model, state_dict, known_missing=None):
-        """Load a state dict into the model with assign semantics.
-
-        Fast-load contract (plan 2026-08-18, D2/D3 — un-defers DF-005):
-
-        1. ``load_state_dict(..., strict=False, assign=True)`` — checkpoint
-           tensors REPLACE the (meta or random) parameter objects directly;
-           no copy pass, no extra host RAM.
-        2. Re-tie weights. ``assign=True`` breaks tied pairs (the checkpoint
-           omits ``lm_head.weight``), so ``tie_weights()`` is re-invoked —
-           the same mitigation transformers' ``from_pretrained`` applies.
-        3. Materialize any parameter still on meta (checkpoint omitted the
-           key) with zeros, mirroring ComfyUI's ``_zero_init_parameter``.
-
-        Args:
-            model: Instantiated model (meta- or eager-initialized).
-            state_dict: Checkpoint state dict (CPU tensors).
-            known_missing: Optional set of keys that are INTENTIONALLY absent
-                from ``state_dict`` (e.g. quant-resident linear weights
-                installed separately); excluded from missing-key warnings but
-                still returned in ``missing_keys``.
-
-        Returns:
-            Tuple of (missing_keys, unexpected_keys).
-        """
+        """Load a state dict into the model with assign semantics."""
         known_missing = known_missing or set()
-        # Friendly shape pre-check (plan 2026-08-27, D8): a config/weights
-        # family mismatch becomes a clear, actionable ValueError naming the
-        # offending keys instead of torch's raw "size mismatch" RuntimeError.
         _assert_shapes_compatible(model, state_dict)
         missing_keys, unexpected_keys = model.load_state_dict(
             state_dict, strict=False, assign=True
@@ -738,45 +532,9 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
     @staticmethod
     def _post_assign_fixups(model, missing_keys, unexpected_keys,
                             known_missing=None):
-        """Post-assign model fixups shared by the batch and streaming loads.
-
-        Everything that must happen after checkpoint tensors have replaced
-        the model's parameter objects, regardless of how they got there
-        (``load_state_dict(assign=True)`` for the batch path, per-tensor
-        ``set_attr_param`` for the streaming path — plan 2026-08-27, 3.1):
-
-        1. Re-tie weights. ``assign`` semantics break tied pairs (the
-           checkpoint omits ``lm_head.weight``), so ``tie_weights()`` is
-           re-invoked — the same mitigation transformers' ``from_pretrained``
-           applies.
-        2. Materialize any parameter still on meta (checkpoint omitted the
-           key) with zeros, mirroring ComfyUI's ``_zero_init_parameter``.
-        3. Materialize meta buffers, sentinel-aware (see
-           ``_SENTINEL_BUFFER_VALUES``).
-        4. Recompute RoPE ``inv_freq`` buffers destroyed by meta-init.
-        5. Convert the tree for native lowvram streaming.
-        6. Report missing / unexpected keys (tied lm_head filtered).
-
-        Args:
-            model: Model with checkpoint tensors already assigned.
-            missing_keys: Keys torch reported as missing.
-            unexpected_keys: Keys torch (or the streaming reader) reported
-                as unexpected.
-            known_missing: Optional set of keys INTENTIONALLY absent from
-                the checkpoint (e.g. quant-resident linear weights installed
-                separately); excluded from missing-key warnings but still
-                returned in ``missing_keys``.
-
-        Returns:
-            Tuple of (missing_keys, unexpected_keys).
-        """
+        """Post-assign model fixups shared by the batch and streaming loads."""
         known_missing = known_missing or set()
 
-        # Re-tie weights broken by assign semantics (e.g. lm_head.weight <->
-        # embed_tokens.weight). Standard/ASR models gate on
-        # decoder_config.tie_word_embeddings; streaming gates on the
-        # top-level config flag — check both, and let each model's own
-        # tie_weights() apply its internal guard.
         config = getattr(model, "config", None)
         tied = False
         if config is not None and hasattr(model, "tie_weights"):
@@ -786,28 +544,13 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             if tied:
                 model.tie_weights()
 
-        # Materialize meta parameters the checkpoint did not cover (D3).
         for name, param in list(model.named_parameters()):
             if param.is_meta:
                 param_new = torch.zeros(param.shape, dtype=param.dtype, device="cpu")
                 comfy.utils.set_attr_param(model, name, param_new)
 
-        # Materialize meta buffers (e.g. position_ids, attention_mask) that
-        # were created on meta during instantiation but are not in the
-        # checkpoint state dict. Without this, ComfyUI's unpatch_model →
-        # model.to(device_to) raises NotImplementedError on meta buffers.
-        #
-        # Regression fix (v2.3.1): some buffers are SENTINELS that must NOT be
-        # zero. speech_scaling_factor / speech_bias_factor are registered as
-        # float('nan') and computed at inference time; the diffusion-inversion
-        # gate (modeling_vibevoice.py:623) is ``if not torch.isnan(sf) and not
-        # torch.isnan(bf)`` — zeroing them makes the gate TRUE and applies
-        # ``speech / 0 - 0`` → silent output. fix_std (persistent=False) is
-        # restored to its config value. See _SENTINEL_BUFFER_VALUES.
         for name, buf in list(model.named_buffers()):
             if buf.is_meta:
-                # Match by the buffer's final dotted component (robust to
-                # submodule nesting, e.g. "model.speech_scaling_factor").
                 leaf = name.split(".")[-1]
                 if leaf in _SENTINEL_BUFFER_VALUES:
                     val = _SENTINEL_BUFFER_VALUES[leaf]
@@ -818,33 +561,8 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                     buf_new = torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
                 comfy.utils.set_attr(model, name, buf_new)
 
-        # Recompute RoPE inv_freq buffers (v2.3.2 fix). These are computed
-        # from the config in the rotary module's __init__ and are NOT in the
-        # checkpoint, so the zero-materialization above destroyed them. With
-        # inv_freq == 0 the model loses positional encoding and emits
-        # gibberish. Re-run each rotary module's config-based computation.
         _recompute_rope_buffers(model)
 
-        # Native lowvram streaming (plan 2026-08-26): convert leaf modules so
-        # core's partial load/offload machinery can stream them instead of
-        # silently stranding them on CPU. Class-only swap; weights untouched.
-        # 2026-09-30: this sweep is NOT suppressed anywhere (the old
-        # streaming_conversion(False) call never existed in this code path).
-        # It runs on EVERY route and must: it is what installs
-        # ``comfy_cast_weights``, the attribute core's dynamic load gates the
-        # vbar branch on (comfy/model_patcher.py:1967).
-        try:
-            from .comfy_stream import convert_tree_for_streaming
-
-            convert_tree_for_streaming(model)
-        except Exception as e:
-            logger.warning(
-                f"Streaming conversion failed (continuing without it): {e}"
-            )
-
-        # Tied embeddings (e.g. 1.5B's tie_word_embeddings=True): the
-        # checkpoint legitimately omits lm_head.weight — it is re-tied above,
-        # so its absence is expected, not a problem.
         if tied and "lm_head.weight" in missing_keys:
             logger.debug(
                 "lm_head.weight absent from checkpoint (tied to input "
@@ -872,97 +590,35 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
     @staticmethod
     def _stream_apply_dense(
-        model, tensor_pairs, known_missing=None, preserve_file_views: bool = False
+        model, tensor_pairs, known_missing=None, preserve_file_views: bool = True,
+        target_device=None,
     ):
-        """Assign a dense checkpoint per-tensor, severing file mappings.
+        """Assign a dense checkpoint per-tensor directly from zero-copy file views.
 
-        Streaming twin of :meth:`_apply_state_dict` for checkpoints read
-        through the base-loader iterators (sharded or single-file). Two
-        differences from the batch path, both deliberate:
-
-        1. No merged state dict ever exists — peak host RAM is bounded by
-           the model plus one tensor in flight.
-        2. Every tensor is ``clone()``d before assign — ON LEGACY ROUTES
-        ONLY (``preserve_file_views=False``, the default). The hazard the
-        clone guards is real and user-confirmed (the sharded 7B ghost-RAM /
-        "Pin error." fix, plan 2026-08-28, confirmed 2026-08-31): a
-        FILE-BACKED view that survives into an offloaded CPU parameter
-        keeps its whole file mapping alive for as long as the model
-        holds a single tensor from it, and under ComfyUI's partial load
-        the process working set balloons to ~full model size ON TOP of
-        the VRAM copy, while ``cudaHostRegister`` on file-backed pages
-        is what produces the "Pin error." flood. Cloning puts offloaded
-        weights in ordinary anonymous memory — the reliable pinning
-        class — and releases any mapping shard-by-shard.
-
-           That reasoning is exactly why the DYNAMIC routes pass
-           ``preserve_file_views=True`` (2026-09-30): with
-           ``ModelPatcherDynamic`` the mapping is not a ghost-RAM
-           liability but the paging SOURCE — core assigns the views
-           (``assign=True``, comfy/sd.py:2407), pages them disk->VRAM at
-           every forward (comfy/model_patcher.py:1993) and never pins
-           them (``pin_weight_to_device`` raises,
-           comfy/model_patcher.py:1821-1825). Cloning there would stage
-           the whole model in host RAM, which is the 20->40 GB spike
-           this port exists to remove.
-
-           WHICH INPUTS THAT APPLIES TO was over-stated until 2026-09-29.
-           Measured: ``safe_open.get_tensor`` returns an OWNED copy, not a
-           view (16 x 8 MB bf16 held with no clone: +128.3 MB = 1.00x file),
-           so for safetensors under the current configuration
-           (``MMAP_TORCH_FILES=False``, ``aimdo_enabled=False``) this clone
-           is a redundant copy of an already-private tensor. It still
-           earns its place for the formats that DO return views:
-           ``.bin`` / ``.pt`` with ``MMAP_TORCH_FILES`` set
-           (``comfy/utils.py:189-192``) and the aimdo ``load_safetensors``
-           path (``comfy/utils.py:165-166``). Kept unconditionally so the
-           two configurations cannot diverge in behaviour; it costs one
-           tensor of transient memory and one extra pass over the file's
-           bytes. Evidence:
-           ``.dev/docs/plans/2026-09-28-external-dense-load-ram-spike.md``
-           (S1 RESULT) and ``.dev/scratch/probe_dense_load_ram.py``.
-
-        Shape checking, missing/unexpected reporting, and all post-assign
-        fixups (re-tie, meta stragglers, sentinel buffers, RoPE, streaming
-        conversion) match the batch path via ``_shape_mismatch_error`` and
-        :meth:`_post_assign_fixups`.
-
-        Quant-storage dtypes (:data:`QUANT_STORAGE_DTYPES`) are rejected on
-        every key, mirroring
-        ``external_loader._assert_dense_loadable``, which the batch path
-        applies to the whole state dict.
-
-        Args:
-            model: Instantiated model (meta- or eager-initialized).
-            tensor_pairs: Iterable of ``(key, tensor)`` — e.g.
-                ``BaseVibeVoiceLoader.iter_sharded_tensors``.
-            known_missing: Optional set of keys that are INTENTIONALLY
-                absent from the stream (see :meth:`_apply_state_dict`).
-
-        Returns:
-            Tuple of (missing_keys, unexpected_keys).
+        ``target_device`` moves each tensor onto the accelerator as it is
+        assigned, so the checkpoint is never materialised as a whole CPU model
+        first. This is the one dense assign used by every load route.
         """
         known_missing = known_missing or set()
         params = dict(model.named_parameters())
         buffers = dict(model.named_buffers())
         assigned = set()
         unexpected = []
+        to_device = (
+            target_device is not None and getattr(target_device, "type", None) == "cuda"
+        )
+
+        def _placed(tensor):
+            if to_device:
+                return place_tensor_on_device(tensor, target_device)
+            return tensor if preserve_file_views else tensor.clone()
 
         for key, tensor in tensor_pairs:
-            # Quant-storage guard, checked on EVERY key before the
-            # params/buffers lookup — including keys the model has no target
-            # for. Mirrors ``external_loader._assert_dense_loadable``, which
-            # rejects on every key of the batch state dict; checking only
-            # where a target exists would let an int8 tensor under an
-            # unexpected key through silently, weakening the very contract
-            # this guard preserves. Safe against the GGUF route, whose
-            # iterator yields only FLOAT_GGML_TYPES and re-views raw uint8 as
-            # bfloat16 before yielding.
             if tensor.dtype in QUANT_STORAGE_DTYPES:
                 raise ValueError(
                     "Checkpoint contains quantized-weight tensors but carries "
-                    "no executable quantization metadata (1 tensors, e.g. "
-                    f"{key} [{tensor.dtype}]). Loading them as floats would "
+                    "no executable quantization metadata (first seen at "
+                    f"'{key}' [{tensor.dtype}]). Loading them as floats would "
                     "corrupt the model. Re-export it with *.comfy_quant "
                     "metadata (comfy-model-tools) or use the dense/BF16 "
                     "checkpoint."
@@ -973,9 +629,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                     raise _shape_mismatch_error(
                         model, [(key, tuple(tensor.shape), tuple(target.shape))]
                     )
-                comfy.utils.set_attr_param(
-                    model, key, tensor if preserve_file_views else tensor.clone()
-                )
+                comfy.utils.set_attr_param(model, key, _placed(tensor))
                 assigned.add(key)
                 continue
             target_buf = buffers.get(key)
@@ -984,17 +638,11 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                     raise _shape_mismatch_error(
                         model, [(key, tuple(tensor.shape), tuple(target_buf.shape))]
                     )
-                comfy.utils.set_attr_buffer(
-                    model, key, tensor if preserve_file_views else tensor.clone()
-                )
+                comfy.utils.set_attr_buffer(model, key, _placed(tensor))
                 assigned.add(key)
                 continue
             unexpected.append(key)
 
-        # Missing keys = expected model keys the stream never delivered.
-        # Mirrors torch's own missing-key semantics (persistent state only;
-        # tied names appear individually and are filtered by the shared
-        # fixups' tied hint).
         expected = set(model.state_dict().keys())
         missing_keys = [k for k in expected if k not in assigned]
         known_missing = mark_optional_absent(missing_keys, assigned, known_missing)
@@ -1011,78 +659,23 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         model_info: dict,
         device,
     ):
-        """Stream a dense checkpoint into the model (per-tensor assign).
-
-        Resolves the checkpoint file path(s) from the model directory or
-        standalone path, then streams the tensors — sharded checkpoints
-        shard-by-shard, single files tensor-by-tensor — into the model via
-        :meth:`_stream_apply_dense`. No merged state dict ever exists, and
-        every tensor is cloned into private memory so the checkpoint's file
-        mapping is released incrementally instead of being pinned alive by
-        offloaded parameters (the sharded 7B ghost-RAM / "Pin error." fix,
-        plan 2026-08-28).
-
-        Device contract (DF-001/DF-002 fix): weights are ALWAYS loaded onto
-        CPU, regardless of the ``device`` argument. Loading them directly
-        onto CUDA caused a disk->VRAM->RAM->VRAM round-trip (full-model VRAM
-        spike outside ComfyUI's arbitration, then a GPU->CPU copy into the
-        CPU-resident parameters). The single host-to-device transfer is owned
-        by ``VibeVoicePatcher.patch_model`` after ComfyUI has arbitrated VRAM.
-
-        Args:
-            model: Model instance (already instantiated).
-            model_path: Path to model directory (for official/local_dir) or None.
-            model_type: "official", "local_dir", or "standalone".
-            model_info: Model info dict (for standalone path).
-            device: Reserved for signature compatibility; NOT used for
-                placement — weights are always loaded onto CPU.
-
-        Returns:
-            The model with loaded weights (on CPU).
-        """
-        # Resolve checkpoint path (handles single-file and sharded checkpoints)
+        """Stream a dense checkpoint into the model using zero-copy file views."""
         ckpt_path, is_sharded = VibeVoiceLoader._resolve_checkpoint_path(
             model_path, model_type, model_info
         )
 
-        # DF-001/DF-002: always load weights onto CPU. The patcher performs
-        # the single H2D transfer after ComfyUI's VRAM arbitration.
         if is_sharded:
-            # Stream shards per-tensor (no merged dict): peak RAM stays at
-            # model + one tensor, and each shard's file mapping is released
-            # as soon as its tensors have been materialized into the model.
             model_dir = model_path if model_type != "standalone" else os.path.dirname(ckpt_path)
             tensor_pairs = BaseVibeVoiceLoader.iter_sharded_tensors(model_dir)
         else:
-            # Stream a single checkpoint file (onto CPU)
             logger.debug(f"Loading state dict from: {ckpt_path}")
             tensor_pairs = BaseVibeVoiceLoader.iter_checkpoint_tensors(ckpt_path)
 
-        # Streaming assign (D2/D3): on the dynamic route the zero-copy file
-        # views ARE the parameters — core pages them disk->VRAM at forward
-        # (the assign=True shape of comfy/sd.py:2407), so nothing is staged
-        # in host RAM. Legacy routes clone into private memory, severing the
-        # mapping (see _stream_apply_dense). Tied weights are re-tied and meta
-        # stragglers zero-materialized by the shared post-assign fixups;
-        # strict=False semantics handle missing/unexpected keys.
-        # Imported here because patcher.py imports this module (cycle).
-        from . import device_utils
-        from .patcher import dynamic_vram_available, resolve_core_patcher_class
-
-        # The DEVICE here must be resolved exactly the way the caller resolved
-        # the one it passed to select_patcher_class — both use
-        # device_utils.get_torch_device(device) (generation.py:221/340,
-        # asr_generation.py:221/340). If the two sides ever disagreed, the
-        # loader could assign aimdo file views to a LEGACY patcher, which is
-        # the pin / ghost-RAM hazard the clone exists to prevent.
-        load_device = device_utils.get_torch_device(device)
         VibeVoiceLoader._stream_apply_dense(
             model,
             tensor_pairs,
-            preserve_file_views=dynamic_vram_available(
-                resolve_core_patcher_class(),
-                load_device,
-            ),
+            preserve_file_views=True,
+            target_device=device,
         )
 
         return model
@@ -1095,33 +688,13 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         use_llm_4bit: bool = False,
         dtype_str: str = "auto",
     ):
-        """Load a VibeVoice model, downloading if necessary. Caches the loaded model.
-
-        Bypasses transformers' from_pretrained() to avoid meta device initialization
-        issues in transformers 5.x. Instead, instantiates the model class directly
-        and loads the state dict using ComfyUI's comfy.utils.load_torch_file().
-
-        Args:
-            model_name: Name of the model to load.
-            device: Target device for the model.
-            attention_mode: Attention implementation ("eager", "sdpa", "flash_attention_2", "sage").
-            use_llm_4bit: Whether to quantize the LLM to 4-bit NF4.
-            dtype_str: Dtype string ("auto", "bf16", "fp16", "fp32").
-
-        Returns:
-            Tuple of (model, processor).
-
-        Raises:
-            ValueError: If model_name is not found.
-            RuntimeError: If model loading fails.
-        """
+        """Load a VibeVoice model, downloading if necessary. Caches the loaded model."""
         if model_name not in AVAILABLE_VIBEVOICE_MODELS:
             raise ValueError(
                 f"Unknown VibeVoice model: {model_name}. "
                 f"Available models: {list(AVAILABLE_VIBEVOICE_MODELS.keys())}"
             )
 
-        # Resolve attention mode with fallback logic
         attention_mode = resolve_attention_mode(attention_mode, use_llm_4bit)
 
         cache_key = f"{model_name}_attn_{attention_mode}_q4_{int(use_llm_4bit)}"
@@ -1132,44 +705,28 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         model_info = AVAILABLE_VIBEVOICE_MODELS[model_name]
         model_type = model_info["type"]
 
-        # Resolve paths
         model_path, config_path, preprocessor_config_path, tokenizer_dir = \
             VibeVoiceLoader._resolve_model_paths(model_name)
 
-        # Load config
         config = VibeVoiceLoader._load_config(config_path, model_name)
-
-        # Detect if this is a streaming model
         is_streaming = isinstance(config, VibeVoiceStreamingConfig)
         if is_streaming:
             logger.debug(f"Model '{model_name}' detected as streaming model")
 
-        # Load tokenizer
         vibevoice_tokenizer = VibeVoiceLoader._load_tokenizer(tokenizer_dir, model_name)
 
-        # Load processor (use streaming processor for streaming models)
         processor = VibeVoiceLoader._load_processor(
             vibevoice_tokenizer, preprocessor_config_path, is_streaming=is_streaming
         )
 
-        # Determine dtype
         load_device = model_management.get_torch_device() if not isinstance(device, torch.device) else device
         model_dtype = resolve_dtype(dtype_str, load_device)
 
-        # Quantization config
         quant_config = None
         final_load_dtype = model_dtype
         if use_llm_4bit:
             bnb_compute_dtype = model_dtype
             if attention_mode == 'sage':
-                # WHY fp32 here: the sage kernels quantise Q/K per block and
-                # assert fp16/bf16 inputs, and a 4-bit bnb linear matmul in
-                # fp16 is the known-accuracy trap. The attention itself still
-                # runs in bfloat16 -- `resolve_sage_target_dtype` returns bf16
-                # for any linear carrying a `quant_state` -- so the 4-bit +
-                # sage path is bf16 attention over an fp32-configured model.
-                # That asymmetry is intentional, not a bug: attention reads
-                # q/k/v (bf16) while the MLP/projection matmuls stay fp32.
                 bnb_compute_dtype, final_load_dtype = torch.float32, torch.float32
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -1178,7 +735,6 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 bnb_4bit_compute_dtype=bnb_compute_dtype,
             )
 
-        # Attention implementation for loading (sage is applied post-load)
         attn_implementation_for_load = get_attn_implementation_for_load(attention_mode)
 
         try:
@@ -1187,7 +743,6 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 f"and attention: '{attn_implementation_for_load}'"
             )
 
-            # Step 1: Instantiate model class directly (bypasses meta device init)
             model = VibeVoiceLoader._instantiate_model(
                 config=config,
                 is_streaming=is_streaming,
@@ -1195,7 +750,6 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 final_load_dtype=final_load_dtype,
             )
 
-            # Step 2: Load state dict using ComfyUI's loading utilities
             model = VibeVoiceLoader._load_state_dict_into_model(
                 model=model,
                 model_path=model_path,
@@ -1204,18 +758,9 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                 device=load_device,
             )
 
-            # Step 3: Apply the final dtype ON CPU (DF-002/DF-003 fix) — but
-            # only where needed (plan 2026-08-18, D4/RC-3). The model leaves
-            # the loader on CPU; the single host-to-device transfer is owned
-            # by VibeVoicePatcher.patch_model after ComfyUI's VRAM
-            # arbitration. The conditional helper skips the pass entirely
-            # when the checkpoint dtype already matches the target.
             cast_model_to_dtype_if_needed(model, final_load_dtype)
 
-            # Step 4: Apply 4-bit quantization if requested (post-load)
             if quant_config is not None:
-                # AUD-014: the module moved from transformers.utils.bitsandbytes
-                # (<= 4.x) to transformers.integrations.bitsandbytes (5.x).
                 try:
                     from transformers.integrations.bitsandbytes import replace_with_bnb_linear
                 except ImportError:
@@ -1226,7 +771,6 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                     modules_to_not_convert=None,
                 )
 
-            # Apply SageAttention post-load
             if attention_mode == "sage":
                 if check_sage_attention_compatible():
                     set_sage_attention(model)

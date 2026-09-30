@@ -12,6 +12,7 @@ from unittest.mock import patch, MagicMock
 from ComfyUI_VibeVoice.modules.base_loader import (
     BaseVibeVoiceLoader,
     iter_safetensors_tensors,
+    place_tensor_on_device,
 )
 
 
@@ -334,3 +335,100 @@ class TestSafetensorsIteratorArms:
         gen = iter_safetensors_tensors(str(tmp_path / "single.safetensors"))
         next(gen)
         gen.close()
+
+
+class TestPlaceTensorOnDevice:
+    """How a checkpoint tensor reaches the GPU decides whether the load
+    touches the SSD and leaves host RAM full.
+
+    ``Tensor.to(cuda)`` on a mapped view is a host-side read: 0.55 GB/s and
+    +2.18 GB of machine RAM per 2 GB (report §F6). When aimdo mapped the file,
+    core's ``read_tensor_file_slice_into`` DMAs the byte range into the
+    destination instead: ~2.6 GB/s, page cache left clean. Every route goes
+    through this helper so that choice is made in exactly one place.
+    """
+
+    CUDA = torch.device("cuda", 0)
+
+    def _skip_without_gpu(self):
+        if not torch.cuda.is_available():
+            pytest.skip("no GPU in this environment")
+
+    def test_non_cuda_device_is_a_no_op(self):
+        t = torch.ones(4)
+        assert place_tensor_on_device(t, None) is t
+        assert place_tensor_on_device(t, torch.device("cpu")) is t
+
+    def test_plain_tensor_falls_back_to_to(self):
+        self._skip_without_gpu()
+        t = torch.ones(8, dtype=torch.bfloat16)
+        # No aimdo mapping on this storage -> the plain copy path.
+        out = place_tensor_on_device(t, self.CUDA)
+        assert out.device.type == "cuda"
+        assert torch.equal(out.cpu(), t)
+
+    def test_file_slice_prefers_the_core_dma(self):
+        """With an aimdo mapping present, core's DMA is used, not .to()."""
+        self._skip_without_gpu()
+        import comfy.memory_management as mm
+
+        t = torch.ones(8, dtype=torch.bfloat16)
+        seen = {}
+
+        class _Storage:
+            _comfy_tensor_file_slice = object()
+
+        real_storage = t.untyped_storage
+
+        def _fake_read(tensor, destination, stream=None, destination2=None):
+            seen["called"] = True
+            seen["src_is_view"] = tensor is t
+            destination.copy_(tensor)
+            return True
+
+        with patch.object(type(t), "untyped_storage",
+                          lambda self: _Storage()),              patch.object(mm, "read_tensor_file_slice_into", _fake_read):
+            out = place_tensor_on_device(t, self.CUDA)
+
+        assert seen.get("called") is True
+        assert seen["src_is_view"] is True
+        assert out.device.type == "cuda"
+        assert torch.equal(out.cpu(), t)
+
+    def test_dma_declining_falls_back_instead_of_raising(self):
+        """Core returns False for tensors it will not DMA; we still place it."""
+        self._skip_without_gpu()
+        import comfy.memory_management as mm
+
+        t = torch.ones(8, dtype=torch.bfloat16)
+
+        class _Storage:
+            _comfy_tensor_file_slice = object()
+
+        with patch.object(type(t), "untyped_storage",
+                          lambda self: _Storage()),              patch.object(mm, "read_tensor_file_slice_into",
+                          lambda *a, **k: False):
+            out = place_tensor_on_device(t, self.CUDA)
+
+        assert out.device.type == "cuda"
+        assert torch.equal(out.cpu(), t)
+
+    def test_dma_raising_falls_back(self):
+        """A missing aimdo native library raises; a slow copy beats a crash."""
+        self._skip_without_gpu()
+        import comfy.memory_management as mm
+
+        t = torch.ones(8, dtype=torch.bfloat16)
+
+        class _Storage:
+            _comfy_tensor_file_slice = object()
+
+        def _boom(*a, **k):
+            raise AttributeError("'NoneType' object has no attribute 'lib'")
+
+        with patch.object(type(t), "untyped_storage",
+                          lambda self: _Storage()),              patch.object(mm, "read_tensor_file_slice_into", _boom):
+            out = place_tensor_on_device(t, self.CUDA)
+
+        assert out.device.type == "cuda"
+        assert torch.equal(out.cpu(), t)

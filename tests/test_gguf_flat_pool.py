@@ -297,10 +297,11 @@ class TestInstallNonLinearFallback:
         seen = {}
         real = VibeVoiceLoader._stream_apply_dense
 
-        def _spy(model, tensor_pairs, known_missing=None):
+        def _spy(model, tensor_pairs, known_missing=None, **kw):
             seen["lazy"] = not isinstance(tensor_pairs, (dict, list, tuple))
             seen["pairs"] = list(tensor_pairs)
-            return real(model, tensor_pairs, known_missing=known_missing)
+            seen["target_device"] = kw.get("target_device")
+            return real(model, tensor_pairs, known_missing=known_missing, **kw)
 
         def _batch(*a, **k):
             raise AssertionError("batch _apply_state_dict must not be used")
@@ -310,10 +311,11 @@ class TestInstallNonLinearFallback:
 
         model = self._build_model()
         reader = open_gguf_reader(flat_pool_gguf)
-        _install_gguf_weights(model, reader)
+        _install_gguf_weights(model, reader, target_device=None)
 
         assert seen["lazy"], "dense pairs must be a generator, not a materialized dict"
         assert seen["pairs"], "expected at least one dense tensor"
+        assert seen["target_device"] is None, "no device requested -> nothing placed"
 
     def test_embedding_quantized_dequants_at_load(self, flat_pool_gguf):
         """Q8_0 embed_tokens (nn.Embedding) lands as float, stays float."""

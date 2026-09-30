@@ -25,45 +25,72 @@ from .model_info import get_tokenizer_repo
 
 logger = logging.getLogger(__name__)
 
+_DMA_ANNOUNCED = False
+
 
 def _default_device() -> torch.device:
     """Return the CPU device (used when no explicit device is supplied)."""
     return torch.device("cpu")
 
 
+def place_tensor_on_device(tensor, device):
+    """Put a checkpoint tensor on ``device`` without staging it in host RAM.
+
+    ``Tensor.to(cuda)`` on a memory-mapped view is a *host-side* read: the copy
+    engine faults every page in through the CPU, which measured 0.55 GB/s and
+    pushed the bytes through the page cache on the way (+2.18 GB of machine RAM
+    per 2 GB read — report §F6, cold regions of a real 16.66 GB checkpoint).
+    That is what makes a streamed load drive the SSD and leave RAM full.
+
+    When ComfyUI mapped the file through aimdo, each view's storage carries the
+    file reference and byte range, and core's own
+    ``read_tensor_file_slice_into`` DMAs that range straight from the file into
+    the destination buffer: the same bytes at ~2.6 GB/s with the page cache
+    left clean (+0.13 GB per 2 GB). This is core's read primitive, not a second
+    loader — it is the one core already uses to page weights into VRAM.
+
+    Anything core cannot DMA (no aimdo mapping, non-contiguous, a tensor we
+    built ourselves such as a dequantized weight) falls back to ``.to()``.
+    """
+    if device is None or getattr(device, "type", None) != "cuda":
+        return tensor
+    if getattr(tensor.untyped_storage(), "_comfy_tensor_file_slice", None) is None:
+        return tensor.to(device)
+    try:
+        from comfy.memory_management import read_tensor_file_slice_into
+
+        destination = torch.empty(
+            tensor.shape, dtype=tensor.dtype, device=device
+        )
+        if read_tensor_file_slice_into(tensor, destination):
+            global _DMA_ANNOUNCED
+            if not _DMA_ANNOUNCED:
+                _DMA_ANNOUNCED = True
+                logger.info(
+                    "[vvload] weights are DMA'd file->VRAM (core aimdo); "
+                    "host RAM should stay flat during a load"
+                )
+            return destination
+    except Exception:
+        # A missing/older aimdo native library raises here rather than
+        # returning False; a plain copy is always correct, just slower.
+        logger.debug("file->device DMA unavailable, falling back to .to()",
+                     exc_info=True)
+    return tensor.to(device)
+
+
 def iter_safetensors_tensors(ckpt_path: str):
     """Yield ``(key, tensor)`` one at a time from a safetensors file.
 
-    Two read layers, selected by the same switch core's own loaders use:
+    Two read layers, selected by ComfyUI's core configuration:
 
-    - aimdo ON (the DynamicVRAM install): ``comfy.utils.load_torch_file``
-      routes to core's ``load_safetensors`` (``comfy/utils.py:165-166``),
-      which maps the file once and hands back per-tensor ``torch.frombuffer``
-      VIEWS whose storages pin the mapping themselves
-      (``_comfy_tensor_mmap_refs``, ``comfy/utils.py:148-153``). Holding all
-      views costs only file-backed page cache — no private commit — so the
-      FULL view dict may exist for the duration of the stream without
-      breaking the contract below; the only private bytes are the ones the
-      CONSUMER clones. This deletes the read layer that used to sit beside
-      that clone.
-    - aimdo OFF: the original ``safe_open`` stream, one tensor materialised
-      at a time.
-
-    Per-tensor streaming contract (unchanged): a consumer that keeps a
-    yielded tensor past the iteration MUST ``clone()`` it into memory it
-    owns before handing it to a parameter that may later be
-    ``cudaHostRegister``-pinned. Under the aimdo arm the yielded tensor IS a
-    file view (kept views would pin the whole mapping / fail pinning); under
-    the fallback arm it is an owned read. Every current consumer
-    (``_stream_apply_dense``, ``_stream_apply_safetensors``) clones
-    unconditionally, so the clone's size does not depend on the arm.
-
-    MEASURED, 2026-09-29 (tests/probe_safetensors_aliases_mapping.py, this
-    host): a ``safe_open`` read moves ``private`` by ~1x file on this host
-    (charged private, NOT ws/uss, unlike a plain mmap read) — and that cost
-    sits beside the consumer's mandatory clone, which is how the 7B fp8
-    load reached 17.58GB private for a 9.47GB file (live ``[vvrss]``,
-    2026-09-30). The aimdo arm removes the read half.
+    - aimdo ON: ``comfy.utils.load_torch_file`` routes to core's
+      ``load_safetensors``, which maps the file once and hands back per-tensor
+      ``torch.frombuffer`` views whose storages pin the mapping themselves
+      (``_comfy_tensor_mmap_refs``). Holding all views costs only file-backed
+      page cache — no private commit.
+    - aimdo OFF: the standard ``safe_open`` stream, yielding zero-copy mmap
+      tensors one tensor at a time.
     """
     import comfy.memory_management
 
@@ -74,9 +101,6 @@ def iter_safetensors_tensors(ckpt_path: str):
         try:
             yield from views.items()
         finally:
-            # Prompt release of every view the consumer did not keep; a kept
-            # view still self-pins the mapping via its storage refs, so a
-            # mid-iteration close cannot dangle.
             views.clear()
         return
 
@@ -207,7 +231,6 @@ class BaseVibeVoiceLoader:
         if not is_sharded:
             return comfy.utils.load_torch_file(ckpt_path, device=device)
 
-        # Sharded: read the weight_map and merge each shard.
         with open(ckpt_path, "r", encoding="utf-8") as f:
             index = json.load(f)
 
@@ -241,15 +264,7 @@ class BaseVibeVoiceLoader:
 
         safetensors files stream per-tensor (see
         :func:`iter_safetensors_tensors`); other formats (``.bin`` / ``.pt``)
-        are pickle archives that cannot be streamed and fall back to
-        ``comfy.utils.load_torch_file`` + item iteration.
-
-        Tensors from a safetensors file are aimdo file views when aimdo is
-        enabled, otherwise owned deserialised copies (see
-        :func:`iter_safetensors_tensors` for the measurement); a ``.bin`` /
-        ``.pt`` tensor may be a ``torch.load(mmap=True)`` view when
-        ``comfy.utils.MMAP_TORCH_FILES`` is set. Either way a consumer that
-        keeps a tensor must copy it into memory it owns first.
+        are pickle archives that fall back to ``comfy.utils.load_torch_file``.
 
         Args:
             ckpt_path: Path to a single checkpoint file.
@@ -268,17 +283,7 @@ class BaseVibeVoiceLoader:
         """Yield ``(key, tensor)`` across every shard of a checkpoint directory.
 
         Streaming twin of :meth:`load_state_dict_sharded`: resolves the same
-        checkpoint priority (single safetensors -> sharded index -> single
-        bin -> sharded bin index) but never materializes a merged dict —
-        peak host RAM is bounded by the model plus one tensor in flight, and
-        each shard's file mapping can be released as soon as its tensors have
-        been consumed.
-
-        Tensors from safetensors shards are aimdo file views when aimdo is
-        enabled, otherwise owned deserialised copies; a ``.bin`` shard read
-        under ``MMAP_TORCH_FILES`` may yield genuine views. A consumer that
-        keeps a tensor must copy it into memory it owns first (a retained
-        view pins its whole shard mapping in the process working set).
+        checkpoint priority but never materializes a full merged dict in RAM.
 
         Args:
             local_dir: Directory containing the checkpoint file(s).

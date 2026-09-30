@@ -51,16 +51,6 @@ def _torch_dtype_is_deprecated_property(config) -> bool:
 def set_config_dtype(config, dtype) -> None:
     """Record the load dtype on a transformers config without triggering the
     transformers v5 deprecation warning.
-
-    transformers v5 renamed ``torch_dtype`` to ``dtype`` and turned
-    ``torch_dtype`` into a deprecated property that logs
-    "``torch_dtype`` is deprecated! Use ``dtype`` instead!" on every access.
-    Write the canonical attribute for the installed transformers version.
-
-    This is the node-side counterpart of the vendored
-    ``configuration_vibevoice.set_config_dtype``; it lives here (rather than
-    being imported from the vendored package) so it stays a real function
-    under the test harness, which mocks ``src.vibevoice.*``.
     """
     if _torch_dtype_is_deprecated_property(config):
         config.dtype = dtype
@@ -69,14 +59,7 @@ def set_config_dtype(config, dtype) -> None:
 
 
 def get_config_dtype(config):
-    """Return the torch dtype recorded on a transformers config, or None.
-
-    Version-safe read: on transformers v5 the canonical ``dtype`` attribute
-    is read (the deprecated ``torch_dtype`` property is never touched); on
-    older versions the plain ``torch_dtype`` attribute is used. String
-    values (e.g. ``"bfloat16"`` from a config.json) are resolved to the
-    corresponding ``torch.dtype``.
-    """
+    """Return the torch dtype recorded on a transformers config, or None."""
     if _torch_dtype_is_deprecated_property(config):
         dtype = getattr(config, "dtype", None)
     else:
@@ -136,12 +119,10 @@ def get_dtype_str(dtype: torch.dtype) -> str:
 
 
 def _quant_protected_names(model) -> set:
-    """Parameter names excluded from bulk dtype casts (plan 2026-08-24, E1).
+    """Parameter names excluded from bulk dtype casts.
 
-    - Every parameter of modules marked ``_quant_resident`` (GGUFLinear /
-      ConvRotInt8Linear): their weights are RAW BYTE / INT8 storage and the
-      fp32 ``weight_scale`` must stay fp32.
-    - Defense-in-depth: any parameter whose leaf name is ``weight_scale``.
+    - Parameters of modules marked ``_quant_resident`` (GGUFLinear / ConvRotInt8Linear / FP8Linear).
+    - Any parameter whose leaf name is ``weight_scale``.
     """
     protected = set()
     for name, mod in model.named_modules():
@@ -153,17 +134,7 @@ def _quant_protected_names(model) -> set:
 
 
 def representative_dtype(model):
-    """First FLOATING parameter dtype (None when the tree has none).
-
-    Unlike transformers' ``dtype`` property this never reports an integer
-    raw-storage param (uint8 GGUF blocks), so callers comparing dtypes don't
-    spuriously schedule casts. Quant-resident modules are skipped ENTIRELY:
-    fp8 storage IS floating point, and reporting it (or an uncast fp32
-    resident bias) would make the patcher's dtype guard fire a pointless
-    filtered cast walk on every patch (plan 2026-08-27, D6). Falls back to
-    the model's ``dtype`` attribute when the parameter tree cannot be walked
-    (e.g. test doubles).
-    """
+    """First FLOATING parameter dtype (None when the tree has none)."""
     try:
         resident_modules = {
             name for name, mod in model.named_modules()
@@ -188,12 +159,10 @@ def _cast_mismatched_params(model, dtype: torch.dtype) -> None:
         if name in protected:
             continue
         if not param.dtype.is_floating_point:
-            continue  # raw int8/uint8 quant storage, index tensors, etc.
+            continue
         if param.dtype != dtype:
             param.data = param.data.to(dtype)
 
-    # Re-tie if the config marks weights as tied (a cast of one member of a
-    # tied pair replaces its storage and breaks the sharing).
     config = getattr(model, "config", None)
     if config is not None and hasattr(model, "tie_weights"):
         decoder_config = getattr(config, "decoder_config", None)
@@ -207,13 +176,7 @@ def cast_model_to_dtype(model, dtype: torch.dtype) -> None:
     """Cast a model's FLOATING parameters to the specified dtype.
 
     Quant-resident storage (raw uint8 GGUF blocks, int8 ConvRot weights,
-    fp32 ``weight_scale``) is NEVER touched. Torch's own ``Module.to(dtype)``
-    happens to skip integer tensors, but it WOULD recast fp32 scales — hence
-    this filtered walk instead of a bulk ``.to()``.
-
-    Args:
-        model: A torch.nn.Module to cast.
-        dtype: Target torch.dtype.
+    fp32 ``weight_scale``) is NEVER touched.
     """
     if dtype is None:
         return
@@ -222,32 +185,12 @@ def cast_model_to_dtype(model, dtype: torch.dtype) -> None:
 
 
 def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
-    """Cast a model to ``dtype`` only when some castable parameter mismatches.
-
-    Replaces the unconditional full-model ``.to(dtype)`` (RC-3). Walks the
-    parameters once; if every CASTABLE (floating, non-protected) parameter
-    already has the target dtype the function returns without touching the
-    model. Otherwise it casts ONLY the mismatched castable parameters in
-    place, then re-ties weights if the config marks them as tied.
-
-    Quant-resident parameters are excluded (see :func:`cast_model_to_dtype`).
-
-    The scan collects every castable mismatch rather than stopping at the
-    first one, so the DEBUG line can name the SOURCE dtype next to the target
-    and report how many parameters were involved. Collecting costs nothing:
-    the walk already visited every parameter on the fast path too, and a
-    matching checkpoint still returns without touching the model.
-
-    Args:
-        model: A torch.nn.Module to cast.
-        dtype: Target torch.dtype. ``None`` is a no-op.
-    """
+    """Cast a model to ``dtype`` only when some castable parameter mismatches."""
     if dtype is None:
         return
 
     protected = _quant_protected_names(model)
 
-    # Fast path: nothing castable to do.
     mismatched = []
     for name, param in model.named_parameters():
         if name in protected or not param.dtype.is_floating_point:
