@@ -12,17 +12,24 @@ Covers plan 2026-08-20 Phase A:
 - identity_for_external: differs for different paths / mtime changes; stable
   for identical inputs; basename-only (no path separators); missing-file
   fallback is deterministic.
+
+Also pins the patcher size-estimation contract (``VibeVoiceASRPatcher
+._estimate_size``) and the shared ``lowvram_model_memory`` forwarding
+contract, which together decide what ComfyUI believes the model costs.
 """
 
+import inspect
 import os
 import weakref
 
 import pytest
+import torch
 from unittest.mock import patch, MagicMock
 
 import comfy.model_management as model_management
 
 from ComfyUI_VibeVoice.modules import model_registry
+from ComfyUI_VibeVoice.modules.asr_generation import ExternalVibeVoiceASRModelHandler
 from ComfyUI_VibeVoice.modules.model_registry import (
     clear_active_keys,
     evict_if_changed,
@@ -32,6 +39,9 @@ from ComfyUI_VibeVoice.modules.model_registry import (
     set_active,
     unregister_from_comfy,
 )
+from ComfyUI_VibeVoice.modules.patcher import VibeVoicePatcher, VibeVoiceASRPatcher
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class _FinalizerStub:
@@ -342,3 +352,130 @@ class TestIdentityForExternal:
         assert tts_key.startswith("external_")
         assert asr_key.startswith("asr_external_")
         assert tts_key != asr_key
+
+
+# ====================================================================
+# Patcher size estimation + lowvram contract (verify-only)
+# ====================================================================
+
+class _SizedModel(torch.nn.Module):
+    """Tiny real module whose parameter byte sum is exactly predictable."""
+
+    def __init__(self, elements=8, dtype=torch.float32):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(elements, dtype=dtype))
+
+
+class TestASRPatcherSizeEstimate:
+    """``ExternalVibeVoiceASRModelHandler._estimate_size`` precedence.
+
+    hint (``size_gb``) > parameter byte sum > 15 GB fallback. This value is
+    ComfyUI's only view of what the model costs, so a wrong one either
+    starves it or lets it evict other models.
+    """
+
+    def test_size_gb_hint_wins_over_parameter_sum(self):
+        model = _SizedModel()  # 8 x fp32 = 32 bytes
+        size = ExternalVibeVoiceASRModelHandler._estimate_size(model, {"size_gb": 2.0})
+        assert size == int(2.0 * (1024 ** 3))
+        assert size > 32, "the hint must beat the parameter sum"
+
+    def test_parameter_sum_used_without_hint(self):
+        model = _SizedModel(elements=8)  # 8 x fp32 = 32 bytes
+        assert ExternalVibeVoiceASRModelHandler._estimate_size(model) == 32
+        # An empty bundle is the real external-ASR shape: the loader builds
+        # the bundle at modules/external_loader.py and sets no size_gb, which
+        # is correct — the model is fully materialised by then, so the real
+        # parameter sum is a better answer than a static config guess.
+        assert ExternalVibeVoiceASRModelHandler._estimate_size(model, {"is_asr": True}) == 32
+        assert ExternalVibeVoiceASRModelHandler._estimate_size(model, {"size_gb": None}) == 32
+
+    def test_falls_back_to_15gb_when_no_parameters(self):
+        assert ExternalVibeVoiceASRModelHandler._estimate_size(torch.nn.Module()) == \
+            int(15.0 * (1024 ** 3))
+
+    def test_unparsable_hint_falls_through_to_parameters(self):
+        model = _SizedModel(elements=8)
+        assert ExternalVibeVoiceASRModelHandler._estimate_size(
+            model, {"size_gb": "not-a-number"}) == 32
+
+
+def _make_patcher(cls):
+    """Build a patcher of ``cls`` with core's ``ModelPatcher.__init__`` stubbed."""
+    handler = MagicMock()
+    handler.cache_key = "k"
+    handler.model = MagicMock()  # pre-set → patch_model skips the lazy load
+    with patch("comfy.model_patcher.ModelPatcher.__init__"):
+        patcher = cls(
+            handler,
+            attention_mode="sdpa",
+            dtype=None,
+            load_device=torch.device("cpu"),
+            offload_device=torch.device("cpu"),
+            size=1000,
+        )
+    # Attributes core's __init__ would normally set (it is stubbed out).
+    patcher.model = handler
+    patcher.load_device = torch.device("cpu")
+    patcher.offload_device = torch.device("cpu")
+    patcher.pinned = set()
+    return patcher
+
+
+class TestPatcherLowvramContract:
+    """TTS and ASR patchers must expose the same lowvram contract.
+
+    ``lowvram_model_memory`` is ComfyUI's per-model memory allowance. Both
+    patchers take it and hand it to core untouched; neither stores it, and no
+    caller in this pack ever sets it — so core's own default applies and the
+    weights are fully resident on the load device.
+    """
+
+    @pytest.mark.parametrize("cls", [VibeVoicePatcher, VibeVoiceASRPatcher])
+    def test_signature_matches_and_forwards_value(self, cls):
+        assert inspect.signature(cls.patch_model) == \
+            inspect.signature(VibeVoicePatcher.patch_model)
+
+        patcher = _make_patcher(cls)
+        with patch("comfy.model_patcher.ModelPatcher.patch_model") as mock_super:
+            patcher.patch_model(lowvram_model_memory=123)
+
+        assert mock_super.call_args.kwargs["lowvram_model_memory"] == 123
+        # Forwarded, not intercepted: the patcher keeps no attribute for it.
+        assert not hasattr(patcher, "lowvram_model_memory")
+
+    def test_lowvram_model_memory_is_declared_and_forwarded_only(self):
+        """No module in this pack ever *sets* the value — only forwards it."""
+        modules_dir = os.path.join(ROOT, "modules")
+        hits = {}
+        assignments = []
+        for name in sorted(os.listdir(modules_dir)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(modules_dir, name), "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+            count = sum(1 for line in lines if "lowvram_model_memory" in line)
+            if count:
+                hits[name] = count
+            for lineno, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if "lowvram_model_memory" not in stripped:
+                    continue
+                if stripped.startswith(("def ", "lowvram_model_memory=")) or (
+                    stripped.startswith("lowvram_model_memory=")
+                ):
+                    continue
+                if "lowvram_model_memory=" in stripped and not stripped.startswith("def "):
+                    # A keyword argument in a super() forward is fine; an
+                    # attribute store (``self.lowvram_model_memory = ...``) is
+                    # not, and that is the thing this test exists to forbid.
+                    lhs = stripped.split("=", 1)[0]
+                    if "self." in lhs or "patcher." in lhs:
+                        assignments.append(f"{name}:{lineno}: {stripped}")
+        # Every mention lives in the patcher module: the legacy signature, its
+        # docstring, the legacy forward (which names the parameter twice — once
+        # as key, once as value), and the DynamicVRAM sibling class's
+        # signature + forward added by the 2026-09-29 T6 selector port.
+        assert set(hits) == {"patcher.py"}, hits
+        assert hits["patcher.py"] >= 3, hits
+        assert assignments == [], assignments

@@ -1,5 +1,7 @@
 """Tests for modules/dtype_utils.py - Dtype resolution and casting."""
 
+import logging
+
 import torch
 import pytest
 from unittest.mock import patch, MagicMock
@@ -240,6 +242,34 @@ class TestCastModelToDtypeIfNeeded:
         cast_model_to_dtype_if_needed(model, None)
         assert model.a.weight.data_ptr() == ptr_before
         assert model.a.weight.dtype == torch.float32
+
+    def test_debug_line_names_source_target_and_count(self, caplog):
+        """S6: the log states WHERE the model came from, not just where it goes.
+
+        A debug line that only prints the target cannot distinguish "the
+        checkpoint was fp32 and we cast it" from "one stray parameter
+        mismatched", which are very different RAM stories.
+        """
+        model = _TinyModel()  # fp32 weights + biases -> 4 mismatched params
+
+        with caplog.at_level(logging.DEBUG, logger="ComfyUI_VibeVoice.modules.dtype_utils"):
+            cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        cast_lines = [r.message for r in caplog.records if "mismatched params" in r.message]
+        assert len(cast_lines) == 1, cast_lines
+        line = cast_lines[0]
+        assert "torch.float32" in line, line          # source dtype
+        assert "torch.bfloat16" in line, line         # target dtype
+        assert "(4 mismatched params)" in line, line  # count over the whole tree
+
+    def test_no_debug_line_on_fast_path(self, caplog):
+        """A matching bf16 checkpoint must stay silent as well as free."""
+        model = _TinyModel().to(torch.bfloat16)
+
+        with caplog.at_level(logging.DEBUG, logger="ComfyUI_VibeVoice.modules.dtype_utils"):
+            cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        assert not [r for r in caplog.records if "mismatched params" in r.message]
 
 
 # ====================================================================

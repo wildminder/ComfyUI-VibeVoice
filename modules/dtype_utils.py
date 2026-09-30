@@ -232,6 +232,12 @@ def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
 
     Quant-resident parameters are excluded (see :func:`cast_model_to_dtype`).
 
+    The scan collects every castable mismatch rather than stopping at the
+    first one, so the DEBUG line can name the SOURCE dtype next to the target
+    and report how many parameters were involved. Collecting costs nothing:
+    the walk already visited every parameter on the fast path too, and a
+    matching checkpoint still returns without touching the model.
+
     Args:
         model: A torch.nn.Module to cast.
         dtype: Target torch.dtype. ``None`` is a no-op.
@@ -242,13 +248,17 @@ def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
     protected = _quant_protected_names(model)
 
     # Fast path: nothing castable to do.
+    mismatched = []
     for name, param in model.named_parameters():
         if name in protected or not param.dtype.is_floating_point:
             continue
         if param.dtype != dtype:
-            break
-    else:
+            mismatched.append((name, param.dtype))
+    if not mismatched:
         return
 
     _cast_mismatched_params(model, dtype)
-    logger.debug(f"Model cast to dtype (mismatched params only): {dtype}")
+    sources = ", ".join(sorted({str(src) for _, src in mismatched}))
+    logger.debug(
+        f"Model cast {sources} -> {dtype} ({len(mismatched)} mismatched params)"
+    )

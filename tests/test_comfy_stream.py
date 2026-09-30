@@ -450,3 +450,301 @@ class TestConvertTree:
         # None-valued params (register_parameter(name, None)) resolve to None.
         t.custom.register_parameter("ghost", None)
         assert t.custom.ghost is None
+
+
+# ---------------------------------------------------------------------
+# streaming_conversion gate
+# ---------------------------------------------------------------------
+
+class TestStreamingConversionGate:
+    """``streaming_conversion(False)`` must suppress the sweep and nothing
+    else. No caller opts in yet, so the default path has to be unchanged."""
+
+    def test_conversion_runs_by_default(self):
+        assert CS._STREAMING_CONVERSION_ENABLED is True
+        t = nn.Module()
+        t.lin = nn.Linear(4, 4)
+        assert CS.convert_tree_for_streaming(t) == {"Linear": 1}
+        assert t.lin.comfy_cast_weights is True
+
+    def test_conversion_suppressed_inside_context(self):
+        t = nn.Module()
+        t.lin = nn.Linear(4, 4)
+        with CS.streaming_conversion(False):
+            assert CS.convert_tree_for_streaming(t) == {}
+        # Suppressed, not converted: class and attributes are untouched.
+        assert type(t.lin) is nn.Linear
+        assert getattr(t.lin, "comfy_cast_weights", False) is False
+        # Restored on exit: a later sweep still converts.
+        assert CS._STREAMING_CONVERSION_ENABLED is True
+        assert CS.convert_tree_for_streaming(t) == {"Linear": 1}
+
+    def test_context_restores_previous_value_on_exception(self):
+        with pytest.raises(RuntimeError):
+            with CS.streaming_conversion(False):
+                raise RuntimeError("boom")
+        assert CS._STREAMING_CONVERSION_ENABLED is True
+        t = nn.Module()
+        t.lin = nn.Linear(4, 4)
+        assert CS.convert_tree_for_streaming(t) == {"Linear": 1}
+
+    def test_nested_contexts_restore_correctly(self):
+        t = nn.Module()
+        t.lin = nn.Linear(4, 4)
+        with CS.streaming_conversion(False):
+            assert CS._STREAMING_CONVERSION_ENABLED is False
+            with CS.streaming_conversion(False):
+                assert CS._STREAMING_CONVERSION_ENABLED is False
+                assert CS.convert_tree_for_streaming(t) == {}
+            # Inner exit restores the OUTER value, not the module default.
+            assert CS._STREAMING_CONVERSION_ENABLED is False
+            assert CS.convert_tree_for_streaming(t) == {}
+        assert CS._STREAMING_CONVERSION_ENABLED is True
+        assert CS.convert_tree_for_streaming(t) == {"Linear": 1}
+
+    def test_nested_context_restores_enabling_value(self):
+        """A nested ``True`` inside ``False`` must re-enable, and the outer
+        ``False`` must come back — save/restore, not a boolean OR."""
+        with CS.streaming_conversion(False):
+            with CS.streaming_conversion(True):
+                assert CS._STREAMING_CONVERSION_ENABLED is True
+            assert CS._STREAMING_CONVERSION_ENABLED is False
+        assert CS._STREAMING_CONVERSION_ENABLED is True
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_quant_resident_still_excluded(self, enabled):
+        """GGUF / convrot-int8 / fp8 residents stream natively and are never
+        rewrapped, whichever way the gate is set."""
+        from gguf.constants import GGMLQuantizationType as T
+
+        from modules.convrot_quant import ConvRotInt8Linear
+        from modules.fp8_quant import FP8Linear
+        from modules.gguf_quant import GGUFLinear
+
+        t = nn.Module()
+        t.gguf = GGUFLinear(32, 32, bias=False, ggml_type=T.Q8_0)
+        t.convrot = ConvRotInt8Linear(4, 4, bias=False, group_size=32)
+        t.fp8 = FP8Linear(4, 4, bias=False, fp8_dtype=torch.float8_e4m3fn)
+        # The local stand-in from the sweep tests, same exclusion path.
+        t.resident = _QuantResident(4, 4)
+
+        before = {k: (type(v), getattr(v, "comfy_cast_weights", "unset"),
+                      v.weight_function if hasattr(v, "weight_function")
+                      else "unset")
+                  for k, v in t.named_children()}
+        with CS.streaming_conversion(enabled):
+            census = CS.convert_tree_for_streaming(t)
+        assert census == {}
+        for name, (cls, cast, wf) in before.items():
+            child = getattr(t, name)
+            assert type(child) is cls
+            assert getattr(child, "comfy_cast_weights", "unset") == cast
+            if wf != "unset":
+                assert child.weight_function is wf
+
+
+# ---------------------------------------------------------------------
+# Regression: index-input ops must not derive the weight cast from x
+# ---------------------------------------------------------------------
+
+class TestEmbeddingIndexDtype:
+    """``cast_bias_weight`` takes its target dtype from ``input.dtype``.
+
+    For nn.Embedding the input is an int64 index tensor, so passing it as
+    the dtype source cast the WHOLE embedding table to int64 and made the
+    lookup return int64 embeddings. That silently poisoned every downstream
+    consumer: the LM's ``inputs_embeds`` became int64, and
+    ``speech_tensors.type_as(x)`` then fed int64 audio into the acoustic
+    tokenizer, crashing with "Input type (__int64) and bias type
+    (BFloat16) should be the same" at the encoder stem conv. Core never
+    does this — it passes only ``device=input.device`` (comfy/ops.py:793).
+    """
+
+    def _converted_embedding(self, dtype=torch.bfloat16):
+        t = nn.Module()
+        t.emb = nn.Embedding(32, 8, dtype=dtype)
+        CS.convert_tree_for_streaming(t)
+        return t
+
+    def test_embedding_lookup_keeps_float_dtype(self):
+        """int64 ids in -> float embeddings out (the reported crash).
+
+        A non-empty ``weight_function`` forces the CAST path — the fast path
+        yields the already-resident weight untouched, and the streaming /
+        vbar route the bug was reported from is exactly the cast path.
+        """
+        t = self._converted_embedding()
+        t.emb.weight_function = [lambda w: w]
+        ids = torch.tensor([1, 5, 31], dtype=torch.int64)
+        out = t.emb(ids)
+        assert out.dtype.is_floating_point, f"embedding returned {out.dtype}"
+        assert out.shape == (3, 8)
+        # Values must still be the table rows (no truncated-to-int cast).
+        assert torch.equal(out.float(), t.emb.weight.detach()[ids].float())
+
+    def test_embedding_accepts_int32_indices_too(self):
+        t = self._converted_embedding()
+        t.emb.weight_function = [lambda w: w]
+        out = t.emb(torch.tensor([0, 2], dtype=torch.int32))
+        assert out.dtype.is_floating_point
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_embedding_across_devices_keeps_weight_dtype(self):
+        """The slow (cast) path: module on CPU, ids on CUDA."""
+        t = self._converted_embedding()
+        t.emb.to("cpu")
+        ids = torch.tensor([4, 9], dtype=torch.int64, device="cuda")
+        out = t.emb(ids)
+        assert out.dtype == torch.bfloat16, f"got {out.dtype}"
+        assert out.device.type == "cuda"
+        ref = torch.nn.functional.embedding(
+            ids, t.emb.weight.detach().to("cuda", torch.bfloat16))
+        assert torch.equal(out, ref)
+
+
+class TestPullStats:
+    """The [vvpull] line is the contract with a live run: it must name the
+    path that served each weight (vbar = core's file->VRAM paging read,
+    nonvbar = the cast-buffer path that can copy a file view HOST-side) and
+    the bytes moved. A silent counter is how the 'insanely long + RAM fill'
+    report goes unattributed again, so the format is pinned here."""
+
+    def test_empty_after_reset(self):
+        from ComfyUI_VibeVoice.modules.comfy_stream import (
+            pull_stats_line, reset_pull_stats,
+        )
+
+        reset_pull_stats()
+        assert "no streaming leaf pulls" in pull_stats_line()
+
+    def test_records_path_bytes_and_resets(self):
+        from ComfyUI_VibeVoice.modules.comfy_stream import (
+            _record_pull, pull_stats_line, reset_pull_stats,
+        )
+
+        reset_pull_stats()
+        _record_pull("Linear", "vbar", 1024 ** 2)
+        _record_pull("Linear", "vbar", 1024 ** 2)
+        _record_pull("Conv1d", "nonvbar", 4096)
+        line = pull_stats_line()
+        assert "vbar/Linear=2(2MB)" in line, line
+        assert "nonvbar/Conv1d=1(0MB)" in line, line
+
+        reset_pull_stats()
+        assert "no streaming leaf pulls" in pull_stats_line()
+
+    def test_acquire_counts_the_colocated_fast_path(self):
+        import torch
+        from ComfyUI_VibeVoice.modules.comfy_stream import (
+            pull_stats_line, reset_pull_stats,
+        )
+        from ComfyUI_VibeVoice.modules.comfy_stream import _acquire
+
+        reset_pull_stats()
+        lin = torch.nn.Linear(4, 4)
+        with _acquire(lin, torch.randn(2, 4)) as (w, b):
+            assert w is lin.weight
+        line = pull_stats_line()
+        assert "colocated/Linear=1" in line, line
+
+
+class TestVbarResidencyObserver:
+    """``[vvpull]`` must separate a cheap arena hit from a disk re-read.
+
+    Finding F7 (tests/probe_vbar_residency.py): when the model does not fit in
+    free VRAM, every forward re-reads the weights from the checkpoint file,
+    which is the reported "~10x slower inference". The per-kind byte totals
+    above CANNOT show that -- a resident pull and a re-read both "serve" a
+    weight -- so the verdict core already computed is reported separately.
+    """
+
+    @staticmethod
+    def _install_over(monkeypatch, delegate):
+        """Install the observer on top of a stand-in for core's resolver.
+
+        Installing over a fake lets the assertions cover what the wrapper does
+        to core's call (counts, then delegates the SAME arguments) without
+        dragging core's real vbar machinery into a CPU-only test. The
+        module-level ``_VBAR_OBSERVER`` guard is cleared so the install path
+        itself is exercised rather than short-circuited.
+        """
+        import comfy.ops
+
+        monkeypatch.setattr(comfy.ops, "resolve_cast_module_with_vbar", delegate)
+        monkeypatch.setattr(CS, "_VBAR_OBSERVER", None)
+        CS._install_vbar_observer()
+        return comfy.ops.resolve_cast_module_with_vbar
+
+    class _FakeModule:
+        def __init__(self, resident, weight):
+            self._prefetch = {"signature": object(), "resident": resident}
+            self.weight = weight
+
+    def test_splits_resident_from_reread(self, monkeypatch):
+        calls = []
+
+        def delegate(s, *args, **kwargs):
+            calls.append((s, args, kwargs))
+            return "delegated"
+
+        observed = self._install_over(monkeypatch, delegate)
+        CS.reset_pull_stats()
+        lin = torch.nn.Linear(4, 4)
+
+        assert observed(self._FakeModule(True, lin.weight)) == "delegated"
+        assert observed(self._FakeModule(False, lin.weight)) == "delegated"
+
+        split = CS._VBAR_SPLIT
+        assert split["resident_calls"] == 1
+        assert split["reread_calls"] == 1
+        assert split["reread_bytes"] == 4 * 4 * 4
+        assert len(calls) == 2, "core's call must not be skipped"
+        CS.reset_pull_stats()
+
+    def test_forwards_arguments_untouched(self, monkeypatch):
+        seen = {}
+        delegate = lambda s, *a, **k: seen.update(args=a, kwargs=k) or "ok"
+
+        observed = self._install_over(monkeypatch, delegate)
+        marker = self._FakeModule(True, torch.nn.Linear(4, 4).weight)
+        assert observed(marker, 1, 2, three=3) == "ok"
+        assert seen["args"] == (1, 2)
+        assert seen["kwargs"] == {"three": 3}
+
+    def test_module_without_prefetch_does_not_raise(self, monkeypatch):
+        observed = self._install_over(monkeypatch, lambda s, *a, **k: "ok")
+        CS.reset_pull_stats()
+        assert observed(torch.nn.Linear(4, 4), 1) == "ok"
+        assert CS._VBAR_SPLIT["resident_calls"] == 0
+        assert CS._VBAR_SPLIT["reread_calls"] == 0
+
+    def test_installs_once_and_is_idempotent(self, monkeypatch):
+        observed = self._install_over(monkeypatch, lambda s, *a, **k: "ok")
+        CS._install_vbar_observer()
+        assert CS._VBAR_OBSERVER is observed
+        import comfy.ops
+
+        assert comfy.ops.resolve_cast_module_with_vbar is observed, (
+            "a second install would stack wrappers onto core's resolver")
+
+    def test_pull_line_reports_the_split_and_its_share(self):
+        CS.reset_pull_stats()
+        assert "resident=" not in CS.pull_stats_line()
+
+        CS._record_pull("Linear", "vbar", 1024 ** 2)
+        CS._VBAR_SPLIT["resident_calls"] = 90
+        CS._VBAR_SPLIT["reread_calls"] = 10
+        CS._VBAR_SPLIT["reread_bytes"] = 5 * 1024 ** 2
+        line = CS.pull_stats_line()
+        assert "resident=90" in line, line
+        assert "reread=10(10.0%,5MB)" in line, line
+
+        CS.reset_pull_stats()
+        assert CS._VBAR_SPLIT["resident_calls"] == 0
+        assert CS._VBAR_SPLIT["reread_calls"] == 0
+        assert CS._VBAR_SPLIT["reread_bytes"] == 0
+
+    def test_reset_clears_the_split(self):
+        CS._VBAR_SPLIT["reread_calls"] = 7
+        CS.reset_pull_stats()
+        assert CS._VBAR_SPLIT["reread_calls"] == 0

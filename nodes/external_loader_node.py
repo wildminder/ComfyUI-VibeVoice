@@ -36,6 +36,7 @@ from ..modules.model_registry import (
     FAMILY_ASR,
     FAMILY_TTS,
     evict_if_changed,
+    get_live_bundle,
     identity_for_external,
 )
 from ..modules.utils import VIBEVOICE_ASR_PATCHER_CACHE, VIBEVOICE_PATCHER_CACHE
@@ -284,6 +285,28 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
             request_key,
             (VIBEVOICE_ASR_PATCHER_CACHE if is_asr else VIBEVOICE_PATCHER_CACHE,),
         )
+        # The gate above is a strict no-op for a SAME-key re-execution (that is
+        # what lets a cached re-run reuse its live patcher), but without this
+        # short-circuit the node still REBUILDS the model on every run. The
+        # outgoing weights remain reachable from two places — ComfyUI's node
+        # output cache and the live patcher's handler — so the rebuild overlaps
+        # a second full copy: the ~2x host-RAM spike on a 16.6 GB checkpoint,
+        # invisible in the load path itself, which measures ~1.0x file
+        # (plan §11.8).
+        #
+        # Reusing the resident model is not merely a RAM optimisation: the
+        # consumer's patcher is keyed by this same identity and is NOT rebuilt
+        # on a hit, so a rebuilt bundle would be discarded in favour of the
+        # already-loaded weights. Short-circuiting keeps exactly one model, and
+        # keeps the node's output consistent with the patcher the consumer
+        # will actually use.
+        cached_bundle = get_live_bundle(request_key)
+        if cached_bundle is not None:
+            logger.debug(
+                f"Reusing the resident model for {request_key!r} "
+                f"(identical re-execution; skipping the rebuild)"
+            )
+            return io.NodeOutput(cached_bundle)
 
         model_bundle = load_external_vibevoice_model(
             weight_path=weight_path,

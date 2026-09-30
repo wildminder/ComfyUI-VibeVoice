@@ -34,15 +34,52 @@ def _default_device() -> torch.device:
 def iter_safetensors_tensors(ckpt_path: str):
     """Yield ``(key, tensor)`` one at a time from a safetensors file.
 
-    Per-tensor streaming contract: only ONE tensor is
-    materialized at any moment — the full-file state dict (and its
-    ~file-size RAM residency) never exists.
+    Two read layers, selected by the same switch core's own loaders use:
 
-    Tensors are zero-copy views into the memory-mapped file (same semantics
-    as ``comfy.utils.load_torch_file``). A consumer that keeps a tensor past
-    the iterator's lifetime must copy it into private memory first — a view
-    keeps the ENTIRE file mapping resident in the process working set.
+    - aimdo ON (the DynamicVRAM install): ``comfy.utils.load_torch_file``
+      routes to core's ``load_safetensors`` (``comfy/utils.py:165-166``),
+      which maps the file once and hands back per-tensor ``torch.frombuffer``
+      VIEWS whose storages pin the mapping themselves
+      (``_comfy_tensor_mmap_refs``, ``comfy/utils.py:148-153``). Holding all
+      views costs only file-backed page cache — no private commit — so the
+      FULL view dict may exist for the duration of the stream without
+      breaking the contract below; the only private bytes are the ones the
+      CONSUMER clones. This deletes the read layer that used to sit beside
+      that clone.
+    - aimdo OFF: the original ``safe_open`` stream, one tensor materialised
+      at a time.
+
+    Per-tensor streaming contract (unchanged): a consumer that keeps a
+    yielded tensor past the iteration MUST ``clone()`` it into memory it
+    owns before handing it to a parameter that may later be
+    ``cudaHostRegister``-pinned. Under the aimdo arm the yielded tensor IS a
+    file view (kept views would pin the whole mapping / fail pinning); under
+    the fallback arm it is an owned read. Every current consumer
+    (``_stream_apply_dense``, ``_stream_apply_safetensors``) clones
+    unconditionally, so the clone's size does not depend on the arm.
+
+    MEASURED, 2026-09-29 (tests/probe_safetensors_aliases_mapping.py, this
+    host): a ``safe_open`` read moves ``private`` by ~1x file on this host
+    (charged private, NOT ws/uss, unlike a plain mmap read) — and that cost
+    sits beside the consumer's mandatory clone, which is how the 7B fp8
+    load reached 17.58GB private for a 9.47GB file (live ``[vvrss]``,
+    2026-09-30). The aimdo arm removes the read half.
     """
+    import comfy.memory_management
+
+    if getattr(comfy.memory_management, "aimdo_enabled", False):
+        import comfy.utils
+
+        views = comfy.utils.load_torch_file(ckpt_path)
+        try:
+            yield from views.items()
+        finally:
+            # Prompt release of every view the consumer did not keep; a kept
+            # view still self-pins the mapping via its storage refs, so a
+            # mid-iteration close cannot dangle.
+            views.clear()
+        return
+
     from safetensors import safe_open
 
     with safe_open(str(ckpt_path), framework="pt", device="cpu") as f:
@@ -207,8 +244,12 @@ class BaseVibeVoiceLoader:
         are pickle archives that cannot be streamed and fall back to
         ``comfy.utils.load_torch_file`` + item iteration.
 
-        Tensors may be zero-copy views into the checkpoint file — a consumer
-        that keeps a tensor must copy it into private memory first.
+        Tensors from a safetensors file are aimdo file views when aimdo is
+        enabled, otherwise owned deserialised copies (see
+        :func:`iter_safetensors_tensors` for the measurement); a ``.bin`` /
+        ``.pt`` tensor may be a ``torch.load(mmap=True)`` view when
+        ``comfy.utils.MMAP_TORCH_FILES`` is set. Either way a consumer that
+        keeps a tensor must copy it into memory it owns first.
 
         Args:
             ckpt_path: Path to a single checkpoint file.
@@ -233,8 +274,10 @@ class BaseVibeVoiceLoader:
         each shard's file mapping can be released as soon as its tensors have
         been consumed.
 
-        Tensors may be zero-copy views into the shard files — a consumer that
-        keeps a tensor must copy it into private memory first (a retained
+        Tensors from safetensors shards are aimdo file views when aimdo is
+        enabled, otherwise owned deserialised copies; a ``.bin`` shard read
+        under ``MMAP_TORCH_FILES`` may yield genuine views. A consumer that
+        keeps a tensor must copy it into memory it owns first (a retained
         view pins its whole shard mapping in the process working set).
 
         Args:

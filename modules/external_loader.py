@@ -15,6 +15,20 @@ Sidecar file convention (place next to the weight file):
     - ``<weight>.preprocessor.json``    → audio preprocessor config (preferred)
     - ``preprocessor_config.json``      → audio preprocessor config (same dir)
     - ``tokenizer.json``                → Qwen2.5 text tokenizer (same dir)
+
+The ``config_name`` dropdown selects the loading BRANCH (TTS vs ASR). Inside
+the ASR branch the checkpoint's own ``model_type`` selects the model FAMILY,
+because two incompatible ASR families are loadable there and the config JSON
+is the only thing that can tell them apart:
+
+    - ``"vibevoice_asr"`` → the transformers >= 5.3.0 classes
+      (``AutoConfig`` / ``VibeVoiceAsrForConditionalGeneration``), which build
+      the ``language_model.model.*`` tree the published ``VibeVoice-ASR-HF``
+      checkpoints store. See :mod:`modules.asr_native`.
+    - ``"vibevoice"`` → the vendored ``src/vibevoice`` classes
+      (``VibeVoiceASRConfig`` / ``VibeVoiceASRForConditionalGeneration``),
+      which build the ``model.language_model.*`` tree of the original
+      ``microsoft/VibeVoice-ASR`` checkpoints.
 """
 
 import os
@@ -37,8 +51,15 @@ from ..src.vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceAS
 from ..src.vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
 from ..src.vibevoice.processor.vibevoice_tokenizer_processor import VibeVoiceTokenizerProcessor
 
-from .loader import VibeVoiceLoader
+from .loader import VibeVoiceLoader, QUANT_STORAGE_DTYPES
 from .base_loader import iter_safetensors_tensors
+from .asr_native import (
+    NATIVE_ASR_MODEL_TYPE,
+    build_native_asr_processor,
+    is_native_asr_config_path,
+    load_native_asr_config,
+    instantiate_native_asr_model,
+)
 from .attention_utils import (
     SAGE_ATTENTION_AVAILABLE,
     resolve_attention_mode,
@@ -50,6 +71,16 @@ from .attention_utils import (
 from .dtype_utils import resolve_dtype, cast_model_to_dtype_if_needed, set_config_dtype
 from .convrot_quant import UnsupportedQuantFormat
 from .quant_common import validate_weight_plan
+from pathlib import Path
+
+from .patcher import (
+    VibeVoiceASRPatcher,
+    VibeVoicePatcher,
+    dynamic_vram_available,
+    resolve_core_patcher_class,
+    select_patcher_class,
+)
+from .memory_census import measured_load, report_census
 
 if SAGE_ATTENTION_AVAILABLE:
     from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
@@ -62,6 +93,7 @@ logger = logging.getLogger(__name__)
 _PACKAGED_CONFIG_FILES = {
     "VibeVoice-1.5B": "default_VibeVoice-1.5B_config.json",
     "VibeVoice-7B": "default_VibeVoice-Large_config.json",
+    "VibeVoice-ASR": "default_VibeVoice-ASR_config.json",
 }
 
 # Sentinel config_name that resolves the architecture from the weight file's
@@ -420,22 +452,33 @@ def is_asr_config_name(config_name: str) -> bool:
 
 
 def _load_asr_config(config_path: str) -> "VibeVoiceASRConfig":
-    """Load a :class:`VibeVoiceASRConfig` from a sidecar config JSON.
+    """Load the ASR architecture config named by ``config_path``.
 
-    ASR configs share ``model_type == "vibevoice"`` with TTS configs, so the
-    caller must select this loader explicitly (via the ``config_name`` dropdown).
+Two ASR families share this branch and need DIFFERENT config classes, so
+the checkpoint's own ``model_type`` picks the one:
 
-    Args:
-        config_path: Path to the ASR config.json.
+- ``"vibevoice_asr"`` (the published ``VibeVoice-ASR-HF`` family) →
+  ``transformers.AutoConfig``; the result carries the ``text_config`` /
+  ``*_tokenizer_encoder_config`` sub-configs the native model class is
+  built from, which the vendored config cannot represent.
+- anything else, including the ``"vibevoice"`` the vendored ASR configs
+  share with TTS → the vendored :class:`VibeVoiceASRConfig`, selected by
+  the caller's ``config_name`` dropdown.
 
-    Returns:
-        VibeVoiceASRConfig instance.
+Args:
+    config_path: Path to the ASR config.json.
 
-    Raises:
-        FileNotFoundError: If the config file does not exist.
-    """
+Returns:
+    A VibeVoiceASRConfig (vendored) or VibeVoiceAsrConfig (native).
+
+Raises:
+    FileNotFoundError: If the config file does not exist.
+    RuntimeError: If a native config is read on transformers < 5.3.0.
+"""
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"ASR config not found: {config_path}")
+    if is_native_asr_config_path(config_path):
+        return load_native_asr_config(config_path)
     return VibeVoiceASRConfig.from_pretrained(config_path)
 
 
@@ -523,16 +566,26 @@ def _instantiate_asr_model(
     final_load_dtype: torch.dtype,
     use_meta: bool = True,
 ):
-    """Instantiate a :class:`VibeVoiceASRForConditionalGeneration` directly.
+    """Instantiate the ASR model class the config's ``model_type`` names.
 
-    ASR counterpart of :meth:`VibeVoiceLoader._instantiate_model`. Instantiates
-    the model class directly (bypassing ``from_pretrained``) so the state dict
-    can be loaded in-memory afterwards. By default construction runs under a
-    ``torch.device("meta")`` context (plan 2026-08-18, D1) — zero RAM, zero
-    random init; weights are bound afterwards by ``_apply_state_dict``.
+    Two families, two classes (see :func:`_load_asr_config`):
+
+    - ``"vibevoice_asr"`` → ``transformers.VibeVoiceAsrForConditionalGeneration``
+      with the attention routed onto the config objects (the ctor takes no
+      ``attn_implementation`` and the config has no
+      ``set_attn_implementation``).
+    - otherwise → the vendored :class:`VibeVoiceASRForConditionalGeneration`,
+      unchanged.
+
+    Both build the class directly (bypassing ``from_pretrained``) so the state
+    dict can be loaded in-memory afterwards. By default construction runs
+    under a ``torch.device("meta")`` context (plan 2026-08-18, D1) — zero RAM,
+    zero random init; weights are bound afterwards by ``_apply_state_dict``.
+
+    ASR counterpart of :meth:`VibeVoiceLoader._instantiate_model`.
 
     Args:
-        config: VibeVoiceASRConfig instance.
+        config: VibeVoiceASRConfig (vendored) or VibeVoiceAsrConfig (native).
         attn_implementation: Attention implementation string.
         final_load_dtype: torch.dtype for the model.
         use_meta: Construct under a meta device context (default True).
@@ -540,6 +593,14 @@ def _instantiate_asr_model(
     Returns:
         Model instance (weights not yet loaded).
     """
+    if getattr(config, "model_type", None) == NATIVE_ASR_MODEL_TYPE:
+        return instantiate_native_asr_model(
+            config,
+            attn_implementation=attn_implementation,
+            final_load_dtype=final_load_dtype,
+            use_meta=use_meta,
+        )
+
     # Set attention implementation on the decoder config
     if hasattr(config, "decoder_config"):
         config.decoder_config._attn_implementation = attn_implementation
@@ -658,9 +719,11 @@ def _gguf_kquant_present(reader) -> bool:
 
 
 # Quant-storage dtypes that must NEVER reach the dense float loader.
-_QUANT_STORAGE_DTYPES = frozenset({
-    torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2,
-})
+# Alias of the single definition in :mod:`modules.loader` (import direction is
+# one-way: this module already imports ``VibeVoiceLoader`` from there, so
+# ``loader`` must never import back). Kept under the private name for the
+# dense batch check, the quant streaming path, and ``_assert_dense_loadable``.
+_QUANT_STORAGE_DTYPES = QUANT_STORAGE_DTYPES
 
 
 def _plan_quantized_safetensors_load(quant_map: dict):
@@ -831,15 +894,9 @@ def _prepare_quantized_safetensors_load(state_dict: dict, quant_map: dict):
 # loader's sharded/dense streaming path); imported at module top.
 
 
-def _read_safetensors_tensor(weight_path: str, key: str):
-    """Read a single named tensor from a safetensors file."""
-    from safetensors import safe_open
-
-    with safe_open(str(weight_path), framework="pt", device="cpu") as f:
-        return f.get_tensor(key)
-
-
-def _stream_apply_safetensors(model, weight_path: str, quant_map: dict):
+def _stream_apply_safetensors(
+    model, weight_path: str, quant_map: dict, preserve_file_views: bool = False
+):
     """Assign a quantized safetensors checkpoint per-tensor (no full dict).
 
     The RAM-spike killer of plan 2026-08-27 (Phase 3): replaces the batch
@@ -871,6 +928,15 @@ def _stream_apply_safetensors(model, weight_path: str, quant_map: dict):
         weight_path: Path to the quantized ``.safetensors`` checkpoint.
         quant_map: Scanned ``comfy_quant`` map from
             ``scan_checkpoint_quantization``.
+        preserve_file_views: True ONLY when the patcher for this load will
+            be dynamic (core resolved ``ModelPatcherDynamic`` for a CUDA
+            target). The zero-copy aimdo file views are then assigned into
+            the parameters as-is — the ``assign=True`` shape core's own
+            loaders use (comfy/sd.py:2407) — and the dynamic patcher pages
+            them disk->VRAM at forward (comfy/model_patcher.py:1993), so no
+            tensor is ever staged in host RAM. False (legacy) keeps the
+            per-tensor ``clone()``: a view retained by a legacy patcher's
+            offloaded parameter would pin the file and break pinning.
 
     Returns:
         Tuple of (missing_keys, unexpected_keys).
@@ -897,16 +963,33 @@ def _stream_apply_safetensors(model, weight_path: str, quant_map: dict):
     # Pass 1 — scales for dequant-at-load layers are tiny; read them up
     # front so the weight stream never has to look back (file order is not
     # guaranteed to put the scale before its weight).
+    #
+    # MEASURED (tests/probe_external_fp8_full_path.py, this host, 2026-09-30):
+    # this pass was the ~9GB private ghost of the 7B fp8 live load. It used
+    # ``safetensors.safe_open`` per scale, and ONE ``safe_open`` + ``get_tensor``
+    # on a 9.47GB file commits ~1x the file as PRIVATE (not ws/uss — the pages
+    # are never faulted, so the sampler's ws stays flat and the census cannot
+    # see it either), pinned until the returned tensor dies. The aimdo
+    # ``load_torch_file`` arm maps the same file FILE-BACKED (13.5MB private
+    # for the real 5GB file, 22MB for the 9.5GB one — probe_dense_read_scale),
+    # so the pre-read goes through it instead: take owned copies of the tiny
+    # scales and drop the view dict immediately.
     scales = {}
-    for prefix in dequant_infos:
-        s_key = f"{prefix}.weight_scale"
+    if dequant_infos:
+        view_dict = comfy.utils.load_torch_file(weight_path)
         try:
-            scales[prefix] = _read_safetensors_tensor(weight_path, s_key)
-        except Exception as e:
-            raise QuantTargetMismatch(
-                f"Rowwise-quantized layer '{prefix}' is missing its "
-                f"'{s_key}' tensor in the checkpoint"
-            ) from e
+            for prefix in dequant_infos:
+                s_key = f"{prefix}.weight_scale"
+                try:
+                    scales[prefix] = view_dict[s_key].clone()
+                except KeyError as e:
+                    raise QuantTargetMismatch(
+                        f"Rowwise-quantized layer '{prefix}' is missing its "
+                        f"'{s_key}' tensor in the checkpoint"
+                    ) from e
+        finally:
+            view_dict.clear()
+            del view_dict
 
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
@@ -933,49 +1016,98 @@ def _stream_apply_safetensors(model, weight_path: str, quant_map: dict):
         return False
 
     # Pass 2 — stream every tensor exactly once.
-    assigned = set()
-    for key, tensor in iter_safetensors_tensors(weight_path):
-        if key.endswith(meta_suffix):
-            continue  # metadata consumed by the resident modules themselves
-        prefix, _, leaf = key.rpartition(".")
-        if prefix in dequant_infos and leaf == "weight_scale":
-            continue  # consumed by pass 1
-        if prefix in dequant_infos and leaf == "weight":
-            # Dequantization builds a fresh tensor that already owns its
-            # memory — no file mapping to sever.
-            tensor = _dequantize_rowwise_weight(
-                prefix, dequant_infos[prefix], tensor, scales[prefix]
-            )
-        else:
-            if tensor.dtype in _QUANT_STORAGE_DTYPES:
-                # Planned residents assign their raw storage into the matching
-                # raw-storage parameter; anything else is an unplanned quant
-                # weight that must never reach a float parameter.
-                if prefix not in resident_prefixes \
-                        or leaf not in ("weight", "weight_scale"):
-                    raise ValueError(
-                        f"Checkpoint contains quantized-weight tensors "
-                        f"({key}: {tensor.dtype}) that no comfy_quant metadata "
-                        f"declares. This node only loads quant formats it can "
-                        f"execute; re-export the checkpoint or use a dense "
-                        f"(bf16/fp16) file."
-                    )
-                target = params.get(key)
-                if target is not None and tensor.dtype != target.dtype:
-                    raise QuantTargetMismatch(
-                        f"Resident layer '{prefix}': expected {target.dtype} "
-                        f"storage for '{leaf}', checkpoint has {tensor.dtype}"
-                    )
-            # Sever the checkpoint file mapping: everything assigned raw from
-            # the stream is a zero-copy mmap view, and a view retained by an
-            # offloaded parameter would pin the whole file in the process
-            # working set (same ghost-RAM / pin hazard as the dense sharded
-            # path in VibeVoiceLoader._stream_apply_dense).
-            tensor = tensor.clone()
-        if _assign(key, tensor):
-            assigned.add(key)
-        else:
-            unexpected.append(key)
+    #
+    # SAMPLED end to end, because this is where a quantized load's
+    # host-RAM TRANSIENT lives and the transient is gone before the
+    # post-H2D census runs. A census inventories what the model still
+    # HOLDS; it structurally cannot see a spike that has already
+    # resolved, so the number a user reports for the 7B fp8 file cannot
+    # be reproduced from one. The two marks bracket the real read, which
+    # is what turns "the load peaked at 2x" into "the read peaked at 2x".
+    #
+    # MEASURED 2026-09-29 (tests/probe_safetensors_aliases_mapping.py, this
+    # host): a ``safe_open`` read moves ``private`` by ~1x file on this host
+    # (charged private, NOT ws/uss, unlike a plain mmap read) — and that cost
+    # sits beside the consumer's mandatory clone, which is how the 7B fp8
+    # load reached 17.58GB private for a 9.47GB file (live ``[vvrss]``,
+    # 2026-09-30). FIXED 2026-09-30: under aimdo the iterator now yields
+    # zero-copy ``load_safetensors`` file views (modules/base_loader.py, the
+    # aimdo arm), so the read half is page cache instead of private commit
+    # and this pass's peak drops to the clones (~1x file). The aimdo-off
+    # fallback keeps the old read shape. The ``[vvrss]`` line emitted around
+    # this pass, and the ``[vvcensus] private=`` bucket, are the two numbers
+    # that decide whether the aimdo arm held.
+    with measured_load("stream-apply-safetensors") as _rss:
+        _rss.mark("stream-begin")
+        assigned = set()
+        for key, tensor in iter_safetensors_tensors(weight_path):
+            if not assigned:
+                # ATTRIBUTION MARK (2026-09-30). Live run: the model holds
+                # private=1.02GB at stream end while the PROCESS is at
+                # end_private=13.03GB. Something outside the model's storages
+                # commits ~12GB during this pass. The only sizeable thing that
+                # happens here is the aimdo view DICT itself (iter_safetensors_
+                # tensors -> comfy.utils.load_torch_file maps the whole file
+                # and tags every tensor), so sample once, on the first tensor:
+                # if private has already jumped by file-size here, the cost is
+                # core's mapping accounting (the same thing Krea holds), not
+                # our assign. If it is still flat, the growth is in the loop.
+                _rss.mark("first-view")
+            if key.endswith(meta_suffix):
+                continue  # metadata consumed by the resident modules themselves
+            prefix, _, leaf = key.rpartition(".")
+            if prefix in dequant_infos and leaf == "weight_scale":
+                continue  # consumed by pass 1
+            if prefix in dequant_infos and leaf == "weight":
+                # Dequantization builds a fresh tensor that already owns its
+                # memory — no file mapping to sever.
+                tensor = _dequantize_rowwise_weight(
+                    prefix, dequant_infos[prefix], tensor, scales[prefix]
+                )
+            else:
+                if tensor.dtype in _QUANT_STORAGE_DTYPES:
+                    # Planned residents assign their raw storage into the matching
+                    # raw-storage parameter; anything else is an unplanned quant
+                    # weight that must never reach a float parameter.
+                    if prefix not in resident_prefixes \
+                            or leaf not in ("weight", "weight_scale"):
+                        raise ValueError(
+                            f"Checkpoint contains quantized-weight tensors "
+                            f"({key}: {tensor.dtype}) that no comfy_quant metadata "
+                            f"declares. This node only loads quant formats it can "
+                            f"execute; re-export the checkpoint or use a dense "
+                            f"(bf16/fp16) file."
+                        )
+                    target = params.get(key)
+                    if target is not None and tensor.dtype != target.dtype:
+                        raise QuantTargetMismatch(
+                            f"Resident layer '{prefix}': expected {target.dtype} "
+                            f"storage for '{leaf}', checkpoint has {tensor.dtype}"
+                        )
+                # Sever the file mapping — LEGACY / no-dynamic routes only.
+                # A view retained by an offloaded parameter would pin the whole
+                # file in the process working set (same ghost-RAM / pin hazard
+                # as the dense sharded path in VibeVoiceLoader._stream_apply_dense).
+                # On the dynamic route the view IS the point: core's
+                # ModelPatcherDynamic pages the parameters disk->VRAM at
+                # forward (comfy/model_patcher.py:1993), so the resident stays
+                # a slice of the file and nothing is ever staged in host RAM —
+                # this is the assign=True shape core's own loaders use
+                # (comfy/sd.py:2407).
+                if not preserve_file_views:
+                    tensor = tensor.clone()
+            if _assign(key, tensor):
+                assigned.add(key)
+            else:
+                unexpected.append(key)
+
+        _rss.mark("stream-end")
+        # What the model HOLDS at this instant, by storage. The sampler's
+        # process counters cannot tell a resident's real allocation from a
+        # transient one that has already been freed, so when a live run
+        # reports a peak the census does not explain, this line is what names
+        # the holder (gated by report_census's own enable switch).
+        report_census(model, phase=f"stream-end:{Path(weight_path).stem}")
 
     # Missing keys = expected model keys the file never delivered. Mirrors
     # torch's own missing-key semantics (persistent state only; tied names
@@ -1454,7 +1586,9 @@ def warn_if_lowbit_quantization(weight_path: str) -> None:
 # In-memory state dict loading
 # ====================================================================
 
-def _load_state_dict_into_model_from_memory(model, state_dict: dict):
+def _load_state_dict_into_model_from_memory(
+    model, state_dict: dict, preserve_file_views: bool = False,
+):
     """Load an in-memory state dict into an already-instantiated model.
 
     Mirrors :meth:`VibeVoiceLoader._load_state_dict_into_model` but accepts a
@@ -1468,21 +1602,47 @@ def _load_state_dict_into_model_from_memory(model, state_dict: dict):
     Args:
         model: Instantiated model (weights not yet loaded).
         state_dict: State dict mapping (on CPU).
+        preserve_file_views: True ONLY on the DynamicVRAM dense route. Skips
+            the clone loop so aimdo's ``ModelMMAP`` file views survive into
+            the parameters — they are the streaming SOURCE core reads
+            disk->VRAM from at every forward
+            (``comfy/memory_management.py:read_tensor_file_slice_into``),
+            which is precisely how the native Load Diffusion Model node
+            avoids host-RAM spikes. Never set this on the legacy route: see
+            the clone-loop comment below for the pinning/ghost-RAM hazard
+            that route still carries.
 
     Returns:
         The model with the state dict loaded (still on CPU).
     """
-    # Sever file-backed storage before assign: comfy.utils.load_torch_file
-    # returns zero-copy mmap views for safetensors checkpoints, and any view
-    # that survives into an offloaded CPU parameter keeps the whole file
-    # mapping resident in the process working set (ghost RAM on top of the
-    # VRAM copy + unstable cudaHostRegister pins). Clone in place so peak
-    # RAM stays at dict + one tensor. Already-owned tensors (e.g. freshly
-    # dequantized ones) pay one extra copy — harmless.
-    for key in list(state_dict.keys()):
-        tensor = state_dict[key]
-        if isinstance(tensor, torch.Tensor):
-            state_dict[key] = tensor.clone()
+    # Sever file-backed storage before assign — LEGACY ROUTE ONLY. The hazard
+    # is real, but only for the input formats that DO hand back mappings:
+    #   * ``.bin`` / ``.pt`` when ``comfy.utils.MMAP_TORCH_FILES`` is set
+    #     (``comfy/utils.py:189-192``) -> genuine ``torch.load(mmap=True)``
+    #     views;
+    #   * the aimdo-backed ``load_safetensors`` path
+    #     (``comfy/utils.py:165-166``).
+    # A view that survives into an offloaded CPU parameter keeps the whole
+    # file mapping resident in the process working set (ghost RAM on top of
+    # the VRAM copy) and file-backed pages are an unreliable
+    # ``cudaHostRegister`` target — the ``[WARNING] Pin error.`` flood.
+    #
+    # The DynamicVRAM route must NOT sever them. There, the file views are
+    # the whole point: the dynamic patcher allocates vbar ranges instead of
+    # stashing host backups (``comfy/model_patcher.py:1967-1998``), pinning
+    # does not exist on that route (``pin_weight_to_device`` raises,
+    # ``:1822/:1825``), and ``assign=True`` (D2) puts the views directly in
+    # the parameters exactly as core's native loaders do
+    # (``comfy/sd.py:2407``, ``assign=model_patcher.is_dynamic()``). Cloning
+    # here was measured as THE host-RAM spike: every tensor of the
+    # checkpoint materialised as a private copy before the H2D (1.26x on the
+    # 5.41 GB 1.5B file, 1.74x on the 16.66 GB ASR file), while the native
+    # node peaks near zero on the same install.
+    if not preserve_file_views:
+        for key in list(state_dict.keys()):
+            tensor = state_dict[key]
+            if isinstance(tensor, torch.Tensor):
+                state_dict[key] = tensor.clone()
     VibeVoiceLoader._apply_state_dict(model, state_dict)
     return model
 
@@ -1682,7 +1842,13 @@ def load_external_vibevoice_model(
         logger.debug(f"Loading external VibeVoice weights from: {weight_path}")
         # Step 1: Load the state dict onto CPU (safetensors/bin via ComfyUI's
         # loader). Always CPU — the patcher owns the single H2D transfer.
-        state_dict = _load_weight_state_dict(weight_path, cpu_device)
+        #
+        # SAMPLED, because this is the phase that can move host RAM by a whole
+        # file size and is over before the post-H2D census runs. The dense
+        # 1.5B report ("host RAM 25.1 -> 32.2GB and stays") could not be
+        # attributed from a probe alone; this line is what a user pastes.
+        with measured_load("dense-read-state-dict"):
+            state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
     # Step 2: Resolve and load the architecture config, reconciled against
     # the weights' architecture fingerprint (plan 2026-08-27, D5). When the
@@ -1758,6 +1924,17 @@ def load_external_vibevoice_model(
         # - dense: legacy in-memory assign of the full float state dict
         weight_family = "dense"
         quant_stats = {}
+        # 2026-09-30: EVERY route now follows core's availability, so the
+        # bundle's dynamic flag is computed ONCE, up front, from the same
+        # probe the per-tensor streams use to decide whether to keep the
+        # aimdo file views. It used to default False and be set only by the
+        # dense branch — which, after the quant routes began assigning
+        # views, would have handed those views to the LEGACY patcher
+        # (the pin / ghost-RAM hazard the clone existed to prevent) via
+        # the AND in generation.py:254 / asr_generation.py:381.
+        dynamic_route = dynamic_vram_available(
+            resolve_core_patcher_class(), load_device
+        )
         if gguf_reader is not None:
             # A quantized lm_head under a tied config would be silently
             # discarded by tie_weights() — reject before any install work.
@@ -1786,13 +1963,30 @@ def load_external_vibevoice_model(
                     _plan_quantized_safetensors_load(convrot_quant_map)
                 )
                 replaced = replace_linears_for_quant(model, layer_plan)
-                _stream_apply_safetensors(model, weight_path, convrot_quant_map)
+                # Dynamic routes keep the zero-copy file views in the
+                # parameters and let core page them disk->VRAM at forward
+                # (the assign=True shape, comfy/sd.py:2407); legacy routes
+                # clone into owned memory.
+                _stream_apply_safetensors(
+                    model,
+                    weight_path,
+                    convrot_quant_map,
+                    preserve_file_views=dynamic_vram_available(
+                        resolve_core_patcher_class(), load_device
+                    ),
+                )
             else:
                 layer_plan, n_rowwise, n_fp8_resident = (
                     _prepare_quantized_safetensors_load(state_dict, convrot_quant_map)
                 )
                 replaced = replace_linears_for_quant(model, layer_plan)
-                model = _load_state_dict_into_model_from_memory(model, state_dict)
+                model = _load_state_dict_into_model_from_memory(
+                    model,
+                    state_dict,
+                    preserve_file_views=dynamic_vram_available(
+                        resolve_core_patcher_class(), load_device
+                    ),
+                )
                 del state_dict
                 state_dict = None
             # Family label: convrot dominates; pure fp8-resident files get
@@ -1811,7 +2005,27 @@ def load_external_vibevoice_model(
             # Defensive net: unplanned int8/uint8/fp8 weights must never
             # reach the float loader (crash or silent corruption).
             _assert_dense_loadable(state_dict)
-            model = _load_state_dict_into_model_from_memory(model, state_dict)
+            # Dynamic-VRAM route decision, resolved ONCE from the same pure
+            # selector the patcher construction sites use. load_device is
+            # already resolved above; weight_family is "dense" here by
+            # construction, so this is exactly the selector's dynamic branch.
+            dynamic_route = select_patcher_class("dense", load_device) is not VibeVoicePatcher
+            # The streaming conversion MUST fire on BOTH routes. It is what
+            # sets ``comfy_cast_weights`` on every leaf module, which is the
+            # exact attribute core's dynamic ``load()`` gates on to take the
+            # vbar branch (``comfy/model_patcher.py:1967``) — without it every
+            # module falls into the eager ``else`` branch (:2000-2009), which
+            # stashes a full host copy in ``self.backup``: the worst possible
+            # outcome on this route. The conversion's forward calls
+            # ``cast_bias_weight``, which is the vbar CONSUMER
+            # (``comfy/ops.py:374``) — producer and consumer, not two owners.
+            # What the dynamic route changes is the CLONING, not the
+            # conversion: file views are preserved below via
+            # ``preserve_file_views`` so core can read disk->VRAM from them.
+            with measured_load("dense-bind-state-dict"):
+                model = _load_state_dict_into_model_from_memory(
+                    model, state_dict, preserve_file_views=dynamic_route,
+                )
 
             # Free the state dict immediately — the model now owns the tensors
             # (assign semantics), so the dict is dead weight (plan D7/RC-4).
@@ -1844,6 +2058,17 @@ def load_external_vibevoice_model(
         # Step 12: Eval mode.
         model.eval()
         setattr(model, "_llm_4bit", bool(quant_config))
+
+        # Pre-H2D host-RAM census (one env-gated line). This is the ONLY
+        # measurement point where the model is still entirely on the host, so
+        # it is where a loader-side materialisation is attributable: on the
+        # dynamic route every param byte should read as ``view`` (aimdo file
+        # slices, zero private). The streaming quant path reads as private by
+        # construction and its ~1x is NOT excused: whether it is the ceiling of
+        # the route or a defect is decided by the sampled peak in the
+        # ``[vvrss]`` lines above against this bucket, not by assertion.
+        # The post-H2D line comes from modules/generation.py.
+        report_census(model, phase=f"pre-h2d:{config_name}")
 
         logger.info(
             f"Successfully loaded external VibeVoice model '{config_name}' "
@@ -1880,6 +2105,7 @@ def load_external_vibevoice_model(
             "is_streaming": is_streaming,
             "is_asr": False,
             "weight_family": weight_family,
+            "dynamic_vram_route": dynamic_route,
             "quant_stats": quant_stats,
         }
 
@@ -2021,19 +2247,32 @@ def load_external_vibevoice_asr_model(
         )
     else:
         logger.debug(f"Loading external VibeVoice ASR weights from: {weight_path}")
-        state_dict = _load_weight_state_dict(weight_path, cpu_device)
+        # SAMPLED for the same reason as the TTS branch: this is the phase
+        # that can move host RAM by a whole file size, and it is over long
+        # before the post-H2D census runs.
+        with measured_load("dense-read-state-dict"):
+            state_dict = _load_weight_state_dict(weight_path, cpu_device)
 
     # Step 2: Resolve and load the ASR architecture config.
     config_path = resolve_sidecar_config(weight_path, config_name)
     config = _load_asr_config(config_path)
 
-    # Step 3: Resolve and load the ASR tokenizer.
+    # Step 3/4: Build the tokenizer + processor.
+    #
+    # Native ("vibevoice_asr") checkpoints get the transformers processor,
+    # which owns its own Qwen2TokenizerFast — loading the vendored
+    # VibeVoiceASRTextTokenizerFast first would be wasted work, and pairing
+    # the native model with the vendored processor cannot work anyway (the
+    # vendored one emits `speech`/`vae_tok_len`, which the native forward does
+    # not accept). Legacy checkpoints keep the vendored pair untouched.
     tokenizer_dir = resolve_sidecar_tokenizer_dir(weight_path)
-    asr_tokenizer = _load_asr_tokenizer(tokenizer_dir)
-
-    # Step 4: Resolve and load the ASR processor.
     preprocessor_path = resolve_sidecar_preprocessor(weight_path)
-    processor = _load_asr_processor(asr_tokenizer, preprocessor_path)
+    if is_native_asr_config_path(config_path):
+        processor = build_native_asr_processor(tokenizer_dir, preprocessor_path)
+    else:
+        processor = _load_asr_processor(
+            _load_asr_tokenizer(tokenizer_dir), preprocessor_path
+        )
 
     # Step 5: Resolve dtype + attention implementation.
     load_device = (
@@ -2060,6 +2299,19 @@ def load_external_vibevoice_asr_model(
         # Step 7: Bind the weights (same dispatch as the TTS branch).
         weight_family = "dense"
         quant_stats = {}
+        # Resolved to a real boolean in the dense branch below; the gguf and
+        # convrot/fp8 branches never reach it and therefore never set it True.
+        # 2026-09-30: EVERY route now follows core's availability, so the
+        # bundle's dynamic flag is computed ONCE, up front, from the same
+        # probe the per-tensor streams use to decide whether to keep the
+        # aimdo file views. It used to default False and be set only by the
+        # dense branch — which, after the quant routes began assigning
+        # views, would have handed those views to the LEGACY patcher
+        # (the pin / ghost-RAM hazard the clone existed to prevent) via
+        # the AND in generation.py:254 / asr_generation.py:381.
+        dynamic_route = dynamic_vram_available(
+            resolve_core_patcher_class(), load_device
+        )
         if gguf_reader is not None:
             # A quantized lm_head under a tied config would be silently
             # discarded by tie_weights() — reject before any install work.
@@ -2088,13 +2340,30 @@ def load_external_vibevoice_asr_model(
                     _plan_quantized_safetensors_load(convrot_quant_map)
                 )
                 replaced = replace_linears_for_quant(model, layer_plan)
-                _stream_apply_safetensors(model, weight_path, convrot_quant_map)
+                # Dynamic routes keep the zero-copy file views in the
+                # parameters and let core page them disk->VRAM at forward
+                # (the assign=True shape, comfy/sd.py:2407); legacy routes
+                # clone into owned memory.
+                _stream_apply_safetensors(
+                    model,
+                    weight_path,
+                    convrot_quant_map,
+                    preserve_file_views=dynamic_vram_available(
+                        resolve_core_patcher_class(), load_device
+                    ),
+                )
             else:
                 layer_plan, n_rowwise, n_fp8_resident = (
                     _prepare_quantized_safetensors_load(state_dict, convrot_quant_map)
                 )
                 replaced = replace_linears_for_quant(model, layer_plan)
-                model = _load_state_dict_into_model_from_memory(model, state_dict)
+                model = _load_state_dict_into_model_from_memory(
+                    model,
+                    state_dict,
+                    preserve_file_views=dynamic_vram_available(
+                        resolve_core_patcher_class(), load_device
+                    ),
+                )
                 del state_dict
                 state_dict = None
             # Family label: convrot dominates; pure fp8-resident files get
@@ -2113,7 +2382,22 @@ def load_external_vibevoice_asr_model(
             # Defensive net: unplanned int8/uint8/fp8 weights must never
             # reach the float loader (crash or silent corruption).
             _assert_dense_loadable(state_dict)
-            model = _load_state_dict_into_model_from_memory(model, state_dict)
+            # Dynamic-VRAM route decision, resolved ONCE from the same pure
+            # selector the patcher construction sites use. ``legacy_cls`` is
+            # the ASR family's own patcher: the selector must compare against
+            # the class this bundle is about to be wrapped in, or the ASR
+            # route would read as "dynamic" purely because its legacy class
+            # differs from the TTS one.
+            dynamic_route = (
+                select_patcher_class(
+                    "dense", load_device, legacy_cls=VibeVoiceASRPatcher
+                )
+                is not VibeVoiceASRPatcher
+            )
+            with measured_load("dense-bind-state-dict"):
+                model = _load_state_dict_into_model_from_memory(
+                    model, state_dict, preserve_file_views=dynamic_route,
+                )
 
             # Free the state dict immediately — the model now owns the tensors
             # (assign semantics), so the dict is dead weight (plan D7/RC-4).
@@ -2165,6 +2449,7 @@ def load_external_vibevoice_asr_model(
             "is_streaming": False,
             "is_asr": True,
             "weight_family": weight_family,
+            "dynamic_vram_route": dynamic_route,
             "quant_stats": quant_stats,
         }
 

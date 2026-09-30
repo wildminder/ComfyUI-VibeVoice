@@ -26,6 +26,7 @@ module), so fully-resident models pay nothing.
 from __future__ import annotations
 
 import logging
+import traceback
 from contextlib import contextmanager
 
 import torch
@@ -41,6 +42,136 @@ logger = logging.getLogger(__name__)
 # Containers with direct params (see make_streaming_container) relocate those
 # params to this device on attribute access.
 _LAST_DEVICE: torch.device | None = None
+
+# PULL STATS (2026-09-30). Per-generate counters for the weight pulls the
+# streaming leaves perform, so a live run can say WHICH path served a weight
+# and how many bytes moved disk/VRAM per step:
+#   vbar_calls / vbar_bytes     — module had a `_v` vbar allocation: core's
+#       file->VRAM paging read (measured cache-clean, tests/
+#       probe_core_slice_read_cost.py arm 1).
+#   nonvbar_calls / nonvbar_bytes — no `_v`: core's cast-buffer path, which
+#       falls back to a HOST-side copy of a file view (arm 3: 1:1 RAM at
+#       0.55 GB/s) whenever read_tensor_file_slice_into declines.
+#   colocated_calls             — fast path, weight already beside the input.
+# Per-kind breakdown keyed by module class name, because "the embedding is
+# re-read 300 times" and "every linear is re-read" are different bugs.
+_PULL_STATS: dict = {}
+
+#: Residency split for vbar-served pulls. Every pull "serves" a weight either
+#: way, so the byte totals above cannot express the one distinction that
+#: decides whether inference is fast: a RESIDENT pull returns ``s._v_weight``,
+#: a pointer into the VRAM arena (comfy/ops.py:274-276), while a RE-READ runs
+#: the transfer branch — and because the module's parameter still aliases the
+#: aimdo file slice, that transfer is disk traffic (comfy/ops.py:181-237).
+_VBAR_SPLIT = {"resident_calls": 0, "reread_calls": 0, "reread_bytes": 0}
+_VBAR_OBSERVER: object = None
+
+
+def reset_pull_stats() -> None:
+    """Clear the counters before a measured run (one generate, one report)."""
+    _PULL_STATS.clear()
+    for key in _VBAR_SPLIT:
+        _VBAR_SPLIT[key] = 0
+
+
+def pull_stats_line() -> str:
+    """One paste-ready ``[vvpull]`` summary of the counters since the last reset."""
+    if not _PULL_STATS:
+        return "[vvpull] no streaming leaf pulls recorded"
+    parts = []
+    for key in sorted(_PULL_STATS):
+        stats = _PULL_STATS[key]
+        mb = stats["bytes"] / (1024 ** 2)
+        parts.append(f"{key}={stats['calls']}({mb:.0f}MB)")
+    line = "[vvpull] " + " ".join(parts)
+    total = _VBAR_SPLIT["resident_calls"] + _VBAR_SPLIT["reread_calls"]
+    if total:
+        pct = 100.0 * _VBAR_SPLIT["reread_calls"] / total
+        line += (
+            f" | resident={_VBAR_SPLIT['resident_calls']}"
+            f" reread={_VBAR_SPLIT['reread_calls']}({pct:.1f}%"
+            f",{_VBAR_SPLIT['reread_bytes'] / (1024 ** 2):.0f}MB)"
+        )
+    # Free VRAM is the other half of the question: re-reads with headroom to
+    # spare mean the arena is being recycled, not that it is out of room.
+    try:
+        import torch as _torch
+
+        if _torch.cuda.is_available():
+            free, total_bytes = _torch.cuda.mem_get_info()
+            line += f" | vram_free={free / (1024 ** 3):.1f}GB"
+    except Exception:
+        pass
+    return line
+
+
+def _record_pull(kind: str, path: str, nbytes: int) -> None:
+    key = f"{path}/{kind}"
+    entry = _PULL_STATS.get(key)
+    if entry is None:
+        entry = _PULL_STATS[key] = {"calls": 0, "bytes": 0}
+    entry["calls"] += 1
+    entry["bytes"] += nbytes
+
+
+def _install_vbar_observer() -> None:
+    """Observe — never alter — the residency verdict core already computed.
+
+    ``comfy.ops.cast_bias_weight`` branches on ``prefetch["resident"]`` and
+    hands the prefetch to ``resolve_cast_module_with_vbar``, which is the only
+    reader of that key: ``cast_bias_weight`` deletes ``_prefetch`` before
+    returning. Re-deriving the verdict here would mean a second ``vbar_fault``
+    native call per module per step on the hot path, so the resolver is the
+    seam instead.
+
+    The wrapper reads ``s._prefetch["resident"]``, bumps a counter, and
+    delegates unconditionally: same arguments, same return value, and no
+    exception of its own can escape (``getattr``/``.get`` are total over the
+    shapes core produces). Core's control flow is untouched.
+    """
+    global _VBAR_OBSERVER
+    if _VBAR_OBSERVER is not None:
+        return
+    # Kill-switch. The wrapper is one dict read per resolved weight and cannot
+    # touch the load path, but during a live regression it must be possible to
+    # rule it out by name rather than by argument.
+    import os
+
+    if os.environ.get("VIBEVOICE_VBAR_OBSERVER", "1").strip().lower() in (
+            "0", "false", "off", "no"):
+        _VBAR_OBSERVER = False
+        return
+    try:
+        import comfy.ops
+
+        original = comfy.ops.resolve_cast_module_with_vbar
+    except Exception:
+        return
+    if getattr(original, "_vv_observer", False):
+        # Already wrapped (module reloaded under a different name); adopt it
+        # rather than stacking a second layer onto the same function.
+        _VBAR_OBSERVER = original
+        return
+    if _VBAR_OBSERVER is False:
+        return
+
+    def observed(s, *args, **kwargs):
+        prefetch = getattr(s, "_prefetch", None)
+        if prefetch is not None:
+            if prefetch.get("resident"):
+                _VBAR_SPLIT["resident_calls"] += 1
+            else:
+                _VBAR_SPLIT["reread_calls"] += 1
+                weight = getattr(s, "weight", None)
+                if isinstance(weight, torch.Tensor):
+                    _VBAR_SPLIT["reread_bytes"] += (
+                        weight.numel() * weight.element_size())
+        return original(s, *args, **kwargs)
+
+    observed._vv_observer = True
+    observed._vv_original = original
+    comfy.ops.resolve_cast_module_with_vbar = observed
+    _VBAR_OBSERVER = observed
 
 
 def _current_compute_device() -> torch.device | None:
@@ -65,13 +196,21 @@ def _current_compute_device() -> torch.device | None:
 
 
 @contextmanager
-def _acquire(module: nn.Module, x: torch.Tensor):
+def _acquire(module: nn.Module, x: torch.Tensor, dtype_from_input: bool = True):
     """Yield ``(weight, bias)`` guaranteed on ``x.device``.
 
     Fast path: params already co-located and no streaming functions attached
     (nothing was offloaded) -> yield the module's own tensors untouched.
     Slow path: core's ``cast_bias_weight`` pulls offloaded weights back
     (honoring LowVramPatch weight_functions) and pins them for async offload.
+
+    ``dtype_from_input=False`` is for ops whose ``x`` is an INDEX tensor
+    rather than an activation (nn.Embedding). ``cast_bias_weight`` derives
+    its target dtype from ``input.dtype``, so passing int64 token ids there
+    would cast the whole embedding table to int64 and make the lookup
+    return int64 embeddings. Core avoids this by passing only
+    ``device=input.device`` and never ``input=`` (comfy/ops.py:793); we do
+    the same, so the weight keeps its own dtype.
     """
     global _LAST_DEVICE
     _LAST_DEVICE = x.device
@@ -88,13 +227,25 @@ def _acquire(module: nn.Module, x: torch.Tensor):
         and (not isinstance(b, torch.Tensor) or b.device == x.device)
     )
     if coLocated:
+        _record_pull(type(module).__name__, "colocated", 0)
         yield w, b
         return
 
     import comfy.ops
 
-    weight, bias, stream = comfy.ops.cast_bias_weight(
-        module, x, offloadable=True
+    if dtype_from_input:
+        weight, bias, stream = comfy.ops.cast_bias_weight(
+            module, x, offloadable=True
+        )
+    else:
+        weight, bias, stream = comfy.ops.cast_bias_weight(
+            module, None, device=x.device, offloadable=True
+        )
+    served = weight.numel() * weight.element_size() if isinstance(weight, torch.Tensor) else 0
+    _record_pull(
+        type(module).__name__,
+        "vbar" if hasattr(module, "_v") else "nonvbar",
+        served,
     )
     try:
         yield weight, bias
@@ -105,6 +256,40 @@ def _acquire(module: nn.Module, x: torch.Tensor):
 # ====================================================================
 # Per-kind compute functions (signature: (self, x, weight, bias) -> Tensor)
 # ====================================================================
+
+
+_DTYPE_MISMATCH_LOGGED: set = set()
+
+
+def _log_conv_dtype_mismatch(module: nn.Module, x: torch.Tensor, w, b) -> None:
+    """One-shot diagnostic for dtype-mismatched conv inputs.
+
+    Wrapped leaves apply no dtype coercion (same contract as plain
+    nn.Conv1d), so a wrongly-typed activation — e.g. the reported
+    "Input type (__int64) and bias type (BFloat16)" — crashes identically
+    with or without conversion. Log the module identity and the caller
+    chain once so the int64's origin can be located from the console.
+    """
+    key = (id(module), str(x.dtype))
+    if key in _DTYPE_MISMATCH_LOGGED:
+        return
+    _DTYPE_MISMATCH_LOGGED.add(key)
+    chain = " <- ".join(
+        f"{fr.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{fr.lineno} {fr.name}"
+        for fr in reversed(traceback.extract_stack()[-15:-1])
+    )
+    logger.warning(
+        "[vvdtype] conv dtype mismatch on %s(id=%x, layer_id=%s): x %s on %s "
+        "dtype=%s | w %s dtype=%s | b %s dtype=%s | call chain (innermost last): %s",
+        type(module).__name__, id(module) & 0xFFFFFF,
+        getattr(module, "_layer_id", None),
+        tuple(x.shape), x.device, x.dtype,
+        tuple(w.shape) if w is not None else None,
+        None if w is None else w.dtype,
+        None if b is None else "-",
+        None if b is None else b.dtype,
+        chain,
+    )
 
 
 def _compute_linear(self, x, w, b):
@@ -124,10 +309,14 @@ def _compute_embedding(self, x, w, b):
 
 
 def _compute_conv1d(self, x, w, b):
+    if x.dtype != w.dtype:
+        _log_conv_dtype_mismatch(self, x, w, b)
     return self._conv_forward(x, w, b)
 
 
 def _compute_conv_transpose1d(self, x, w, b):
+    if x.dtype != w.dtype:
+        _log_conv_dtype_mismatch(self, x, w, b)
     return F.conv_transpose1d(
         x, w, b,
         stride=self.stride,
@@ -240,7 +429,7 @@ def _streaming_bias(self):
     return self._parameters.get("bias")
 
 
-def make_streaming(base_cls, compute_fn):
+def make_streaming(base_cls, compute_fn, index_input: bool = False):
     """Build (once per base class) a streaming subclass of ``base_cls``.
 
     Used for leaf ops (Linear/Conv/Embedding/norm/Layernorm) whose compute
@@ -248,14 +437,27 @@ def make_streaming(base_cls, compute_fn):
     acquires weights through core's cast path (so they can be streamed), and
     the subclass exposes ``weight``/``bias`` so core's placement bookkeeping
     (``get_key_weight``) never raises on biasless modules.
+
+    ``index_input=True`` for ops whose ``x`` is an index tensor (Embedding):
+    the activation dtype must not drive the weight cast — see ``_acquire``.
+    It is DERIVED from the class (Embedding always qualifies) rather than
+    left to the caller, so every build path — including direct
+    ``make_streaming(nn.Embedding, ...)`` callers and their cached
+    subclasses — gets the correct forward.
     """
-    key = ("leaf", base_cls)
+    index_input = index_input or issubclass(base_cls, nn.Embedding)
+    key = ("leaf", base_cls, index_input)
     if key in _SUBCLASS_CACHE:
         return _SUBCLASS_CACHE[key]
 
-    def forward(self, x):
-        with _acquire(self, x) as (w, b):
-            return compute_fn(self, x, w, b)
+    if index_input:
+        def forward(self, x):
+            with _acquire(self, x, dtype_from_input=False) as (w, b):
+                return compute_fn(self, x, w, b)
+    else:
+        def forward(self, x):
+            with _acquire(self, x) as (w, b):
+                return compute_fn(self, x, w, b)
 
     namespace = {
         "comfy_cast_weights": True,
@@ -353,6 +555,34 @@ def _is_quant_resident(module) -> bool:
     return bool(getattr(module, "_quant_resident", False))
 
 
+# Gate for ``convert_tree_for_streaming`` ONLY. The dynamic-VRAM route owns
+# every weight through core's patcher (invariant 6: one weight owner per
+# module), so attaching our ``weight_function`` hooks as well would give the
+# same parameter two managers. Nothing else reads this flag: the quant-resident
+# exclusion inside the sweep (``_is_quant_resident``) is unconditional and
+# unchanged, and every other streaming helper is unaffected. The default is
+# True, i.e. conversion is behaviour-neutral until a caller opts out.
+_STREAMING_CONVERSION_ENABLED = True
+
+
+@contextmanager
+def streaming_conversion(enabled: bool):
+    """Run the enclosed block with streaming conversion on or off.
+
+    Save/restore (rather than a counter or a nesting depth) so the previous
+    value is restored EXACTLY on both normal exit and exception. Deliberately
+    silent: a load enters this once per bundle, and INFO noise in the loader
+    log is a regression.
+    """
+    global _STREAMING_CONVERSION_ENABLED
+    previous = _STREAMING_CONVERSION_ENABLED
+    _STREAMING_CONVERSION_ENABLED = enabled
+    try:
+        yield
+    finally:
+        _STREAMING_CONVERSION_ENABLED = previous
+
+
 def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
     """Swap eligible leaf-module classes for streaming subclasses in place.
 
@@ -365,6 +595,18 @@ def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
         Census dict ``{kind_name: count}`` for the modules actually
         converted. Idempotent: already-streaming modules are skipped.
     """
+    if not _STREAMING_CONVERSION_ENABLED:
+        logger.debug(
+            "Streaming conversion suppressed for this load "
+            "(dynamic VRAM route owns the weights)."
+        )
+        return {}
+
+    # Installed here, not at import: the counters must only observe pulls a
+    # streaming forward actually made, and this is the first moment we know
+    # the load will use the streaming path at all.
+    _install_vbar_observer()
+
     # Vendored/external kinds (lazy: avoids import cycles at module load).
     try:
         from .vendor_streaming_types import register_vendored_types

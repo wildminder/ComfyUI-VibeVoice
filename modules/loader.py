@@ -83,6 +83,22 @@ _SENTINEL_BUFFER_VALUES = {
 # under it. If any encoder key is present, the rest are reported normally.
 OPTIONAL_ABSENT_PREFIXES = ("acoustic_tokenizer.encoder.",)
 
+# Quant-storage dtypes that must NEVER reach a dense float loader.
+#
+# Single source of truth for both dense routes: the batch check
+# (``external_loader._assert_dense_loadable``) and the per-tensor streaming
+# assign (``VibeVoiceLoader._stream_apply_dense``). ``external_loader``
+# imports this name from here (it already imports ``VibeVoiceLoader``), so the
+# dependency runs one way only — ``loader`` must never import from
+# ``external_loader``, which would be a cycle.
+#
+# Assigning int8/uint8/fp8 storages into float parameters either crashes
+# cryptically or (fp8) silently misloads with scales ignored. Both are worse
+# than a clear error at load time.
+QUANT_STORAGE_DTYPES = frozenset({
+    torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2,
+})
+
 
 def mark_optional_absent(
     missing_keys: list[str],
@@ -812,6 +828,11 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         # Native lowvram streaming (plan 2026-08-26): convert leaf modules so
         # core's partial load/offload machinery can stream them instead of
         # silently stranding them on CPU. Class-only swap; weights untouched.
+        # 2026-09-30: this sweep is NOT suppressed anywhere (the old
+        # streaming_conversion(False) call never existed in this code path).
+        # It runs on EVERY route and must: it is what installs
+        # ``comfy_cast_weights``, the attribute core's dynamic load gates the
+        # vbar branch on (comfy/model_patcher.py:1967).
         try:
             from .comfy_stream import convert_tree_for_streaming
 
@@ -850,7 +871,9 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         return missing_keys, unexpected_keys
 
     @staticmethod
-    def _stream_apply_dense(model, tensor_pairs, known_missing=None):
+    def _stream_apply_dense(
+        model, tensor_pairs, known_missing=None, preserve_file_views: bool = False
+    ):
         """Assign a dense checkpoint per-tensor, severing file mappings.
 
         Streaming twin of :meth:`_apply_state_dict` for checkpoints read
@@ -859,23 +882,55 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
         1. No merged state dict ever exists — peak host RAM is bounded by
            the model plus one tensor in flight.
-        2. Every tensor is ``clone()``d before assign. ``safe_open`` /
-           ``load_torch_file`` hand back zero-copy views into the mapped
-           checkpoint file(s); assigning them directly keeps EVERY file
-           mapping alive for as long as the model holds a single tensor
-           from it. Under ComfyUI's partial load, offloaded CPU parameters
-           are scattered across all shards, so the process working set
-           balloons to ~full model size ON TOP of the VRAM copy, and
-           ``cudaHostRegister`` on file-backed pages is what produces the
-           "Pin error." flood. Cloning into private memory fixes both: the
-           mapping is released shard-by-shard during the pass, and pinned
-           offloaded weights sit in ordinary anonymous memory (the
-           reliable pinning class).
+        2. Every tensor is ``clone()``d before assign — ON LEGACY ROUTES
+        ONLY (``preserve_file_views=False``, the default). The hazard the
+        clone guards is real and user-confirmed (the sharded 7B ghost-RAM /
+        "Pin error." fix, plan 2026-08-28, confirmed 2026-08-31): a
+        FILE-BACKED view that survives into an offloaded CPU parameter
+        keeps its whole file mapping alive for as long as the model
+        holds a single tensor from it, and under ComfyUI's partial load
+        the process working set balloons to ~full model size ON TOP of
+        the VRAM copy, while ``cudaHostRegister`` on file-backed pages
+        is what produces the "Pin error." flood. Cloning puts offloaded
+        weights in ordinary anonymous memory — the reliable pinning
+        class — and releases any mapping shard-by-shard.
+
+           That reasoning is exactly why the DYNAMIC routes pass
+           ``preserve_file_views=True`` (2026-09-30): with
+           ``ModelPatcherDynamic`` the mapping is not a ghost-RAM
+           liability but the paging SOURCE — core assigns the views
+           (``assign=True``, comfy/sd.py:2407), pages them disk->VRAM at
+           every forward (comfy/model_patcher.py:1993) and never pins
+           them (``pin_weight_to_device`` raises,
+           comfy/model_patcher.py:1821-1825). Cloning there would stage
+           the whole model in host RAM, which is the 20->40 GB spike
+           this port exists to remove.
+
+           WHICH INPUTS THAT APPLIES TO was over-stated until 2026-09-29.
+           Measured: ``safe_open.get_tensor`` returns an OWNED copy, not a
+           view (16 x 8 MB bf16 held with no clone: +128.3 MB = 1.00x file),
+           so for safetensors under the current configuration
+           (``MMAP_TORCH_FILES=False``, ``aimdo_enabled=False``) this clone
+           is a redundant copy of an already-private tensor. It still
+           earns its place for the formats that DO return views:
+           ``.bin`` / ``.pt`` with ``MMAP_TORCH_FILES`` set
+           (``comfy/utils.py:189-192``) and the aimdo ``load_safetensors``
+           path (``comfy/utils.py:165-166``). Kept unconditionally so the
+           two configurations cannot diverge in behaviour; it costs one
+           tensor of transient memory and one extra pass over the file's
+           bytes. Evidence:
+           ``.dev/docs/plans/2026-09-28-external-dense-load-ram-spike.md``
+           (S1 RESULT) and ``.dev/scratch/probe_dense_load_ram.py``.
 
         Shape checking, missing/unexpected reporting, and all post-assign
         fixups (re-tie, meta stragglers, sentinel buffers, RoPE, streaming
         conversion) match the batch path via ``_shape_mismatch_error`` and
         :meth:`_post_assign_fixups`.
+
+        Quant-storage dtypes (:data:`QUANT_STORAGE_DTYPES`) are rejected on
+        every key, mirroring
+        ``external_loader._assert_dense_loadable``, which the batch path
+        applies to the whole state dict.
 
         Args:
             model: Instantiated model (meta- or eager-initialized).
@@ -894,13 +949,33 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         unexpected = []
 
         for key, tensor in tensor_pairs:
+            # Quant-storage guard, checked on EVERY key before the
+            # params/buffers lookup — including keys the model has no target
+            # for. Mirrors ``external_loader._assert_dense_loadable``, which
+            # rejects on every key of the batch state dict; checking only
+            # where a target exists would let an int8 tensor under an
+            # unexpected key through silently, weakening the very contract
+            # this guard preserves. Safe against the GGUF route, whose
+            # iterator yields only FLOAT_GGML_TYPES and re-views raw uint8 as
+            # bfloat16 before yielding.
+            if tensor.dtype in QUANT_STORAGE_DTYPES:
+                raise ValueError(
+                    "Checkpoint contains quantized-weight tensors but carries "
+                    "no executable quantization metadata (1 tensors, e.g. "
+                    f"{key} [{tensor.dtype}]). Loading them as floats would "
+                    "corrupt the model. Re-export it with *.comfy_quant "
+                    "metadata (comfy-model-tools) or use the dense/BF16 "
+                    "checkpoint."
+                )
             target = params.get(key)
             if target is not None:
                 if tuple(tensor.shape) != tuple(target.shape):
                     raise _shape_mismatch_error(
                         model, [(key, tuple(tensor.shape), tuple(target.shape))]
                     )
-                comfy.utils.set_attr_param(model, key, tensor.clone())
+                comfy.utils.set_attr_param(
+                    model, key, tensor if preserve_file_views else tensor.clone()
+                )
                 assigned.add(key)
                 continue
             target_buf = buffers.get(key)
@@ -909,7 +984,9 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                     raise _shape_mismatch_error(
                         model, [(key, tuple(tensor.shape), tuple(target_buf.shape))]
                     )
-                comfy.utils.set_attr_buffer(model, key, tensor.clone())
+                comfy.utils.set_attr_buffer(
+                    model, key, tensor if preserve_file_views else tensor.clone()
+                )
                 assigned.add(key)
                 continue
             unexpected.append(key)
@@ -981,13 +1058,32 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             logger.debug(f"Loading state dict from: {ckpt_path}")
             tensor_pairs = BaseVibeVoiceLoader.iter_checkpoint_tensors(ckpt_path)
 
-        # Streaming assign (D2/D3): checkpoint tensors are cloned into PRIVATE
-        # memory as they replace the meta/random parameter objects — the clone
-        # severs the checkpoint file mapping (see _stream_apply_dense). Tied
-        # weights are re-tied and meta stragglers zero-materialized by the
-        # shared post-assign fixups; strict=False semantics handle
-        # missing/unexpected keys (e.g., tied weights, quantized layers).
-        VibeVoiceLoader._stream_apply_dense(model, tensor_pairs)
+        # Streaming assign (D2/D3): on the dynamic route the zero-copy file
+        # views ARE the parameters — core pages them disk->VRAM at forward
+        # (the assign=True shape of comfy/sd.py:2407), so nothing is staged
+        # in host RAM. Legacy routes clone into private memory, severing the
+        # mapping (see _stream_apply_dense). Tied weights are re-tied and meta
+        # stragglers zero-materialized by the shared post-assign fixups;
+        # strict=False semantics handle missing/unexpected keys.
+        # Imported here because patcher.py imports this module (cycle).
+        from . import device_utils
+        from .patcher import dynamic_vram_available, resolve_core_patcher_class
+
+        # The DEVICE here must be resolved exactly the way the caller resolved
+        # the one it passed to select_patcher_class — both use
+        # device_utils.get_torch_device(device) (generation.py:221/340,
+        # asr_generation.py:221/340). If the two sides ever disagreed, the
+        # loader could assign aimdo file views to a LEGACY patcher, which is
+        # the pin / ghost-RAM hazard the clone exists to prevent.
+        load_device = device_utils.get_torch_device(device)
+        VibeVoiceLoader._stream_apply_dense(
+            model,
+            tensor_pairs,
+            preserve_file_views=dynamic_vram_available(
+                resolve_core_patcher_class(),
+                load_device,
+            ),
+        )
 
         return model
 

@@ -184,10 +184,19 @@ class TestASRConsumerWiring:
     """
 
     def _run_asr_consumer(self, bundle):
-        """Drive load_asr_from_external with GPU loading stubbed out."""
+        """Drive load_asr_from_external with GPU loading stubbed out.
+
+        The load stub patches ``load_models_gpu``, not ``load_model_gpu``:
+        core's ``load_model_gpu(model)`` is literally ``load_models_gpu([model])``
+        (comfy/model_management.py:1041-1042), resolved as a module global at
+        call time. One patch therefore intercepts both the legacy
+        ``load_to_device`` branch and the dynamic one, which calls
+        ``load_models_gpu([patcher], memory_required=...)``, without the test
+        having to know which class the selector picked.
+        """
         with patch("comfy.model_patcher.ModelPatcher.patch_model"), \
-             patch(f"{ASRGEN}.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()), \
+             patch(f"{ASRGEN}.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()), \
              patch(f"{MR}.gc.collect"):
             return load_asr_from_external(
                 bundle, device="cpu", dtype="fp32", attention_mode="sdpa"

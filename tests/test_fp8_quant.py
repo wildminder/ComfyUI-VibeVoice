@@ -22,6 +22,10 @@ from ComfyUI_VibeVoice.modules.fp8_quant import (
     probe_fp8_backend,
 )
 from ComfyUI_VibeVoice.modules.convrot_quant import QuantLayerInfo
+from ComfyUI_VibeVoice.modules.dtype_utils import (
+    cast_model_to_dtype,
+    cast_model_to_dtype_if_needed,
+)
 
 
 def _fill(m, seed=0, scale=2.0, bias_val=None):
@@ -144,6 +148,47 @@ class TestFP8LinearForward:
         m.weight_function = []
 
 
+class TestResidentConstructionIsMetaOnly:
+    """2026-09-30: swapping in quant residents must not allocate host RAM.
+
+    The model tree is meta (VibeVoiceLoader._instantiate_model use_meta=True),
+    but the replacement factories used to run OUTSIDE that context, so every
+    FP8Linear allocated a real torch.empty of its full weight — 8.08 GB for
+    the 7B fp8 checkpoint, all of it replaced by the checkpoint assign. The
+    live signature was peak_ws 5.6 GB next to peak_private 27.94 GB:
+    committed, never touched.
+    """
+
+    def test_swapped_residents_start_on_meta(self):
+        from ComfyUI_VibeVoice.modules.convrot_quant import QuantLayerInfo
+        from ComfyUI_VibeVoice.modules.fp8_quant import make_fp8_linear
+        from ComfyUI_VibeVoice.modules.quant_common import replace_linears_for_quant
+
+        class Tree(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(32, 16)
+
+        info = QuantLayerInfo(
+            prefix="proj",
+            group_size=32,
+            in_features=32,
+            out_features=16,
+            has_bias=True,
+            rowwise_dtype=torch.float8_e4m3fn,
+            resident_fp8=True,
+        )
+        with torch.device("meta"):
+            tree = Tree()
+        replaced = replace_linears_for_quant(tree, {"proj": make_fp8_linear(info)})
+        assert replaced == ["proj"]
+        weight = dict(tree.named_parameters())["proj.weight"]
+        assert weight.is_meta, (
+            "the replacement resident allocated real host memory — this is "
+            "the 8GB-per-model waste the meta-only construction removes"
+        )
+
+
 class TestFP8LinearStateDict:
     def test_load_consumes_comfy_quant_meta(self):
         m = FP8Linear(6, 8, False, torch.float8_e4m3fn)
@@ -186,3 +231,124 @@ class TestMakeFP8Linear:
         assert isinstance(mod, FP8Linear)
         assert mod.fp8_dtype == fp8_dtype
         assert mod.bias is not None
+
+
+# ====================================================================
+# Ranked hypothesis (task fp8-peak, 2026-09-29): "_quant_protected_names
+# fails to protect FP8Linear, so cast_model_to_dtype_if_needed dequantises
+# the resident fp8 weights to bf16 — 9.47GB of fp8 becoming ~17GB, the
+# measured 1.8x on the 7B file."
+#
+# MEASURED, 2026-09-29: REFUTED. The ranked hypothesis was the whole defect
+# story and it does not hold. ``_quant_protected_names`` protects the fp8
+# weight and the fp32 scale of every ``_quant_resident`` module
+# (modules/dtype_utils.py:138-152), and FP8Linear sets that marker
+# (modules/fp8_quant.py:93), so the cast skips the residents. These tests
+# exist to keep it refuted: the protection is load-bearing for a 1.8x host-RAM
+# claim and a future edit that drops the marker (or the weight entry) would
+# silently reintroduce it, with no other test noticing.
+# ====================================================================
+
+class _WitnessModel(nn.Module):
+    """fp8 resident + one mismatched fp32 linear, so the cast is NOT a no-op.
+
+    The plain fp32 linear is the control: it proves the cast actually ran.
+    Without a mismatched castable parameter, ``cast_model_to_dtype_if_needed``
+    takes its fast path and returns untouched — which would make every
+    "storage survived" assertion below pass vacuously.
+    """
+
+    def __init__(self, in_features=8, out_features=4):
+        super().__init__()
+        self.proj = FP8Linear(in_features, out_features, True,
+                              torch.float8_e4m3fn, torch.bfloat16)
+        self.head = nn.Linear(out_features, out_features, bias=False)
+        self.head.weight.data = torch.zeros(out_features, out_features,
+                                            dtype=torch.float32)
+
+
+def _fp8_resident_tree():
+    model = _WitnessModel()
+    _fill(model.proj, seed=3, scale=0.75)
+    return model
+
+
+class TestFp8ResidentSurvivesDtypeCast:
+    """KB-scale: a resident fp8 param keeps float8 STORAGE after the cast."""
+
+    def test_cast_runs_and_leaves_fp8_storage_untouched(self):
+        model = _fp8_resident_tree()
+        before_bytes = model.proj.weight.untyped_storage().nbytes()
+        assert before_bytes == 4 * 8  # 1 byte per fp8 element, no rounding
+
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        # Control: the cast really happened (else the rest proves nothing).
+        assert model.head.weight.dtype == torch.bfloat16
+        # The claim under test.
+        assert model.proj.weight.dtype == torch.float8_e4m3fn
+        assert model.proj.weight_scale.dtype == torch.float32
+        assert model.proj.weight.untyped_storage().nbytes() == before_bytes
+        assert model.proj.weight_scale.item() == pytest.approx(0.75)
+
+    @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_both_fp8_storage_dtypes_survive(self, fp8_dtype):
+        model = _WitnessModel()
+        model.proj = FP8Linear(8, 4, True, fp8_dtype, torch.bfloat16)
+        _fill(model.proj, seed=4)
+
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        assert model.proj.weight.dtype == fp8_dtype
+        assert model.proj.weight_scale.dtype == torch.float32
+
+    def test_unconditional_cast_model_to_dtype_also_protects(self):
+        """``cast_model_to_dtype`` shares the filtered walk, so it is safe too."""
+        model = _fp8_resident_tree()
+        cast_model_to_dtype(model, torch.bfloat16)
+        assert model.proj.weight.dtype == torch.float8_e4m3fn
+
+    def test_fp8_bytes_stay_half_the_bf16_footprint(self):
+        """The 1.8x hypothesis, in bytes: fp8 storage is HALF a bf16 recast.
+
+        9.47GB of fp8 is ~17GB if the residents are cast — the exact shape of
+        the reported 25->42GB spike. With the protection in place the model
+        keeps the fp8 footprint, so the ceiling of the quant route is ~1x
+        file (owned copies), not ~2x.
+        """
+        model = _fp8_resident_tree()
+        fp8_bytes = model.proj.weight.numel()
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+        assert model.proj.weight.untyped_storage().nbytes() == fp8_bytes
+        assert fp8_bytes * 2 == model.proj.weight.numel() * 2  # bf16 would be this
+
+    def test_census_reads_the_resident_as_private_fp8(self):
+        """The census half of the same claim, at the same scale.
+
+        A quant-assigned parameter is a PRIVATE host allocation BY DESIGN
+        (the stream assigns owned clones — under the aimdo arm they are
+        cloned from zero-copy file views, see modules/base_loader.py) —
+        so the census must count it as private
+        fp8 bytes at 1 byte/element, never as an aimdo file view. That 1x is
+        the ceiling of the quant route: with views the family would read as
+        page cache, and with a bf16 recast it would read as twice these bytes.
+        """
+        from ComfyUI_VibeVoice.modules.memory_census import census
+
+        model = _fp8_resident_tree()
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+        report = census(model)
+
+        # No view, no mmap: the whole tree is private host memory.
+        assert report["param_view_bytes"] == 0
+        assert report["param_mmap_bytes"] == 0
+        assert report["param_private_bytes"] == sum(
+            p.untyped_storage().nbytes() for p in model.parameters())
+        # The resident weight is counted at fp8 width (1 byte/element) plus
+        # its fp32 scalar scale and its (castable, so cast) bf16 bias.
+        assert report["families"]["FP8Linear/params"] == (
+            model.proj.weight.numel()
+            + model.proj.weight_scale.untyped_storage().nbytes()
+            + model.proj.bias.untyped_storage().nbytes()
+        )
+        assert report["families"]["Linear/params"] == model.head.weight.numel() * 2

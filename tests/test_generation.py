@@ -313,6 +313,127 @@ class TestLoadFromExternal:
         VIBEVOICE_PATCHER_CACHE.clear()
 
 
+# The dynamic-patcher's aimdo-free stand-in and its alias fixture live in
+# test_patcher.py, which owns the patcher-level tests. They are imported, not
+# redefined, so there is exactly one definition of the stand-in in the suite.
+from tests.test_patcher import dynamic_core_alias, load_side_effect  # noqa: E402,F401
+
+
+def _generation_module():
+    """The generation module OBJECT (monkeypatch cannot resolve the alias
+    package ``ComfyUI_VibeVoice.modules.generation`` from a dotted string)."""
+    import ComfyUI_VibeVoice.modules.generation as gen
+
+    return gen
+
+
+class TestLoadFromExternalUnderBothPatcherClasses:
+    """T8: the external TTS load path must work on EITHER patcher class.
+
+    The selector (modules/patcher.py:select_patcher_class) is the only thing
+    that chooses, so the class is forced here by rebinding the name the
+    consuming module imported. Everything downstream — construction, the
+    lazy build, ``load_to_device``'s branch, the cache registration — then runs
+    for real.
+
+    Assertions are on ``is_dynamic()`` and ``is_loaded``, never on
+    ``isinstance``: ``ModelPatcherDynamic.__new__`` (comfy/model_patcher.py:1754-1757)
+    reroutes a CPU load_device to a plain ModelPatcher, so a "dynamic"
+    instance is not necessarily an instance of the dynamic subclass. This is a
+    correctness requirement, not a style preference.
+    """
+
+    def _make_bundle(self):
+        return {
+            "model": MagicMock(),
+            "processor": MagicMock(),
+            "model_name": "ExtModel",
+            "source_path": "/fake/model.safetensors",
+            "is_streaming": False,
+            # The dense family is the ONLY one that may go dynamic; naming it
+            # here keeps the fixture honest about what the selector would pick.
+            "weight_family": "dense",
+            "dynamic_vram_route": True,
+        }
+
+    @pytest.mark.parametrize("patcher_kind", ["legacy", "dynamic"])
+    def test_tts_generation_works_under_both_patcher_classes(
+        self, monkeypatch, dynamic_core_alias, patcher_kind
+    ):
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.patcher import (
+            VibeVoicePatcher,
+            make_dynamic_patcher_class,
+        )
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+        patcher_cls = (
+            make_dynamic_patcher_class(VibeVoicePatcher)
+            if patcher_kind == "dynamic"
+            else VibeVoicePatcher
+        )
+        monkeypatch.setattr(
+            _generation_module(), "select_patcher_class",
+            lambda *args, **kwargs: patcher_cls,
+        )
+
+        bundle = self._make_bundle()
+
+        with patch("comfy.model_patcher.ModelPatcher.patch_model"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.load_model_gpu"), \
+             patch("ComfyUI_VibeVoice.modules.generation.model_management.load_models_gpu",
+                   side_effect=load_side_effect()):
+            patcher, model, processor = load_vibevoice_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        assert patcher.is_dynamic() is (patcher_kind == "dynamic")
+        assert patcher.is_loaded is True
+        assert model is not None
+        assert processor is not None
+
+        # The identity key is an internal format; the contract under test is
+        # "the cache entry is registered", so assert membership, not spelling.
+        assert patcher in VIBEVOICE_PATCHER_CACHE.values()
+        assert len(VIBEVOICE_PATCHER_CACHE) == 1
+        assert patcher.attention_mode == "sdpa"
+        assert patcher.target_dtype == torch.float32
+
+        VIBEVOICE_PATCHER_CACHE.clear()
+
+    @pytest.mark.parametrize("patcher_kind", ["legacy", "dynamic"])
+    def test_tts_family_label_no_longer_decides_the_protocol(
+            self, monkeypatch, dynamic_core_alias, patcher_kind):
+        """2026-09-30: the selector follows the DEVICE and core's alias, not
+        the family label.
+
+        The old version of this test drove the real selector with
+        ``device="cpu"`` and asserted the quant families stay legacy — which
+        was vacuous the moment the whitelist went away, because EVERY family
+        returns legacy on a CPU device. It is rewritten to pin what is now
+        true: CPU -> legacy for all labels; CUDA + dynamic alias -> dynamic
+        for every family whose load stream keeps aimdo file views, with
+        ``gguf_block`` the single measured exception (its install still
+        copies into private memory, so paging from it would buy nothing).
+        """
+        import torch
+        from ComfyUI_VibeVoice.modules.patcher import (
+            VibeVoicePatcher,
+            select_patcher_class,
+        )
+
+        for family in ("gguf_block", "convrot_int8", "fp8_resident", "", None):
+            assert select_patcher_class(family, torch.device("cpu")) is VibeVoicePatcher
+
+        if torch.cuda.is_available():
+            for family in ("convrot_int8", "fp8_resident", "", None):
+                assert select_patcher_class(family, torch.device("cuda"))                     is not VibeVoicePatcher, family
+            assert select_patcher_class("gguf_block", torch.device("cuda"))                 is VibeVoicePatcher
+
+        del patcher_kind  # the parametrisation runs the same body twice
+
+
+
 class TestExternalVibeVoiceModelHandler:
     """Test the ExternalVibeVoiceModelHandler container."""
 

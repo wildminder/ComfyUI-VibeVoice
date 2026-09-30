@@ -304,8 +304,8 @@ class TestASRSingleCacheOwnership:
         try:
             with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load), \
                  patch("comfy.model_patcher.ModelPatcher.patch_model"), \
-                 patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                       side_effect=lambda p: p.patch_model()), \
+                 patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                       side_effect=lambda models: models[0].patch_model()), \
                  patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
                        return_value=torch.device("cpu")), \
                  patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device",

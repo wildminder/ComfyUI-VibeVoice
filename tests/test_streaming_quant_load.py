@@ -40,6 +40,11 @@ from ComfyUI_VibeVoice.modules.convrot_quant import (
 from ComfyUI_VibeVoice.modules.fp8_quant import FP8Linear, probe_fp8_backend
 from ComfyUI_VibeVoice.modules.quant_common import replace_linears_for_quant
 from ComfyUI_VibeVoice.modules.dtype_utils import cast_model_to_dtype_if_needed
+from ComfyUI_VibeVoice.modules.memory_census import census
+from ComfyUI_VibeVoice.modules.patcher import (
+    VibeVoicePatcher,
+    select_patcher_class,
+)
 from conftest import build_stub_vv
 
 
@@ -278,16 +283,28 @@ class TestStreamingBatchParity:
 # ====================================================================
 
 class TestStreamingStructuralGuarantees:
-    def test_full_dict_loader_never_called_for_quant_safetensors(
+    def test_quant_safetensors_map_once_for_scales_only(
             self, tmp_path, stubbed_load_env):
+        """Pass-1 maps the file ONCE through core's reader (aimdo: zero-copy
+        file-backed views, dict dropped after the tiny scales are cloned out);
+        the stream then assigns views directly. No WEIGHT materialization —
+        the old safe_open per-scale pre-read committed ~1x file in private
+        on Windows (measured, tests/probe_external_fp8_full_path.py)."""
         run, _ = stubbed_load_env
         p = _save_mixed(tmp_path / "noload.safetensors")
 
-        with patch.object(comfy.utils, "load_torch_file",
-                          side_effect=AssertionError(
-                              "full-dict materialization on the quant path")):
+        calls = []
+        real = comfy.utils.load_torch_file
+
+        def _spy(path, **kw):
+            calls.append(str(path))
+            return real(path, **kw)
+
+        with patch.object(comfy.utils, "load_torch_file", side_effect=_spy):
             bundle = run(p)
 
+        # Exactly one mapping (pass-1); no dense full-dict read.
+        assert calls == [str(p)]
         assert bundle["weight_family"] == "convrot_int8"
 
     def test_dense_safetensors_still_use_batch_loader(
@@ -342,6 +359,116 @@ class TestStreamingStructuralGuarantees:
         o = bundle["model"].model.language_model.layers[0].self_attn.o_proj
         assert o.weight.dtype == torch.float8_e4m3fn
         assert o.weight_scale.dtype == torch.float32
+
+
+# ====================================================================
+# The quant route's host-RAM CEILING, asserted (task fp8-peak)
+# ====================================================================
+#
+# HISTORY. 2026-09-29 (tests/probe_ram_census.py, real 7B fp8 file): the
+# then-current quant route peaked at ~2x file (18GiB ws / 18GiB private for
+# 8.82GiB), settling to the model itself (~10GiB, all private copies). Two
+# causes, since REMOVED by the Dynamic-VRAM port (2026-09-30):
+#   1. every assigned tensor was a safe_open/get_tensor OWNED copy;
+#   2. select_patcher_class returned the legacy patcher for any
+#      family != "dense", closing the view-paging route to quants.
+# 2026-09-30 (tests/probe_external_fp8_full_path.py, exact live path,
+# dynamic route): a THIRD cause hid in pass-1 — one safe_open + get_tensor
+# for a tiny scale committed ~1x file as PRIVATE (Windows; pages never
+# faulted, so ws stayed flat and the census could not see it) and pinned it
+# until the scale tensor died. Fix: pass-1 pre-reads the scales through
+# core's aimdo load_torch_file arm (file-backed, 22MB private on the real
+# 9.47GB file) and clones only the scales. The same probe then measures the
+# whole 7B fp8 load at 1.18GB private over baseline (0.13x file), with the
+# model holding view=8.31GB / private=1.02GB — the assign=True shape core
+# itself uses (comfy/sd.py:2407).
+#
+# The tests below pin the LEGACY-route behavior as exercised by this stub
+# env (CPU target, aimdo off -> per-tensor clones): owned copies, no views,
+# fp8 bytes exact, final cast a no-op. On a CUDA+aimdo host the same code
+# path preserves views instead — asserted in test_dynamic_vram_mechanism.py.
+
+
+class TestQuantRouteCeiling:
+    def test_quant_params_carry_no_file_views_by_design(
+            self, tmp_path, stubbed_load_env):
+        run, _ = stubbed_load_env
+        p = _save_mixed(tmp_path / "ceiling.safetensors")
+        bundle = run(p)
+        report = census(bundle["model"])
+
+        # The quant reader returns owned copies, so NOTHING on this route can
+        # be a view or an mmap. A non-zero view bucket here would mean the
+        # reader started mapping — a design change, not a bug fix.
+        assert report["param_view_bytes"] == 0
+        assert report["param_mmap_bytes"] == 0
+        assert report["buffer_view_bytes"] == 0
+        assert report["param_private_bytes"] > 0
+        # "convrot_int8": this mixed file also carries a convrot resident, so
+        # the family is not the pure "fp8_resident" label the real 7B file
+        # gets (asserted in TestFp8QuantizedEmbedding). Both are != "dense",
+        # which is all the gate at modules/patcher.py:606 cares about.
+        assert bundle["weight_family"] in ("fp8_resident", "convrot_int8")
+
+    def test_private_footprint_is_about_one_x_file(
+            self, tmp_path, stubbed_load_env):
+        """The ceiling itself: ~1x file, not ~2x (i.e. NOT a bf16 recast)."""
+        run, _ = stubbed_load_env
+        p = _save_mixed(tmp_path / "ceiling_bytes.safetensors")
+        file_bytes = p.stat().st_size
+        bundle = run(p)
+        report = census(bundle["model"])
+
+        resident = sum(
+            m.weight.untyped_storage().nbytes()
+            for m in bundle["model"].modules() if isinstance(m, FP8Linear)
+        )
+        file_fp8 = sum(
+            t.numel() for t in load_file(str(p)).values()
+            if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        )
+        # The residents occupy exactly the fp8 bytes the file carries: 1 byte
+        # per element, never 2. A bf16 recast would double this line.
+        assert resident == file_fp8 > 0
+        # Whole-model private host bytes stay near the file: the quant tail
+        # dequantises (embed/norms) and costs more than the file, so the
+        # bound is generous on one side and absolute on the other.
+        assert report["param_private_bytes"] <= 4 * file_bytes
+
+    def test_fp8_resident_follows_the_device_not_the_family(self):
+        """2026-09-30: fp8_resident is ON the dynamic route (the whole point of
+        the port); what keeps it legacy is a CPU target or a missing aimdo
+        alias. The previous version asserted the opposite through a CPU
+        device, where EVERY family returns legacy anyway - vacuous."""
+        for family in ("fp8_resident", "dense", "convrot_int8", "gguf_block", ""):
+            assert select_patcher_class(family, torch.device("cpu"))                 is VibeVoicePatcher  # no CUDA -> legacy, whatever the label
+
+    def test_loaded_fp8_resident_keeps_fp8_storage_after_the_cast(
+            self, tmp_path, stubbed_load_env):
+        """End-to-end at KB scale: cast AFTER the load must not touch fp8.
+
+        The ranked hypothesis for the reported 7B spike was that
+        ``_quant_protected_names`` fails to protect FP8Linear, so the final
+        cast dequantises 9.47GB of fp8 into ~17GB of bf16. MEASURED: refuted —
+        the loader's own final cast leaves every resident at float8 width
+        (asserted here through the real loader, and at unit scale in
+        tests/test_fp8_quant.py::TestFp8ResidentSurvivesDtypeCast).
+        """
+        run, _ = stubbed_load_env
+        p = _save_mixed(tmp_path / "cast_survives.safetensors")
+        bundle = run(p)
+        model = bundle["model"]
+
+        # The loader has already run its final cast at this point; re-running
+        # it must be a no-op for the residents.
+        cast_model_to_dtype_if_needed(model, torch.bfloat16)
+
+        residents = [m for m in model.modules() if isinstance(m, FP8Linear)]
+        assert residents
+        for m in residents:
+            assert m.weight.dtype == torch.float8_e4m3fn
+            assert m.weight_scale.dtype == torch.float32
+            assert m.weight.untyped_storage().nbytes() == m.weight.numel()
 
 
 # ====================================================================
@@ -781,6 +908,13 @@ class TestASRStreaming:
                 self.lm_head = vv.lm_head
 
         p = _save_mixed(tmp_path / "asr_quant.safetensors")
+        calls = []
+        real = comfy.utils.load_torch_file
+
+        def _spy(path, **kw):
+            calls.append(str(path))
+            return real(path, **kw)
+
         with patch.object(EL, "VibeVoiceASRForConditionalGeneration", _StubASR), \
              patch.object(EL, "_load_asr_config", return_value=MagicMock()), \
              patch.object(EL, "_load_asr_tokenizer", return_value=MagicMock()), \
@@ -795,8 +929,7 @@ class TestASRStreaming:
              patch.object(EL.model_management, "get_torch_device",
                           return_value=torch.device("cpu")), \
              patch.object(comfy.utils, "load_torch_file",
-                          side_effect=AssertionError(
-                              "full-dict materialization on the ASR quant path")):
+                          side_effect=_spy):
             bundle = load_external_vibevoice_asr_model(
                 weight_path=str(p), config_name="VibeVoice-ASR",
                 attention_mode="sdpa", dtype_str="auto",
@@ -804,6 +937,9 @@ class TestASRStreaming:
 
         assert bundle["is_asr"] is True
         assert bundle["weight_family"] == "convrot_int8"
+        # The ASR quant path maps the file exactly once (pass-1 scale
+        # pre-read through core's aimdo arm) — no full-dict weight read.
+        assert calls == [str(p)]
         q = bundle["model"].model.language_model.layers[0].self_attn.q_proj
         assert isinstance(q, ConvRotInt8Linear)
         assert q.weight.dtype == torch.int8

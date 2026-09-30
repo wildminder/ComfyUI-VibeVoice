@@ -7,6 +7,23 @@ from unittest.mock import patch, MagicMock
 
 from ComfyUI_VibeVoice.modules.asr_generation import load_asr_model, load_asr_model_patched, transcribe_audio, force_offload_asr_model
 
+# The dynamic patcher's aimdo-free stand-in, its alias fixture and the
+# load_models_gpu stand-in live in test_patcher.py, which owns the
+# patcher-level tests. Imported, not redefined, so the suite has exactly one
+# definition of each.
+from tests.test_patcher import (  # noqa: E402
+    dynamic_core_alias,
+    load_side_effect,
+)
+
+
+def _asr_generation_module():
+    """The asr_generation module OBJECT (monkeypatch cannot resolve the alias
+    package ``ComfyUI_VibeVoice.modules.asr_generation`` from a dotted string)."""
+    import ComfyUI_VibeVoice.modules.asr_generation as asr_gen
+
+    return asr_gen
+
 
 class TestLoadASRModel:
     """Test load_asr_model function."""
@@ -199,8 +216,8 @@ class TestLoadASRModelPatched:
 
         with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load), \
              patch("comfy.model_patcher.ModelPatcher.patch_model"), \
-             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device", return_value=torch.device("cpu")), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device", return_value=torch.device("cpu")):
             return load_asr_model_patched(
@@ -244,8 +261,8 @@ class TestLoadASRModelPatched:
 
         with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load), \
              patch("comfy.model_patcher.ModelPatcher.patch_model"), \
-             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device", return_value=torch.device("cpu")), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device", return_value=torch.device("cpu")):
             patcher1, _, _ = load_asr_model_patched(
@@ -281,8 +298,8 @@ class TestLoadASRModelPatched:
             self.model = torch.nn.Linear(8, 8)
             self.processor = object()
 
-        with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load),              patch("comfy.model_patcher.ModelPatcher.patch_model"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
+        with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load),              patch("comfy.model_patcher.ModelPatcher.patch_model"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
                    return_value=torch.device("cpu")),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device",
                    return_value=torch.device("cpu")):
             patcher, _, _ = load_asr_model_patched(
@@ -317,8 +334,8 @@ class TestLoadASRModelPatched:
             self.model = torch.nn.Linear(8, 8)
             self.processor = object()
 
-        with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load),              patch("comfy.model_patcher.ModelPatcher.patch_model"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
+        with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load),              patch("comfy.model_patcher.ModelPatcher.patch_model"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
                    return_value=torch.device("cpu")),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device",
                    return_value=torch.device("cpu")):
             p1, _, _ = load_asr_model_patched(
@@ -400,8 +417,8 @@ class TestLoadASRFromExternal:
         from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
 
         with patch("comfy.model_patcher.ModelPatcher.patch_model"), \
-             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device", return_value=torch.device("cpu")), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device", return_value=torch.device("cpu")):
             return load_asr_from_external(
@@ -530,6 +547,118 @@ class TestLoadASRFromExternal:
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
 
 
+class TestLoadASRUnderBothPatcherClasses:
+    """T8: the external ASR load path must work on EITHER patcher class.
+
+    The selector (modules/patcher.py:select_patcher_class) is the only thing
+    that chooses, so the class is forced here by rebinding the name the
+    consuming module imported. Everything downstream — construction, the lazy
+    build, ``load_to_device``'s branch, the cache registration — then runs for
+    real.
+
+    Assertions are on ``is_dynamic()`` and ``is_loaded``, never on
+    ``isinstance``: ``ModelPatcherDynamic.__new__``
+    (comfy/model_patcher.py:1754-1757) reroutes a CPU load_device to a plain
+    ModelPatcher, so a "dynamic" instance is not necessarily an instance of the
+    dynamic subclass. This is a correctness requirement, not a style preference.
+    """
+
+    # The aimdo-free dynamic stand-in and its alias fixture live in
+    # test_patcher.py, which owns the patcher-level tests. Imported, not
+    # redefined, so the suite has exactly one definition of the stand-in.
+    def _bundle(self, name="ext-asr"):
+        return {
+            "model": torch.nn.Linear(8, 8),
+            "processor": object(),
+            "model_name": name,
+            "source_path": "fake.safetensors",
+            # The dense family is the ONLY one that may go dynamic; naming it
+            # keeps the fixture honest about what the selector would pick.
+            "weight_family": "dense",
+            "dynamic_vram_route": True,
+        }
+
+    @pytest.mark.parametrize("patcher_kind", ["legacy", "dynamic"])
+    def test_asr_generation_works_under_both_patcher_classes(
+        self, monkeypatch, dynamic_core_alias, patcher_kind
+    ):
+        from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
+        from ComfyUI_VibeVoice.modules.patcher import (
+            VibeVoiceASRPatcher,
+            make_dynamic_patcher_class,
+        )
+        from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
+        from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
+
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        LOADED_ASR_MODELS_CACHE.clear()
+
+        patcher_cls = (
+            make_dynamic_patcher_class(VibeVoiceASRPatcher)
+            if patcher_kind == "dynamic"
+            else VibeVoiceASRPatcher
+        )
+        monkeypatch.setattr(
+            _asr_generation_module(), "select_patcher_class",
+            lambda *args, **kwargs: patcher_cls,
+        )
+
+        bundle = self._bundle()
+
+        with patch("comfy.model_patcher.ModelPatcher.patch_model"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu"),              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=load_side_effect()),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device", return_value=torch.device("cpu")),              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device", return_value=torch.device("cpu")):
+            patcher, model, processor = load_asr_from_external(
+                bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
+            )
+
+        assert patcher.is_dynamic() is (patcher_kind == "dynamic")
+        assert patcher.is_loaded is True
+        assert model is not None
+        assert processor is not None
+
+        # The identity key is an internal format; the contract under test is
+        # "the cache entry is registered", so assert membership, not spelling.
+        assert patcher in VIBEVOICE_ASR_PATCHER_CACHE.values()
+        assert len(VIBEVOICE_ASR_PATCHER_CACHE) == 1
+        assert patcher.attention_mode == "sdpa"
+        assert patcher.target_dtype == torch.float32
+        assert patcher.model.cache_key == patcher.cache_key
+
+        VIBEVOICE_ASR_PATCHER_CACHE.clear()
+        LOADED_ASR_MODELS_CACHE.clear()
+
+    @pytest.mark.parametrize("patcher_kind", ["legacy", "dynamic"])
+    def test_asr_family_label_no_longer_decides_the_protocol(
+            self, monkeypatch, dynamic_core_alias, patcher_kind):
+        """2026-09-30: see the TTS twin — the ASR selector is the same rule
+        keyed on ``legacy_cls``. (The previous version asserted the removed
+        quant-family exclusion using a CPU device, where every family returns
+        legacy anyway — vacuous.)"""
+        import torch
+        from ComfyUI_VibeVoice.modules.patcher import (
+            VibeVoiceASRPatcher,
+            select_patcher_class,
+        )
+
+        for family in ("gguf_block", "convrot_int8", "fp8_resident", "", None):
+            assert select_patcher_class(
+                family, torch.device("cpu"), legacy_cls=VibeVoiceASRPatcher
+            ) is VibeVoiceASRPatcher
+
+        if torch.cuda.is_available():
+            for family in ("convrot_int8", "fp8_resident", "", None):
+                selected = select_patcher_class(
+                    family, torch.device("cuda"), legacy_cls=VibeVoiceASRPatcher
+                )
+                assert selected is not VibeVoiceASRPatcher, family
+            assert select_patcher_class(
+                "gguf_block", torch.device("cuda"), legacy_cls=VibeVoiceASRPatcher
+            ) is VibeVoiceASRPatcher
+
+        del patcher_kind  # the parametrisation runs the same body twice
+
+
+
 class TestForceOffloadASRPatcher:
     """CRIT-001 S5: force_offload via patcher nulls the model and clears the cache."""
 
@@ -547,8 +676,8 @@ class TestForceOffloadASRPatcher:
 
         with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load), \
              patch("comfy.model_patcher.ModelPatcher.patch_model"), \
-             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.unload_all_models"), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.soft_empty_cache"), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.gc"), \
@@ -951,8 +1080,8 @@ class TestASRAttentionSwitchNoLeak:
 
         with patch.object(VibeVoiceASRModelHandler, "load_model", fake_load), \
              patch("comfy.model_patcher.ModelPatcher.patch_model"), \
-             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_model_gpu",
-                   side_effect=lambda p: p.patch_model()), \
+             patch("ComfyUI_VibeVoice.modules.asr_generation.model_management.load_models_gpu",
+                   side_effect=lambda models: models[0].patch_model()), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_torch_device",
                    return_value=torch.device("cpu")), \
              patch("ComfyUI_VibeVoice.modules.asr_generation.get_offload_device",

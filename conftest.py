@@ -18,8 +18,68 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ====================================================================
 # 1. PATH CONFIGURATION
 # ====================================================================
-# ComfyUI root — adjust if your checkout lives elsewhere.
-COMFYUI_ROOT = os.environ.get("COMFYUI_ROOT", r"C:\_Dev\ComfyUI_dev\ComfyUI")
+def _resolve_comfyui_root() -> str:
+    """Locate a ComfyUI checkout that actually exists on this machine.
+
+    An explicit ``COMFYUI_ROOT`` always wins and is returned verbatim (even if
+    missing — a bad override should surface as a loud import error, not be
+    silently "helpfully" replaced).
+
+    The previous hardcoded default (``C:\\_Dev\\ComfyUI_dev\\ComfyUI``) pointed
+    at a path that no longer exists on the dev host, so with no env var set the
+    stale root was prepended to ``sys.path`` and six tests in
+    ``test_unified_tts_node.py`` errored with the opaque
+    "attempted relative import beyond top-level package" (the repo's own
+    ``nodes`` package shadowed ComfyUI's). Those tests deliberately fail loudly
+    rather than skip, so a stale root is a hard error, not a soft one — hence
+    the discovery below instead of a skip.
+
+    A root qualifies when it contains ComfyUI's top-level ``nodes.py`` and
+    ``execution.py`` (the modules ``test_unified_tts_node.py`` imports).
+    """
+    explicit = os.environ.get("COMFYUI_ROOT")
+    if explicit:
+        return explicit
+
+    default = r"C:\_Dev\ComfyUI_dev\ComfyUI"
+    if _is_comfyui_root(default):
+        return default
+
+    # Search the parent of the ComfyUI_vendored-nodes tree first, then its
+    # siblings, for any checkout that carries ComfyUI's top-level modules.
+    search_dirs = []
+    comfy_nodes_parent = os.path.dirname(os.path.dirname(ROOT_DIR))  # .../ComfyUI_dev
+    if os.path.isdir(comfy_nodes_parent):
+        search_dirs.append(comfy_nodes_parent)
+    search_dirs.append(os.path.dirname(os.path.dirname(ROOT_DIR)))
+
+    for base in search_dirs:
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for entry in entries:
+            candidate = os.path.join(base, entry)
+            if _is_comfyui_root(candidate):
+                return candidate
+            nested = os.path.join(candidate, "ComfyUI")
+            if _is_comfyui_root(nested):
+                return nested
+
+    # Nothing found: keep the historical default so the failure message names
+    # a concrete path rather than an empty string.
+    return default
+
+
+def _is_comfyui_root(path: str) -> bool:
+    """True when ``path`` is a ComfyUI root carrying its top-level modules."""
+    return all(
+        os.path.isfile(os.path.join(path, name))
+        for name in ("nodes.py", "execution.py")
+    )
+
+
+COMFYUI_ROOT = _resolve_comfyui_root()
 
 if COMFYUI_ROOT not in sys.path:
     sys.path.insert(0, COMFYUI_ROOT)

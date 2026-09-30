@@ -1,0 +1,18 @@
+{
+  "audio_bos_token": "<|object_ref_start|>",
+  "audio_duration_token": "<|AUDIO_DURATION|>",
+  "audio_eos_token": "<|object_ref_end|>",
+  "audio_token": "<|box_start|>",
+  "feature_extractor": {
+    "eps": 1e-06,
+    "feature_extractor_type": "VibeVoiceAcousticTokenizerFeatureExtractor",
+    "feature_size": 1,
+    "normalize_audio": true,
+    "padding_side": "right",
+    "padding_value": 0.0,
+    "return_attention_mask": true,
+    "sampling_rate": 24000,
+    "target_dB_FS": -25
+  },
+  "processor_class": "VibeVoiceAsrProcessor"
+}

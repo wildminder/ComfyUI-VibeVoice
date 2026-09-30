@@ -119,6 +119,35 @@ def release_model_bundles(cache_key: str) -> int:
     return 1
 
 
+def get_live_bundle(cache_key: str):
+    """Return the bundle registered under ``cache_key`` if it is still usable.
+
+    "Live" means the heavy fields have not been retired, i.e. the weights are
+    still resident. Used by the loader node to recognise a cache hit: an
+    identical re-execution can reuse the already-built model instead of
+    building a second copy of it (see
+    :func:`~nodes.external_loader_node.VibeVoiceExternalLoaderNode.execute`).
+
+    Returns the bundle, or ``None`` when nothing is registered or the
+    registration has already been neutralized.
+    """
+    try:
+        bundle = _BUNDLE_REGISTRY.get(cache_key)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            f"model_registry.get_live_bundle({cache_key!r}) failed: {e}"
+        )
+        return None
+    if bundle is None:
+        return None
+    try:
+        if bundle.get("model") is None:
+            return None
+    except Exception:  # pragma: no cover - a non-dict registration
+        return None
+    return bundle
+
+
 def clear_bundle_registry() -> None:
     """Forget all bundle registrations (test isolation helper)."""
     _BUNDLE_REGISTRY.clear()

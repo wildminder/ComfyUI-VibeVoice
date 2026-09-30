@@ -15,7 +15,7 @@ import comfy.model_management as model_management
 from .progress_utils import ProgressBarWithConsole
 
 from .loader import VibeVoiceModelHandler, VibeVoiceLoader, cleanup_old_models, LOADED_MODELS_CACHE
-from .patcher import VibeVoicePatcher
+from .patcher import VibeVoicePatcher, load_to_device, select_patcher_class
 from .model_registry import (
     FAMILY_TTS,
     evict_if_changed,
@@ -29,6 +29,7 @@ from .device_utils import get_torch_device, get_offload_device, DEVICE_CPU
 from .dtype_utils import resolve_dtype, DTYPE_AUTO
 from .attention_utils import resolve_attention_mode, resolve_realtime_attention_mode
 from .gguf_quant import log_gguf_forward_counters
+from .memory_census import measured_load, report_census
 
 logger = logging.getLogger(__name__)
 
@@ -241,11 +242,26 @@ def load_vibevoice_from_external(
         # destroy path evicts the right entry (plan 2026-08-20, §4.2).
         model_handler.cache_key = cache_key
 
-        patcher = VibeVoicePatcher(
+        # Route selection is a single pure function (modules/patcher.py). The
+        # bundle's weight_family is the ONLY input that can open the dynamic
+        # branch, and the loader already recorded its own decision in
+        # dynamic_vram_route; AND-ing the two means a hand-built bundle without
+        # the key still works, and a bundle that says False can never be forced
+        # dynamic by a device that merely looks CUDA-capable.
+        patcher_cls = select_patcher_class(
+            model_bundle.get("weight_family"), load_device, legacy_cls=VibeVoicePatcher
+        )
+        if not bool(model_bundle.get("dynamic_vram_route", True)):
+            patcher_cls = VibeVoicePatcher
+        patcher = patcher_cls(
             model_handler,
             attention_mode=actual_attention_mode,
             load_device=load_device,
             offload_device=offload_device,
+            # size/dtype are load-bearing, not decoration: core honours size in
+            # model_size() (comfy/model_patcher.py:406-411) and load_models_gpu
+            # budgets from it (comfy/model_management.py:800-809), and the
+            # dynamic patcher's patch_model honours dtype.
             size=model_handler.size,
             dtype=target_dtype,
         )
@@ -256,7 +272,17 @@ def load_vibevoice_from_external(
         )
 
     patcher = VIBEVOICE_PATCHER_CACHE[cache_key]
-    model_management.load_model_gpu(patcher)
+    # SAMPLED: this is where core's patcher load() actually runs, and on
+    # the dynamic route it is where the pinned host staging buffer is
+    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
+    # "+7GB that stays resident" was measured only in a standalone
+    # probe; this line is what makes it observable in live ComfyUI.
+    with measured_load("load-to-device"):
+        load_to_device(patcher)
+    # Host-RAM census (one env-gated line): what this load left resident
+    # after the H2D — file views vs private copies, the eager branch's
+    # patcher.backup stash, and the vbar ranges core allocated.
+    report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     loaded_model = patcher.model.model
     loaded_processor = patcher.model.processor
 
@@ -332,7 +358,14 @@ def load_vibevoice_model(
             dtype_str=dtype,
         )
 
-        patcher = VibeVoicePatcher(
+        # Standard-directory dropdown loader: no external bundle, hence no
+        # weight_family / dynamic_vram_route to AND with. 2026-09-30: the
+        # selector no longer reads the family label, so this route takes the
+        # dynamic class exactly like the external ones when core resolved one
+        # for this device — and the loader preserves the aimdo file views on
+        # the same predicate (modules/loader.py, same device expression).
+        patcher_cls = select_patcher_class(None, load_device, legacy_cls=VibeVoicePatcher)
+        patcher = patcher_cls(
             model_handler,
             attention_mode=actual_attention_mode,
             load_device=load_device,
@@ -344,7 +377,14 @@ def load_vibevoice_model(
         logger.debug(f"Created new patcher for {model_name} with attn={actual_attention_mode}, q4={quantize_4bit}")
 
     patcher = VIBEVOICE_PATCHER_CACHE[cache_key]
-    model_management.load_model_gpu(patcher)
+    # SAMPLED: this is where core's patcher load() actually runs, and on
+    # the dynamic route it is where the pinned host staging buffer is
+    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
+    # "+7GB that stays resident" was measured only in a standalone
+    # probe; this line is what makes it observable in live ComfyUI.
+    with measured_load("load-to-device"):
+        load_to_device(patcher)
+    report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     model = patcher.model.model
     processor = patcher.model.processor
 
@@ -531,7 +571,25 @@ def generate_audio(
             pbar.update_absolute(current, total=total)
 
         try:
-            outputs = model.generate(**gen_inputs, progress_callback=_progress)
+            # SAMPLED (2026-09-30): the live 1.5B run showed machine RAM
+            # 20.8 -> 27.3GB while EVERY process counter stayed flat, and the
+            # growth happened while this window was running — the load-phase
+            # lines cannot see it. The line carries start_sys/end_sys (machine
+            # used) beside the process counters, so this one line says whether
+            # the growth is in the ComfyUI process or machine-wide (file
+            # cache / other processes). [vvpull] then says WHICH path served
+            # each weight (vbar = core's file->VRAM paging; nonvbar = the
+            # cast-buffer path that can copy a file view host-side) and how
+            # many bytes moved — the number that distinguishes "one 5GB
+            # paging pass" from "5GB re-read every AR step".
+            from .comfy_stream import pull_stats_line, reset_pull_stats
+
+            reset_pull_stats()
+            with measured_load("tts-generate") as _rss:
+                _rss.mark("gen-enter")
+                outputs = model.generate(**gen_inputs, progress_callback=_progress)
+                _rss.mark("gen-return")
+            logger.info(pull_stats_line())
 
         except model_management.InterruptProcessingException:
             logger.info("VibeVoice generation interrupted by user")

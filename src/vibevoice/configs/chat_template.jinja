@@ -1,0 +1,26 @@
+{%- set system_prompt = system_prompt | default("You are a helpful assistant that transcribes audio input into text output in JSON format.") -%}
+<|im_start|>system
+{{ system_prompt }}<|im_end|>
+{%- set audio_token = audio_token | default("<|box_start|>") -%}
+{%- set audio_start_token = "<|object_ref_start|>" -%}
+{%- set audio_end_token = "<|object_ref_end|>" -%}
+{%- for message in messages -%}
+    {%- if message['role'] == 'user' -%}
+{{ '
+' }}<|im_start|>user{{ '
+' }}{%- set text_items = message['content'] | selectattr('type', 'equalto', 'text') | list -%}
+        {%- set context_text = text_items[0]['text'] if text_items else none -%}
+        {%- for item in message['content'] -%}
+            {%- if item['type'] == 'audio' -%}
+{{ audio_start_token }}{{ audio_token }}{{ audio_end_token }}{{ "
+" }}{%- if context_text -%}
+This is a <|AUDIO_DURATION|> seconds audio, with extra info: {{ context_text }}
+
+Please transcribe it with these keys: Start time, End time, Speaker ID, Content{%- else -%}
+This is a <|AUDIO_DURATION|> seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content{%- endif -%}
+            {%- endif -%}
+        {%- endfor -%}
+<|im_end|>{{ '
+' }}
+    {%- endif -%}
+{%- endfor -%}

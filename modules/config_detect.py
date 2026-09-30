@@ -7,6 +7,15 @@ checkpoint is a perfect fingerprint of its architecture family —
         VibeVoice-7B    (152064, 3584)
         VibeVoice-1.5B  (151936, 1536)
 
+    language_model.model.embed_tokens.weight  shape [vocab, hidden]
+        VibeVoice-ASR   (152064, 3584)
+
+The ASR shape COLLIDES with the 7B one, so ASR files are recognized first by
+module names only they have (``multi_modal_projector.*`` and the two
+``*_tokenizer_encoder.*`` towers) and only then classified against their own
+signature table. A TTS file never carries those prefixes, so the two
+branches cannot be confused.
+
 This module reads that shape WITHOUT materializing any tensor data:
 
 * safetensors → ``safe_open`` reads the JSON header only (instant on
@@ -47,6 +56,27 @@ _FAMILY_SIGNATURES = {
     "VibeVoice-1.5B": (1536, 151936),
 }
 
+# ASR checkpoints are a DIFFERENT family that happens to share the 7B
+# embedding shape ((3584, 152064) is the VibeVoice-7B TTS signature), so they
+# must never be resolved through _FAMILY_SIGNATURES: that table is scanned
+# first-match and would answer "VibeVoice-7B", routing an ASR checkpoint into
+# the TTS loader. The gate below keys on module names that exist ONLY in an ASR
+# state dict, and this table is scanned on its own.
+_ASR_ONLY_KEY_PREFIXES = (
+    "multi_modal_projector.",
+    "acoustic_tokenizer_encoder.",
+    "semantic_tokenizer_encoder.",
+)
+
+_ASR_EMBEDDING_CANDIDATES = (
+    "language_model.model.embed_tokens.weight",
+)
+
+# config_name -> (hidden_size, vocab_size) for the ASR family.
+_ASR_FAMILY_SIGNATURES = {
+    "VibeVoice-ASR": (3584, 152064),
+}
+
 
 @dataclass(frozen=True)
 class WeightsFingerprint:
@@ -55,11 +85,13 @@ class WeightsFingerprint:
     hidden_size: int
     vocab_size: int
     source_key: str
+    is_asr: bool = False
 
     @property
     def config_name(self) -> str:
         """The config_name whose signature matches this fingerprint."""
-        for name, (hidden, vocab) in _FAMILY_SIGNATURES.items():
+        table = _ASR_FAMILY_SIGNATURES if self.is_asr else _FAMILY_SIGNATURES
+        for name, (hidden, vocab) in table.items():
             if (hidden, vocab) == (self.hidden_size, self.vocab_size):
                 return name
         return ""
@@ -88,6 +120,41 @@ def classify_embedding_shape(shape: Sequence[int]) -> Optional[WeightsFingerprin
     return None
 
 
+def classify_asr_embedding_shape(shape: Sequence[int]) -> Optional[WeightsFingerprint]:
+    """Classify a 2-D embedding shape onto the ASR family, orientation-agnostic.
+
+    Separate from :func:`classify_embedding_shape` on purpose: the ASR
+    signature overlaps the 7B TTS one, and only the ASR key prefixes (checked
+    by the caller) justify consulting this table.
+
+    Args:
+        shape: The embedding tensor's shape, ``[vocab, hidden]`` or reversed.
+
+    Returns:
+        A fingerprint with ``is_asr=True`` when the shape matches exactly one
+        known ASR family, else ``None``.
+    """
+    if shape is None or len(shape) != 2:
+        return None
+    d0, d1 = int(shape[0]), int(shape[1])
+
+    for name, (hidden, vocab) in _ASR_FAMILY_SIGNATURES.items():
+        if (d0, d1) == (vocab, hidden) or (d0, d1) == (hidden, vocab):
+            return WeightsFingerprint(
+                hidden_size=hidden, vocab_size=vocab, source_key="", is_asr=True
+            )
+    return None
+
+
+def _has_asr_only_keys(keys) -> bool:
+    """True when the state dict carries a module only an ASR checkpoint has."""
+    for key in keys:
+        for prefix in _ASR_ONLY_KEY_PREFIXES:
+            if key.startswith(prefix):
+                return True
+    return False
+
+
 def fingerprint_safetensors(path: str) -> Optional[WeightsFingerprint]:
     """Fingerprint a ``.safetensors`` file from its header only.
 
@@ -104,6 +171,47 @@ def fingerprint_safetensors(path: str) -> Optional[WeightsFingerprint]:
 
         with safe_open(path, framework="pt") as f:
             keys = set(f.keys())
+
+            # ASR gate FIRST: an ASR checkpoint shares the 7B embedding shape,
+            # so classifying it with _FAMILY_SIGNATURES would return
+            # "VibeVoice-7B" and send it to the TTS loader.
+            #
+            # This branch is TERMINAL in both directions. A state dict carrying
+            # an ASR-only prefix is an ASR checkpoint by construction, so if
+            # the ASR embedding key is missing or its shape is foreign we must
+            # NOT fall through to the TTS loop below: a hypothetical ASR
+            # variant that spells its embedding differently (e.g.
+            # ``tok_embeddings.weight``) would otherwise be classified with
+            # _FAMILY_SIGNATURES, whose 7B entry is the very same (3584,
+            # 152064) shape, and would be misrouted to the TTS loader as
+            # "VibeVoice-7B". Returning None makes the caller raise the
+            # actionable "could not auto-detect, pick a config_name" error
+            # instead of silently loading the wrong family.
+            if _has_asr_only_keys(keys):
+                for candidate in _ASR_EMBEDDING_CANDIDATES:
+                    if candidate in keys:
+                        shape = f.get_slice(candidate).get_shape()
+                        fp = classify_asr_embedding_shape(shape)
+                        if fp is not None:
+                            return WeightsFingerprint(
+                                hidden_size=fp.hidden_size,
+                                vocab_size=fp.vocab_size,
+                                source_key=candidate,
+                                is_asr=True,
+                            )
+                        logger.debug(
+                            "ASR embedding key '%s' in '%s' has foreign shape %s",
+                            candidate, os.path.basename(path), shape,
+                        )
+                        return None
+                logger.debug(
+                    "'%s' carries ASR-only prefixes but none of the ASR "
+                    "embedding keys %s; refusing to classify it as a TTS "
+                    "family (the ASR and 7B-TTS signatures collide)",
+                    os.path.basename(path), list(_ASR_EMBEDDING_CANDIDATES),
+                )
+                return None
+
             for candidate in _EMBEDDING_KEY_CANDIDATES:
                 if candidate in keys:
                     shape = f.get_slice(candidate).get_shape()

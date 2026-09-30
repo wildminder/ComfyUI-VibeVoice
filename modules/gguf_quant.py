@@ -754,26 +754,40 @@ class GGUFLinear(torch.nn.Module):
         return torch.nn.functional.linear(x, w, self.bias)
 
     def _forward_streamed(self, x):
-        """Lowvram path: raw blocks were offloaded; pull them back
-        dtype-preservingly.
+        """Paged path: raw blocks were offloaded; pull them through core's
+        cast machinery, dtype-preservingly.
 
-        NOTE: deliberately NOT comfy.ops.cast_bias_weight — it recasts the
-        weight to the ACTIVATION dtype whenever they differ
-        (ops.py: "if weight_has_function or weight.dtype != dtype:
-        weight = weight.to(dtype=dtype)"), which would corrupt raw byte
-        blocks. Core's own partial-unload contract attaches LowVramPatch
-        callables whose job is exactly "move tensor to device, keep dtype";
-        we honor those directly."""
+        2026-09-30 (see :meth:`modules.fp8_quant.FP8Linear._forward_streamed`
+        for the full reasoning): the old bare ``.to(device)`` pull existed to
+        dodge ``cast_bias_weight``'s DEFAULT activation-dtype cast, but core's
+        own quantized layers pass the weight dtype explicitly
+        (comfy/ops.py:1722). With ``dtype=torch.uint8`` the raw blocks survive
+        and, under ModelPatcherDynamic, the returned tensor is the vbar
+        window (comfy/model_patcher.py:1993) so the bytes page disk->VRAM.
+        ``bias_dtype`` stays separate (comfy/ops.py:350-351); the uncast is a
+        stream sync / vbar unpin only (comfy/ops.py:444-462).
+        """
+        import comfy.ops
+
         _FORWARD_COUNTERS["streamed"] += 1
-        w_raw = self._pull_to_device(self.weight, x.device)
-        bias = self.bias
-        if bias is not None and bias.device != x.device:
-            bias = bias.to(x.device)
-        w = dequantize_blocks(
-            w_raw, self.ggml_type, x.dtype,
-            (self.out_features, self.in_features),
+        weight, bias, offload_stream = comfy.ops.cast_bias_weight(
+            self,
+            x,
+            device=x.device,
+            dtype=self.weight_comfy_model_dtype,
+            bias_dtype=x.dtype,
+            offloadable=True,
         )
-        return torch.nn.functional.linear(x, w, bias)
+        try:
+            if bias is not None and bias.dtype != x.dtype:
+                bias = bias.to(x.dtype)
+            w = dequantize_blocks(
+                weight, self.ggml_type, x.dtype,
+                (self.out_features, self.in_features),
+            )
+            return torch.nn.functional.linear(x, w, bias)
+        finally:
+            comfy.ops.uncast_bias_weight(self, weight, bias, offload_stream)
 
     def _pull_to_device(self, tensor, device):
         # A fully resident tensor with no hooks is already where it needs to

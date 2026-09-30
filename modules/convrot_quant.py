@@ -188,38 +188,46 @@ class ConvRotInt8Linear(nn.Module):
         )
 
     def _forward_streamed(self, x):
-        """Lowvram path: pull the int8 weight back dtype-preservingly.
+        """Paged path: pull the raw int8 weight through core's cast machinery.
 
-        Deliberately NOT comfy.ops.cast_bias_weight — it recasts the weight
-        to the ACTIVATION dtype whenever they differ (ops.py:
-        "if weight_has_function or weight.dtype != dtype: weight =
-        weight.to(dtype=dtype)"), which would destroy int8 storage. Core's
-        partial-unload contract attaches LowVramPatch callables whose job is
-        exactly "move tensor to device, keep dtype"; we honor those. The
-        tiny fp32 scale rides along with a cheap device guard."""
+        2026-09-30 (see :meth:`modules.fp8_quant.FP8Linear._forward_streamed`
+        for the full reasoning): the old bare ``.to(x.device)`` existed to
+        dodge ``cast_bias_weight``'s DEFAULT activation-dtype cast, but core's
+        own quantized layers pass the weight dtype explicitly
+        (comfy/ops.py:1722). With ``dtype=torch.int8`` the int8 storage
+        survives and, under ModelPatcherDynamic, the returned tensor is the
+        vbar window (comfy/model_patcher.py:1993) so the bytes page
+        disk->VRAM instead of being copied whole per offloaded forward.
+        ``bias_dtype`` stays separate (comfy/ops.py:350-351); the uncast is a
+        stream sync / vbar unpin only (comfy/ops.py:444-462).
+        """
+        import comfy.ops
         import comfy_kitchen
 
-        w = self.weight
-        if w.device != x.device:
-            w = w.to(x.device)
-        for fn in (getattr(self, "weight_function", None) or ()):
-            w = fn(w)
-        if w.device != x.device:
-            w = w.to(x.device)
-
-        scale = (self.weight_scale if self.weight_scale.device == x.device
-                 else self.weight_scale.to(x.device))
-        bias = (self.bias if self.bias is None
-                or self.bias.device == x.device else self.bias.to(x.device))
-        return comfy_kitchen.int8_linear(
-            x.contiguous(),
-            w,
-            scale,
-            bias,
-            out_dtype=x.dtype,
-            convrot=True,
-            convrot_groupsize=self.convrot_groupsize,
+        weight, bias, offload_stream = comfy.ops.cast_bias_weight(
+            self,
+            x,
+            device=x.device,
+            dtype=self.weight_comfy_model_dtype,
+            bias_dtype=x.dtype,
+            offloadable=True,
         )
+        try:
+            scale = (self.weight_scale if self.weight_scale.device == x.device
+                     else self.weight_scale.to(x.device))
+            if bias is not None and bias.dtype != x.dtype:
+                bias = bias.to(x.dtype)
+            return comfy_kitchen.int8_linear(
+                x.contiguous(),
+                weight,
+                scale,
+                bias,
+                out_dtype=x.dtype,
+                convrot=True,
+                convrot_groupsize=self.convrot_groupsize,
+            )
+        finally:
+            comfy.ops.uncast_bias_weight(self, weight, bias, offload_stream)
 
     def extra_repr(self):
         return (

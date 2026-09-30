@@ -36,6 +36,7 @@ Microsoft's VibeVoice, with model download, VRAM management and audio handling h
   * [Realtime models](#realtime)
   * [Node inputs](#node-inputs)
   * [Loading external models](#external-models)
+    * [Host RAM during an external load](#host-ram)
 * [Performance &amp; stability](#performance)
   * [Feature compatibility &amp; VRAM matrix](#vram-matrix)
   * [`transformers` version support](#transformers-support)
@@ -302,6 +303,140 @@ node into the `external_model` input of the TTS or ASR node — connected, it
     flood of `[WARNING] Pin error.` while pinning partially offloaded weights.
     Quant-resident loads (GGUF / ConvRot INT8 / fp8) never offload, so they
     avoid it; otherwise start ComfyUI with `--disable-pinned-memory`.
+
+</details>
+
+<p id="host-ram" align="center">· · · · · · · · · · · · · ·</p>
+
+#### ▣ Host RAM during an external load
+
+Loading a single-file dense checkpoint costs roughly **one copy of the file in
+host RAM**. That is measured on a *synthetic* dense bf16 `.safetensors` driven
+through the real loader: synchronous per-phase counters on a warm process give
+`load_torch_file +1.00× file`, the clone loop `+0.00×`, and assign +
+`_post_assign_fixups` `−0.02×` — the file, held once.
+
+**That synthetic number was not the reported failure.** A live load of the
+16.6 GB `VibeVoice-ASR-HF-bf16.safetensors` was observed peaking well above
+the file — about **1.26×** on the 5.41 GB `VibeVoice-1.5B` and **1.74×** on the
+16.66 GB ASR checkpoint. The earlier explanation of that number (a second full
+build on an identical re-execution) was itself real and is fixed, but it was
+**not** the whole cause: the remainder is simply the **entire model resident in
+host RAM**, which is exactly what the legacy patcher does — it has no virtual
+address space to page weights out of, so a dense bf16 state dict must be held
+whole until the weights are moved to the device. The 1× figure above is what
+the *load path* costs; the ~1.3–1.7× is what the *patcher* costs on top of it.
+
+**Status: mechanism wired, outcome NOT achieved and NOT measured.** The dense
+external single-file route now *selects* ComfyUI's DynamicVRAM patcher and loads
+through `load_models_gpu()`. That is the whole of what is done. The weights are
+**not** being demand-paged, and the RAM fix is **not working** — see "Known
+defect" below. No host-RAM number has been observed on a real checkpoint.
+
+<details>
+<summary><b>Known defect in the DynamicVRAM port (the RAM fix does not work)</b></summary>
+
+ComfyUI's `ModelPatcherDynamic` gates its entire demand-paging mechanism on a
+single per-module attribute, `comfy_cast_weights`
+(`comfy/model_patcher.py:1967`); only modules carrying it get an `m._v =
+vbar.alloc(...)` handle (`:1993`) and are paged. Modules without it take the
+branch at `:2000-2009`, which stashes the host tensor in `self.backup` and makes
+a full eager device copy.
+
+This route **suppresses** `convert_tree_for_streaming`
+(`modules/external_loader.py:1904`, `:2239`) to avoid two owners of one weight —
+but `convert_tree_for_streaming` is the *only* thing in this pack that sets
+`comfy_cast_weights` on these modules. Core sets it solely on
+`comfy.ops.manual_cast.*` (`comfy/ops.py:821-853`), classes this pack's
+transformers trees never use. So the suppression removes the attribute that
+unlocks paging, and the load lands entirely on the eager branch.
+
+Consequences, all in core's source, none measured here:
+
+*   Every original host tensor is retained **by reference** in
+    `ModelPatcher.backup` for the patcher's lifetime — the full 16.66 GB stays
+    in host RAM. This is the spike the work set out to remove, unchanged.
+*   A full device copy is made on top, and `model_loaded_weight_memory` reports
+    full residency, so the low-VRAM budget is defeated rather than honoured.
+*   Core's per-module lazy H2D (driven from `hasattr(s, "_v")` in
+    `comfy/ops.py:374`) never happens, because no `_v` is ever allocated.
+
+A second, deeper obstacle is visible in the same source: even with
+`comfy_cast_weights` set, `ModelPatcherDynamic` **never releases the host
+parameter** — `setup_param` allocates `_v` but does not replace the parameter
+(`comfy/model_patcher.py:1921-1953`). Core's host-RAM economy for its own
+models comes from the *loader* (`comfy/utils.py:165-166`, aimdo
+`load_safetensors` against a meta-initialised tree), not from the patcher. This
+pack instead materialises the whole model in ordinary host memory first
+(`modules/loader.py:895-903`: `safe_open.get_tensor` returns an owned copy under
+`MMAP_TORCH_FILES=False`). So the patcher port alone is unlikely to remove the
+spike even once paging is reachable.
+
+The port therefore needs re-planning; it is not a defect that can be closed by
+adjusting the existing steps. Until it is re-done and measured, treat the dense
+route's host-RAM behaviour as **unchanged from the legacy patcher**.
+
+</details>
+
+The family split below is real and holds; only the dense row's *outcome* is
+unproven:
+
+*   **Dense external single-file** checkpoints — the plain-BF16 family — select
+    `ModelPatcherDynamic` and load via `load_models_gpu()`. This is the only
+    family that moved. When ComfyUI's DynamicVRAM is unavailable (aimdo did not
+    initialise, or the load device is not CUDA) the selector **silently falls
+    back to the legacy patcher** — the previous, known-good behaviour — so
+    nothing breaks on a machine without it. The decision lives in one function,
+    `select_patcher_class` in `modules/patcher.py`; it is the whole scope of
+    this change.
+*   **GGUF**, **ConvRot INT8** and **fp8-resident** stay on the legacy
+    `comfy.model_patcher.ModelPatcher`, byte-identical. They install quant
+    residents that already stream natively, so a dynamic patcher would gain
+    nothing and would change their offload order.
+*   The **standard-directory dropdown loaders** (no external bundle) also stay
+    on the legacy patcher.
+
+To see which class actually served a load — and whether the dynamic route or
+the silent fallback was taken — the scratch probe below reports
+`PATCHER SELECTION` alongside the RAM numbers.
+
+<details>
+<summary><b>Measuring it on your machine</b></summary>
+
+*   Turn on `DEBUG` logging for the loader and read the dtype line it now
+    emits, e.g. `Model cast torch.float32 -> torch.bfloat16 (812
+    mismatched params)`. A cast is the one thing that can double the
+    footprint: it allocates a second copy of every mismatched parameter before
+    the old one is released. Both source dtype and parameter count are on the
+    line for exactly that reason.
+*   For a timeline of a full external ASR load — peak private commit, peak
+    working set, CUDA allocation, per-phase timings and **how many times each
+    load phase ran** — use the scratch probe
+    `.dev/scratch/probe_external_asr_ram.py` (Windows; needs `COMFYUI_ROOT`
+    set; it loads the real checkpoint, so run it yourself):
+
+    ```
+    python .dev/scratch/probe_external_asr_ram.py "<path-to-checkpoint>" --config-name VibeVoice-ASR
+    ```
+
+    It loads the checkpoint **twice by default** (`--passes`), keeping the
+    first copy alive across the second — that is the situation a live graph is
+    in between two generations, and a second full load is the usual reason a
+    load costs twice the file size. Pass `--passes 1` for a single load.
+    Add `--drive-consumer` to also push the bundle through the ASR node's cache
+    layer, which is where a re-load caused by a cache-key mismatch shows up. It
+    is also **required** for the `PATCHER SELECTION` block: only the consumer
+    path constructs a patcher, so without it that block reports `NONE OBSERVED`.
+
+*   **Paste the timeline back** — the `TIMELINE`, `PEAK`, `PHASE COUNTS` and
+    `PATCHER SELECTION` blocks — when reporting a load that uses far more RAM
+    than the file size. The counts are the diagnosis: with `--passes N`, each
+    phase should show exactly `N`. More than `N` means the checkpoint is being
+    loaded more times than you asked for, which is a different bug from a slow
+    or cast-heavy single load. `PATCHER SELECTION` answers the separate
+    question of *which* patcher served the load: `is_dynamic=True` means the
+    weights are demand-paged, and `is_dynamic=False` on a machine that should
+    have DynamicVRAM means the silent fallback to legacy fired.
 
 </details>
 

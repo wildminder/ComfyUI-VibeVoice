@@ -907,3 +907,94 @@ class TestOptionalAbsentPrefixes:
         mark_optional_absent(["acoustic_tokenizer.encoder.head.bias"], set(), original)
 
         assert original == {"lm_head.weight"}
+
+
+class _QuantGuardModel(torch.nn.Module):
+    """Tiny real module for the streaming quant-storage guard tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer1 = torch.nn.Linear(2, 2, bias=False)
+        self.layer2 = torch.nn.Linear(2, 2, bias=False)
+        self.config = MagicMock()
+        self.config.decoder_config.tie_word_embeddings = False
+        self.config.tie_word_embeddings = False
+
+
+class TestStreamApplyDenseQuantGuard:
+    """The streaming dense route must reject quantized storages too.
+
+    ``external_loader._assert_dense_loadable`` guards the batch route; without
+    a matching check the per-tensor route would happily assign an int8 storage
+    into a float parameter. One shared dtype set keeps both routes speaking
+    the same message.
+    """
+
+    @staticmethod
+    def _apply(pairs):
+        from ComfyUI_VibeVoice.modules.loader import VibeVoiceLoader
+
+        return VibeVoiceLoader._stream_apply_dense(_QuantGuardModel(), iter(pairs))
+
+    def test_int8_storage_rejected(self):
+        with pytest.raises(ValueError) as exc:
+            self._apply([("layer1.weight", torch.ones(2, 2, dtype=torch.int8))])
+
+        assert "carries no executable quantization metadata" in str(exc.value)
+        assert "layer1.weight" in str(exc.value)
+        assert "torch.int8" in str(exc.value)
+
+    def test_uint8_storage_rejected(self):
+        with pytest.raises(ValueError) as exc:
+            self._apply([("layer1.weight", torch.ones(2, 2, dtype=torch.uint8))])
+
+        assert "carries no executable quantization metadata" in str(exc.value)
+        assert "torch.uint8" in str(exc.value)
+
+    def test_float8_e4m3fn_storage_rejected(self):
+        with pytest.raises(ValueError) as exc:
+            self._apply([("layer1.weight", torch.ones(2, 2).to(torch.float8_e4m3fn))])
+
+        assert "carries no executable quantization metadata" in str(exc.value)
+        assert "torch.float8_e4m3fn" in str(exc.value)
+
+    def test_quant_storage_rejected_under_an_unexpected_key(self):
+        """Guard sits at the top of the loop, before the params lookup.
+
+        ``_assert_dense_loadable`` checks every key of the state dict, not
+        just the ones the model has a target for; an int8 tensor under an
+        unknown key must not slip through silently.
+        """
+        with pytest.raises(ValueError) as exc:
+            self._apply([("no.such.key", torch.ones(2, 2, dtype=torch.int8))])
+
+        assert "no.such.key" in str(exc.value)
+
+    def test_bf16_and_fp32_dense_still_assign(self):
+        from ComfyUI_VibeVoice.modules.loader import VibeVoiceLoader
+
+        w1 = torch.full((2, 2), 3.0, dtype=torch.bfloat16)
+        w2 = torch.full((2, 2), 4.0, dtype=torch.float32)
+
+        model = _QuantGuardModel()
+        missing, unexpected = VibeVoiceLoader._stream_apply_dense(
+            model, iter([("layer1.weight", w1), ("layer2.weight", w2)])
+        )
+
+        assert missing == []
+        assert unexpected == []
+        assert model.layer1.weight.dtype == torch.bfloat16
+        assert model.layer2.weight.dtype == torch.float32
+        assert torch.equal(model.layer1.weight.data, w1)
+        assert torch.equal(model.layer2.weight.data, w2)
+
+    def test_dtype_set_is_shared_with_external_loader(self):
+        # Drift guard: the dtype set has exactly ONE definition object,
+        # module-level in ``modules.loader`` (external_loader imports it from
+        # there, so the dependency runs one way only).
+        from ComfyUI_VibeVoice.modules import loader as L
+
+        assert L.QUANT_STORAGE_DTYPES is EL._QUANT_STORAGE_DTYPES
+        assert L.QUANT_STORAGE_DTYPES == frozenset({
+            torch.int8, torch.uint8, torch.float8_e4m3fn, torch.float8_e5m2,
+        })

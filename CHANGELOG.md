@@ -9,6 +9,144 @@ Release history for ComfyUI-VibeVoice. Newest first.
 ---
 
 <details>
+<summary><strong>Unreleased - fix the ~2x host-RAM spike on an external load</strong></summary>
+
+### Changed
+*   **The dense external single-file route now selects ComfyUI's DynamicVRAM
+    patcher.** A plain-BF16 external checkpoint was landing *entirely* in host RAM,
+    because the pack subclassed the legacy `comfy.model_patcher.ModelPatcher` rather
+    than `CoreModelPatcher` (which core rebinds to `ModelPatcherDynamic` once aimdo
+    initialises). The observed cost was **1.26×** file size on the 5.41 GB
+    `VibeVoice-1.5B` and **1.74×** on the 16.66 GB ASR checkpoint. The route now
+    constructs `ModelPatcherDynamic` and loads it via `load_models_gpu()`.
+
+    **The mechanism is wired; the outcome is NOT achieved and NOT measured.** The
+    weights are **not** demand-paged. `ModelPatcherDynamic` gates paging on a
+    per-module `comfy_cast_weights` attribute (`comfy/model_patcher.py:1967`,
+    allocating at `:1993`), and this route suppresses
+    `convert_tree_for_streaming` (`modules/external_loader.py:1904`, `:2239`) —
+    which is the only thing in this pack that sets that attribute on these
+    transformers modules. Every module therefore takes the eager branch at
+    `:2000-2009`: host tensors are retained by reference in `ModelPatcher.backup`
+    (so the 16.66 GB stays in host RAM) and a full device copy is made on top
+    (so VRAM is no longer paged either). This trips the port plan's own stop
+    condition and needs re-planning. Until then, treat the dense route's
+    host-RAM behaviour as unchanged from the legacy patcher.
+
+    **Scope is dense only.** The entire behavioural decision is one function,
+    `select_patcher_class` in `modules/patcher.py`. Four families deliberately did
+    **not** move and keep the legacy patcher byte-identical:
+    *   **GGUF** (`gguf_block`) — installs quant residents that already stream natively.
+    *   **ConvRot INT8** (`convrot_int8`) — same.
+    *   **fp8-resident** (`fp8_resident`) — same.
+    *   The **standard-directory dropdown loaders** (no external bundle, so
+        `weight_family` is `None`).
+
+    A dynamic patcher would gain nothing for the first three — they are quant
+    residents, not full float state dicts — while changing their offload order.
+
+*   **Silent fallback to legacy.** If ComfyUI's DynamicVRAM is unavailable (aimdo did
+    not initialise, or the load device is not CUDA), the selector returns the legacy
+    patcher with no error, no warning and no user-visible change. Machines without
+    DynamicVRAM keep exactly the previous, known-good behaviour.
+
+### Fixed
+*   Re-running the `Load VibeVoice Model` node with the **same** model no longer builds a
+    second copy of the weights. The node computed an unload-before-load key, skipped
+    eviction for an identical re-run (correctly — the live patcher is reused), and then
+    rebuilt the model anyway. The outgoing weights stayed reachable from ComfyUI's node
+    output cache *and* from the live patcher's handler, so the process held two full
+    models at once. An identical re-execution now reuses the resident model.
+*   The returned bundle is now the same object the reused patcher wraps. Previously a
+    rebuilt bundle was discarded in favour of the already-loaded weights, so the rebuild
+    was wasted work as well as wasted RAM.
+
+### Diagnostics
+*   README: the "Host RAM during an external load" note no longer claims the load path
+    was exonerated, and no longer claims the legacy-patcher opt-out is permanent. It
+    now states the dense-only scope, the four families left on the legacy patcher, and
+    the silent fallback.
+*   `.dev/scratch/probe_external_asr_ram.py` gained a `PATCHER SELECTION` block
+    reporting, per load phase, the patcher class actually constructed,
+    `patcher.is_dynamic()`, and `patcher.loaded_size()` split into
+    `model_loaded_weight_memory` and the demand-paged remainder. Requires
+    `--drive-consumer` (only the consumer path builds a patcher). All pre-existing
+    counters and the `TIMELINE` / `PEAK` / `PHASE COUNTS` blocks are unchanged, so
+    earlier and later pastes stay comparable.
+
+### Not yet confirmed by live measurement
+*   **The RAM fix is NOT working, and NOT confirmed.** No real checkpoint was loaded
+    to produce this change; the evidence behind it is a green unit-test suite, which
+    is a non-regression signal only. No host-RAM number has been observed since the
+    port. Worse, reading core's source says the port cannot have worked as written —
+    see the "mechanism is wired" note above. Running the probe is still worth doing,
+    but it will measure the eager path, not paging: expect host RAM unchanged.
+    Run it on both the 5.41 GB and the 16.66 GB checkpoints and paste back the
+    `PEAK` / `TIMELINE` / `PHASE COUNTS` / `PATCHER SELECTION` blocks either way.
+
+</details>
+
+---
+
+<details>
+<summary><strong>v2.12.0 - external VibeVoice-ASR (native) loading</strong></summary>
+
+### Loading
+*   The `Load VibeVoice Model` node, `config_name "VibeVoice-ASR"`, loads a single-file
+    `VibeVoice-ASR-HF` checkpoint end to end.
+*   Native checkpoints (`model_type: "vibevoice_asr"`) are built with the transformers
+    classes; the vendored ASR tree cannot consume their `language_model.model.*` keys.
+*   The architecture config, tokenizer config, processor config and chat template ship with
+    the node, so nothing has to be written into the model's own folder.
+*   Auto-detect recognizes an ASR checkpoint by the module names only it carries, instead of
+    guessing from the embedding shape it shares with VibeVoice-7B.
+
+### Diagnostics
+*   The post-load dtype cast logs the SOURCE dtype, the target and how many
+    parameters were converted, e.g. `Model cast torch.float32 -> torch.bfloat16
+    (812 mismatched params)`. A cast allocates a second copy of every
+    mismatched parameter before the old one is freed, so the line is the
+    fastest way to tell a cast-heavy load from a plain one. A checkpoint that
+    already matches stays silent and costs nothing.
+
+### Documentation
+*   The external-model section now states the measured host-RAM cost of a load
+    (~1x the checkpoint, ~1.2x working set) instead of leaving the impression
+    that ComfyUI core's near-zero figure applies here. It explains that the
+    legacy `ModelPatcher` opt-out is why, points at the peak-RAM probe, and asks
+    for the load timeline back when reporting a large-RAM load.
+
+### Tests
+*   The external ASR loader is exercised end to end on a tiny native checkpoint: config,
+    processor, weight binding, and the rotary buffers a meta-device load must materialize.
+*   That load is also asserted to have been converted for streaming. The conversion is
+    wrapped in a defensive `try`/`except` that only warns, so a dropped call would
+    otherwise leave the full-size checkpoint unstreamable behind a green suite.
+*   The packaged tokenizer is diffed against the published `VibeVoice-ASR-HF` tokenizer
+    (vocab size, symmetric difference, token→id mapping, added tokens) on hosts that have
+    it; the digest pin still guards hosts that do not.
+*   The full-size checkpoint is never loaded by the test suite.
+
+### Docs
+*   **Documentation correction, no behaviour change and no user-visible fix.** Three
+    docstrings claimed that `safe_open` / `comfy.utils.load_torch_file` hand back
+    zero-copy mmap views into the checkpoint file. Measured on this stack, they do not:
+    `get_tensor` returns an owned, deserialised copy, and holding a file's tensors costs
+    the file size in private commit. Corrected in `iter_safetensors_tensors`,
+    `_load_state_dict_into_model_from_memory` and `_stream_apply_dense`.
+*   The safety rationale is kept and narrowed, not deleted. The per-tensor `clone()`
+    before assign is still the fix for the ghost-RAM / `[WARNING] Pin error.` flood, and
+    it is still required for `.bin`/`.pt` when `MMAP_TORCH_FILES` is set and for the
+    aimdo `load_safetensors` path. Under the current configuration
+    (`MMAP_TORCH_FILES=False`, `aimdo_enabled=False`) it is a redundant copy that costs
+    one tensor of transient memory; the code is unchanged.
+*   The RAM plan's stop condition fired on its own evidence and the streaming re-route is
+    not shipped; the reason is recorded in
+    `.dev/docs/plans/2026-09-28-external-dense-load-ram-spike.md` (S1 RESULT).
+
+</details>
+
+<details>
 <summary><strong>v2.11.0 - loading, numerics and release hygiene</strong></summary>
 
 ### Loading

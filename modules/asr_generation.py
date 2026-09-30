@@ -19,7 +19,7 @@ from transformers.generation import BaseStreamer
 from .progress_utils import ProgressBarWithConsole
 
 from .asr_loader import VibeVoiceASRLoader, VibeVoiceASRModelHandler, LOADED_ASR_MODELS_CACHE, cleanup_asr_models
-from .patcher import VibeVoiceASRPatcher
+from .patcher import VibeVoiceASRPatcher, load_to_device, select_patcher_class
 from .model_registry import (
     FAMILY_ASR,
     evict_if_changed,
@@ -32,6 +32,7 @@ from .dtype_utils import resolve_dtype, DTYPE_AUTO
 from .audio_utils import extract_audio_tensor, resample_audio
 from .attention_utils import resolve_attention_mode, resolve_asr_attention_mode
 from .gguf_quant import log_gguf_forward_counters
+from .memory_census import measured_load, report_census
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +238,13 @@ def load_asr_model_patched(
         # VibeVoiceASRPatcher.unpatch_model clears the correct entry.
         handler.cache_key = cache_key
 
-        patcher = VibeVoiceASRPatcher(
+        # Standard-directory ASR loader: no external bundle, so no
+        # weight_family / dynamic_vram_route to AND with. 2026-09-30: the
+        # selector follows the device and core's alias, not the family label
+        # — this route is dynamic when core resolved one, and the loader keeps
+        # the aimdo file views on the same predicate.
+        patcher_cls = select_patcher_class(None, load_device, legacy_cls=VibeVoiceASRPatcher)
+        patcher = patcher_cls(
             handler,
             attention_mode=actual_attn,
             load_device=load_device,
@@ -249,12 +256,19 @@ def load_asr_model_patched(
         logger.debug(f"Created ASR patcher for {model_name} with attn={actual_attn}")
 
     patcher = VIBEVOICE_ASR_PATCHER_CACHE[cache_key]
-    model_management.load_model_gpu(patcher)
+    # SAMPLED: this is where core's patcher load() actually runs, and on
+    # the dynamic route it is where the pinned host staging buffer is
+    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
+    # "+7GB that stays resident" was measured only in a standalone
+    # probe; this line is what makes it observable in live ComfyUI.
+    with measured_load("load-to-device"):
+        load_to_device(patcher)
+    report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     model = patcher.model.model
     processor = patcher.model.processor
 
     # Register under the patcher key so the ASR cache reflects the live model
-    # and the patcher's unpatch_model() cleanup removes it.
+    # and the patcher's unpatch_model() cleanup removes the correct entry.
     LOADED_ASR_MODELS_CACHE[cache_key] = (model, processor)
 
     if model is None or processor is None:
@@ -358,11 +372,22 @@ def load_asr_from_external(
         # VibeVoiceASRPatcher.unpatch_model clears the correct entry.
         handler.cache_key = cache_key
 
-        patcher = VibeVoiceASRPatcher(
+        # Route selection is a single pure function (modules/patcher.py); the
+        # ASR bundle's weight_family is the only input that can open the
+        # dynamic branch, AND-ed with the loader's own recorded decision so a
+        # bundle saying False can never be forced dynamic.
+        patcher_cls = select_patcher_class(
+            model_bundle.get("weight_family"), load_device, legacy_cls=VibeVoiceASRPatcher
+        )
+        if not bool(model_bundle.get("dynamic_vram_route", True)):
+            patcher_cls = VibeVoiceASRPatcher
+        patcher = patcher_cls(
             handler,
             attention_mode=actual_attn,
             load_device=load_device,
             offload_device=offload_device,
+            # size feeds core's model_size() and the load_models_gpu budget;
+            # dtype is honoured by the dynamic patcher's patch_model.
             size=handler.size,
             dtype=target_dtype,
         )
@@ -370,12 +395,19 @@ def load_asr_from_external(
         logger.debug(f"Created ASR patcher for external model {model_name} with attn={actual_attn}")
 
     patcher = VIBEVOICE_ASR_PATCHER_CACHE[cache_key]
-    model_management.load_model_gpu(patcher)
+    # SAMPLED: this is where core's patcher load() actually runs, and on
+    # the dynamic route it is where the pinned host staging buffer is
+    # grown (comfy/model_patcher.py:1874-1881). The 1.5B report's
+    # "+7GB that stays resident" was measured only in a standalone
+    # probe; this line is what makes it observable in live ComfyUI.
+    with measured_load("load-to-device"):
+        load_to_device(patcher)
+    report_census(patcher.model.model, patcher, phase=f"post-h2d:{model_name}")
     model = patcher.model.model
     processor = patcher.model.processor
 
     # Register under the patcher key so the ASR cache reflects the live model
-    # and the patcher's unpatch_model() cleanup removes it.
+    # and the patcher's unpatch_model() cleanup removes the correct entry.
     LOADED_ASR_MODELS_CACHE[cache_key] = (model, processor)
 
     return patcher, model, processor

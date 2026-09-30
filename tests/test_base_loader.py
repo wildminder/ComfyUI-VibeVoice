@@ -9,7 +9,10 @@ import torch
 import pytest
 from unittest.mock import patch, MagicMock
 
-from ComfyUI_VibeVoice.modules.base_loader import BaseVibeVoiceLoader
+from ComfyUI_VibeVoice.modules.base_loader import (
+    BaseVibeVoiceLoader,
+    iter_safetensors_tensors,
+)
 
 
 class TestResolveOfficialModelDir:
@@ -238,3 +241,96 @@ class TestStreamingIterators:
         pairs = dict(BaseVibeVoiceLoader.iter_checkpoint_tensors(str(path)))
         assert set(pairs) == {"w"}
         assert torch.equal(pairs["w"], w)
+
+
+class TestSafetensorsIteratorArms:
+    """``iter_safetensors_tensors`` has two read layers (2026-09-30 fp8 fix).
+
+    The aimdo arm yields zero-copy ``load_safetensors`` file views (page
+    cache, no private commit) so the consumer's mandatory clone is the only
+    private copy — that clone is what halfed the 7B fp8 load spike. The
+    aimdo-off fallback keeps the original ``safe_open`` stream. Both arms
+    must deliver identical values; only the yielded storage's backing
+    differs.
+    """
+
+    @staticmethod
+    def _write_single(tmp_path):
+        from safetensors.torch import save_file
+
+        w = torch.randn(8, 4)
+        path = tmp_path / "single.safetensors"
+        save_file({"w": w}, str(path))
+        return w
+
+    @staticmethod
+    def _has_file_slice(t):
+        return hasattr(t.untyped_storage(), "_comfy_tensor_file_slice")
+
+    @pytest.fixture(scope="class", autouse=True)
+    def aimdo_runtime(self):
+        """control.init() once for the class — the native runtime that
+        production ComfyUI brings up at startup (same guard as the probes:
+        no CUDA or a failed init skips the arm, the fallback arm still runs).
+        """
+        pytest.importorskip("comfy_aimdo")
+        if not torch.cuda.is_available():
+            pytest.skip("aimdo runtime needs CUDA on this install")
+        from comfy_aimdo import control
+
+        if not control.init():
+            pytest.skip("aimdo control.init() failed")
+
+    def test_fallback_arm_yields_owned_tensors(self, tmp_path, monkeypatch):
+        import comfy.memory_management
+
+        w = self._write_single(tmp_path)
+        monkeypatch.setattr(
+            comfy.memory_management, "aimdo_enabled", False, raising=False
+        )
+        pairs = dict(iter_safetensors_tensors(str(tmp_path / "single.safetensors")))
+        assert set(pairs) == {"w"}
+        assert torch.equal(pairs["w"], w)
+        assert not self._has_file_slice(pairs["w"])
+
+    def test_aimdo_arm_yields_file_views(self, tmp_path, monkeypatch):
+        import comfy.memory_management
+
+        w = self._write_single(tmp_path)
+        monkeypatch.setattr(
+            comfy.memory_management, "aimdo_enabled", True, raising=False
+        )
+        pairs = dict(iter_safetensors_tensors(str(tmp_path / "single.safetensors")))
+        assert set(pairs) == {"w"}
+        assert torch.equal(pairs["w"], w)
+        assert self._has_file_slice(pairs["w"])
+
+    def test_clone_severs_the_view(self, tmp_path, monkeypatch):
+        """The consumer contract: clone before keeping. The clone must not
+        carry the file mapping (pinning hazard), while the view does."""
+        import comfy.memory_management
+
+        self._write_single(tmp_path)
+        monkeypatch.setattr(
+            comfy.memory_management, "aimdo_enabled", True, raising=False
+        )
+        gen = iter_safetensors_tensors(str(tmp_path / "single.safetensors"))
+        _, view = next(gen)
+        gen.close()
+        clone = view.clone()
+        assert self._has_file_slice(view)
+        assert not self._has_file_slice(clone)
+        assert torch.equal(view, clone)
+
+    def test_early_exit_does_not_raise(self, tmp_path, monkeypatch):
+        """Breaking mid-stream closes cleanly — the finally's views.clear()
+        must not fight GeneratorExit."""
+        import comfy.memory_management
+
+        self._write_single(tmp_path)
+        monkeypatch.setattr(
+            comfy.memory_management, "aimdo_enabled", True, raising=False
+        )
+        gen = iter_safetensors_tensors(str(tmp_path / "single.safetensors"))
+        next(gen)
+        gen.close()

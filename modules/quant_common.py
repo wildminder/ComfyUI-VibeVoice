@@ -75,7 +75,18 @@ def replace_linears_for_quant(model: torch.nn.Module, layer_plan: dict) -> list:
                 f"--heur option)."
             )
         try:
-            new_mod = factory(in_f, out_f, bias)
+            # META-ONLY construction (2026-09-30). The model tree was built
+            # under torch.device("meta") so every parameter is virtual; these
+            # replacements were NOT, so each factory's torch.empty(...)
+            # allocated REAL host memory for the whole resident — 8.08 GB for
+            # the 7B fp8 file, committed but never touched (which is why the
+            # live sampler showed peak_ws 5.6 GB beside peak_private 27.94
+            # GB). The checkpoint assign that follows replaces every one of
+            # those parameters (fp8 storage + fp32 scale + bias), so the real
+            # allocation was pure waste. GGUF's set_raw_weight installs its own
+            # real raw bytes afterwards, which is unaffected.
+            with torch.device("meta"):
+                new_mod = factory(in_f, out_f, bias)
         except Exception as e:
             raise QuantTargetMismatch(
                 f"Failed to build quantized replacement for '{prefix}': {e}"
