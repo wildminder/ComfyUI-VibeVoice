@@ -403,3 +403,50 @@ class TestFingerprintOnFlatPool:
         path = write_synthetic_gguf(tmp_path / "sig7b.gguf", spec,
                                     flat_pool={FLAT_CONV_KEY})
         assert resolve_auto_config_name(str(path)) == "VibeVoice-7B"
+
+
+class TestResidentBlocksPlacement:
+    """Where a quant-resident Linear's raw blocks live.
+
+    The raw blocks ARE the model's storage — a q8_0 checkpoint's 8 GB of
+    blocks is not 16 GB of dequantized weights waiting to happen. Left on the
+    host they are private memory (the 24 -> 41 GB spike) and every forward
+    takes the paged `cast_bias_weight` path; placed on the load device they
+    cost the same bytes, load flat, and dequantize in place.
+    """
+
+    def test_resident_blocks_go_to_the_requested_device(self, flat_pool_gguf):
+        if not torch.cuda.is_available():
+            pytest.skip("no GPU in this environment")
+        from ComfyUI_VibeVoice.modules.external_loader import _install_gguf_weights
+        from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
+
+        model = TestInstallNonLinearFallback()._build_model()
+        reader = open_gguf_reader(flat_pool_gguf)
+        stats = _install_gguf_weights(
+            model, reader, target_device=torch.device("cuda", 0)
+        )
+
+        assert stats["n_resident_layers"] > 0, "fixture has no resident layers"
+        residents = [
+            m for m in model.modules() if isinstance(m, GGUFLinear)
+        ]
+        assert residents
+        off_device = [
+            type(m).__name__ for m in residents if m.weight.device.type != "cuda"
+        ]
+        assert not off_device, f"resident blocks left on host: {off_device}"
+        # Blocks stay blocks — no float materialisation on the way in.
+        assert all(m.weight.dtype == torch.uint8 for m in residents)
+
+    def test_no_device_request_keeps_the_host_contract(self, flat_pool_gguf):
+        from ComfyUI_VibeVoice.modules.external_loader import _install_gguf_weights
+        from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
+
+        model = TestInstallNonLinearFallback()._build_model()
+        reader = open_gguf_reader(flat_pool_gguf)
+        _install_gguf_weights(model, reader, target_device=None)
+
+        residents = [m for m in model.modules() if isinstance(m, GGUFLinear)]
+        assert residents
+        assert all(m.weight.device.type == "cpu" for m in residents)

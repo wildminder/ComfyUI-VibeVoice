@@ -931,7 +931,15 @@ def _install_gguf_weights(model, reader, target_device=None) -> dict:
         if kind != "resident" or target not in resident_set:
             continue
         module = resolve_module(model, target)
-        module.set_raw_weight(GGUFTensor.from_reader_tensor(t).raw)
+        raw = GGUFTensor.from_reader_tensor(t).raw
+        # The raw blocks ARE the model's storage for a quant-resident Linear,
+        # so they belong where the rest of the model belongs. Left on the host
+        # they cost ~8 GB of private RAM and every forward takes the paged
+        # `cast_bias_weight` path; in VRAM they cost the same bytes, load
+        # flat, and the forward dequantizes in place. Dequantizing to float at
+        # load instead would cost twice the VRAM and lose the point of a GGUF
+        # checkpoint.
+        module.set_raw_weight(place_tensor_on_device(raw, target_device))
         total_raw += module.weight.numel()
 
     def _dense_pairs():
