@@ -904,3 +904,84 @@ class TestP42GpuPeakVram:
         # Cleanup
         handler.model.to(CPU)
         torch.cuda.empty_cache()
+
+
+# ====================================================================
+# Honest resident-weight accounting
+# ====================================================================
+
+class TestResidentWeightAccounting:
+    """Our loader puts every tensor on the load device before the patcher
+    exists, so core's own counter still reads zero. Core then plans a partial
+    load into whatever VRAM is left and reports a fully resident 9.33 GB model
+    as "5511.92 MB offloaded" on an idle 16 GB card. The patcher has to own up
+    to the bytes it already has.
+    """
+
+    @staticmethod
+    def _handler(inner):
+        handler = VibeVoiceModelHandler("VibeVoice-1.5B")
+        handler.model = inner
+        return handler
+
+    def test_meta_model_leaves_the_counter_at_zero(self):
+        from ComfyUI_VibeVoice.modules.patcher import _adopt_resident_weights
+
+        with torch.device("meta"):
+            inner = torch.nn.Linear(8, 4)
+        patcher = MagicMock()
+        patcher.model = MagicMock()
+        patcher.model.model_loaded_weight_memory = 0
+
+        _adopt_resident_weights(patcher, self._handler(inner))
+
+        assert patcher.model.model_loaded_weight_memory == 0
+
+    def test_cpu_model_leaves_the_counter_at_zero(self):
+        from ComfyUI_VibeVoice.modules.patcher import _adopt_resident_weights
+
+        patcher = MagicMock()
+        patcher.model = MagicMock()
+        patcher.model.model_loaded_weight_memory = 0
+
+        _adopt_resident_weights(patcher, self._handler(torch.nn.Linear(8, 4)))
+
+        assert patcher.model.model_loaded_weight_memory == 0
+
+    def test_gpu_model_reports_every_resident_byte(self):
+        if not torch.cuda.is_available():
+            pytest.skip("no GPU in this environment")
+        from ComfyUI_VibeVoice.modules.patcher import _adopt_resident_weights
+
+        inner = torch.nn.Linear(8, 4).to("cuda")
+        expected = sum(
+            t.numel() * t.element_size()
+            for t in list(inner.parameters()) + list(inner.buffers())
+        )
+        patcher = MagicMock()
+        patcher.model = MagicMock()
+        patcher.model.model_loaded_weight_memory = 0
+
+        _adopt_resident_weights(patcher, self._handler(inner))
+
+        assert patcher.model.model_loaded_weight_memory == expected
+        assert expected > 0
+
+    def test_a_resident_counter_makes_core_skip_the_partial_load(self):
+        """Core's own guard is the payoff, so assert the guard's condition."""
+        if not torch.cuda.is_available():
+            pytest.skip("no GPU in this environment")
+        from ComfyUI_VibeVoice.modules.patcher import _adopt_resident_weights
+
+        inner = torch.nn.Linear(8, 4).to("cuda")
+        patcher = MagicMock()
+        patcher.model = MagicMock()
+        patcher.model.model_loaded_weight_memory = 0
+        patcher.model.model_lowvram = False
+
+        _adopt_resident_weights(patcher, self._handler(inner))
+
+        # comfy/model_patcher.py partially_load(): this pair short-circuits
+        # the whole partial-load plan for an already-resident model.
+        assert patcher.model.model_lowvram is False
+        assert patcher.model.model_loaded_weight_memory > 0

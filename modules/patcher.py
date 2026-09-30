@@ -9,6 +9,8 @@ import torch
 import gc
 import logging
 
+from itertools import chain
+
 import comfy.model_patcher
 import comfy.model_management as model_management
 
@@ -42,6 +44,43 @@ def _init_legacy_attributes(patcher, model, attention_mode, dtype) -> None:
     patcher._warm_offloaded = False
 
 
+def _adopt_resident_weights(patcher, model) -> None:
+    """Report to core the weight bytes this patcher already has in VRAM.
+
+    Our loader places every tensor on the load device *before* the patcher is
+    built, so core's own counter still reads zero. ``partially_load`` then
+    computes ``0 + extra_memory > model_size()`` as false, decides the load is
+    not full, and plans a partial load into whatever VRAM happens to be left.
+    That is how a fully resident 9.33 GB 7B model gets reported as
+    ``loaded partially; 5511.92 MB offloaded`` on an otherwise idle 16 GB card:
+    the weights never move, only the bookkeeping is wrong — and it is wrong in
+    the direction that makes a second model look like there is 5.5 GB free.
+
+    Counting the bytes that are genuinely on an accelerator lets core's own
+    guard do the right thing: ``partially_load`` returns 0 and leaves the
+    resident model alone.
+    """
+    inner = getattr(model, "model", None)
+    if inner is None:
+        return
+    resident = 0
+    on_accelerator = False
+    for tensor in chain(inner.parameters(), inner.buffers()):
+        if tensor.is_meta:
+            return  # nothing is loaded yet; leave core's counter at zero
+        if tensor.device.type == "cuda":
+            resident += tensor.numel() * tensor.element_size()
+            on_accelerator = True
+    if on_accelerator and resident > 0:
+        patcher.model.model_loaded_weight_memory = resident
+
+
+def _init_patch_state(patcher, model, attention_mode, dtype) -> None:
+    """The one place a patcher finishes coming up."""
+    _init_legacy_attributes(patcher, model, attention_mode, dtype)
+    _adopt_resident_weights(patcher, model)
+
+
 class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
     """Custom ModelPatcher for managing VibeVoice models in ComfyUI.
 
@@ -62,7 +101,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         # blows up in ModelPatcher.__init__ with "missing 1 required
         # positional argument: 'offload_device'".
         super().__init__(model, *args, **kwargs)
-        _init_legacy_attributes(self, model, attention_mode, dtype)
+        _init_patch_state(self, model, attention_mode, dtype)
 
     @property
     def _model_cache(self) -> dict:
