@@ -299,10 +299,12 @@ class TestEveryMessageIsPrefixed:
                 leftmost = first
                 while isinstance(leftmost, ast.BinOp) and isinstance(leftmost.op, ast.Add):
                     leftmost = leftmost.left
-                if _literal_text(leftmost) is not None:
-                    continue
-                if not (isinstance(leftmost, ast.JoinedStr)
-                        and _literal_text(leftmost).startswith(PREFIX)):
+                # A literal leftmost fragment -- including the folded implicit
+                # concatenation of several f-strings, which `ast` collapses into
+                # ONE JoinedStr -- is still REQUIRED to carry the prefix. It is
+                # never an exemption.
+                text = _literal_text(leftmost)
+                if text is None or not text.startswith(PREFIX):
                     offenders.append(
                         f"{_rel(path)}:{node.lineno} "
                         f"{ast.unparse(first)[:60]!r} is not prefix-wrapped"
@@ -338,7 +340,6 @@ def _assert_level(needle, expected):
         f"{needle!r} is emitted at {levels}, expected exactly [{expected!r}]: "
         f"{[(h[0], h[1]) for h in hits]}"
     )
-    assert f"[{expected}]" in levels or expected in levels
 
 
 class TestExplicitLevelDecisions:
