@@ -23,10 +23,10 @@ Two halves:
    (``LayerNorm(256)`` does exactly that — measured, not assumed), which is
    correct behaviour but would mask the property under test.
 
-The aimdo bootstrap (``_aimdo_ready`` / ``aimdo_runtime``) is copied from
-``tests/test_dynamic_vram_mechanism.py`` — including its repair of
-comfy_aimdo's import-order trap — because a fixture cannot be shared across
-test modules without becoming a conftest-wide GPU dependency.
+The aimdo bootstrap (``_aimdo_ready`` / ``aimdo_runtime``) lives here rather
+than in a shared fixture because a cross-module fixture would make the
+whole suite a GPU dependency. It repairs comfy_aimdo's import-order trap;
+see ``_aimdo_ready`` below.
 """
 
 import collections
@@ -364,8 +364,7 @@ class TestRendering:
 def _aimdo_ready() -> bool:
     """True when control.init + init_devices both succeed (main.py:74/:278).
 
-    Copied from tests/test_dynamic_vram_mechanism.py — including its repair
-    of comfy_aimdo's import-order trap: ``host_buffer`` / ``model_mmap`` /
+    Repairs comfy_aimdo's import-order trap: ``host_buffer`` / ``model_mmap`` /
     ``model_vbar`` / ``vram_buffer`` / ``storage`` snapshot ``lib =
     control.lib`` AT IMPORT TIME. Under pytest those modules are imported (via
     ``comfy.memory_management``) before ``control.init()`` loads the native

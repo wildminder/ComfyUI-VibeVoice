@@ -408,7 +408,7 @@ class TestStreamingStructuralGuarantees:
 # The tests below pin the LEGACY-route behavior as exercised by this stub
 # env (CPU target, aimdo off -> per-tensor clones): owned copies, no views,
 # fp8 bytes exact, final cast a no-op. On a CUDA+aimdo host the same code
-# path preserves views instead — asserted in test_dynamic_vram_mechanism.py.
+# path preserves views instead.
 
 
 class TestQuantRouteCeiling:
