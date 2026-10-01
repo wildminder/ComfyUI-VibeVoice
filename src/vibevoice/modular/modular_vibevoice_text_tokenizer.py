@@ -2,10 +2,7 @@
 
 from typing import List, Optional, Union
 
-from transformers.utils import logging
 from .transformers_compat import Qwen2Tokenizer, Qwen2TokenizerFast
-
-logger = logging.get_logger(__name__)
 
 
 class VibeVoiceTextTokenizer(Qwen2Tokenizer):

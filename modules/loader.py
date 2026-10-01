@@ -47,7 +47,6 @@ if SAGE_ATTENTION_AVAILABLE:
 
 from huggingface_hub import hf_hub_download
 
-logger = logging.getLogger(__name__)
 
 # Sentinel buffer values that must be restored to their intended initial state
 # after meta-init materialization (regression fix, v2.3.1). The VibeVoice model
@@ -166,8 +165,8 @@ def _recompute_rope_buffers(model) -> int:
                 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
                 rope_init_fn = ROPE_INIT_FUNCTIONS.get(rope_type)
                 if rope_init_fn is None:
-                    logger.warning(
-                        f"No rope init function for type '{rope_type}' on "
+                    logging.warning(
+                        f"[ComfyUI-VibeVoice] No rope init function for type '{rope_type}' on "
                         f"{module.__class__.__name__}; leaving inv_freq as-is."
                     )
                     continue
@@ -180,12 +179,12 @@ def _recompute_rope_buffers(model) -> int:
                 )
             recomputed += 1
         except Exception as e:
-            logger.warning(
-                f"Could not recompute RoPE inv_freq for "
+            logging.warning(
+                f"[ComfyUI-VibeVoice] Could not recompute RoPE inv_freq for "
                 f"{module.__class__.__name__}: {e}"
             )
     if recomputed:
-        logger.debug(f"Recomputed RoPE inv_freq for {recomputed} rotary module(s).")
+        logging.debug(f"[ComfyUI-VibeVoice] Recomputed RoPE inv_freq for {recomputed} rotary module(s).")
     return recomputed
 
 
@@ -247,10 +246,10 @@ def cleanup_old_models(keep_cache_key: str = None) -> None:
             try:
                 evict_patcher(patcher, VIBEVOICE_PATCHER_CACHE, key)
             except Exception as e:
-                logger.warning(f"Error cleaning up patcher {key}: {e}")
+                logging.warning(f"[ComfyUI-VibeVoice] Error cleaning up patcher {key}: {e}")
 
     if keys_to_remove:
-        logger.debug(f"Cleaned up cached models: {keys_to_remove}")
+        logging.debug(f"[ComfyUI-VibeVoice] Cleaned up cached models: {keys_to_remove}")
         gc.collect()
         model_management.soft_empty_cache()
 
@@ -354,7 +353,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             model_type = config_data.get("model_type", "")
 
             if model_type == "vibevoice_streaming":
-                logger.debug(f"Detected streaming config for '{model_name}'")
+                logging.debug(f"[ComfyUI-VibeVoice] Detected streaming config for '{model_name}'")
                 return VibeVoiceStreamingConfig.from_pretrained(config_path)
             else:
                 return VibeVoiceConfig.from_pretrained(config_path)
@@ -367,7 +366,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         fallback_path = os.path.join(
             os.path.dirname(__file__), "..", "src", "vibevoice", "configs", fallback_name
         )
-        logger.warning(f"Config not found for '{model_name}'. Using fallback: {fallback_name}")
+        logging.warning(f"[ComfyUI-VibeVoice] Config not found for '{model_name}'. Using fallback: {fallback_name}")
         return VibeVoiceConfig.from_pretrained(fallback_path)
 
     @staticmethod
@@ -376,7 +375,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         tokenizer_file_path = os.path.join(tokenizer_dir, "tokenizer.json")
 
         if not os.path.exists(tokenizer_file_path):
-            logger.debug(f"'tokenizer.json' not found in model directory: {tokenizer_dir}")
+            logging.debug(f"[ComfyUI-VibeVoice] 'tokenizer.json' not found in model directory: {tokenizer_dir}")
 
             packaged_configs_dir = os.path.join(
                 os.path.dirname(__file__), "..", "src", "vibevoice", "configs"
@@ -384,7 +383,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             packaged_tokenizer_path = os.path.join(packaged_configs_dir, "tokenizer.json")
 
             if os.path.exists(packaged_tokenizer_path):
-                logger.debug("Using pre-packaged tokenizer directly from the node folder...")
+                logging.debug("[ComfyUI-VibeVoice] Using pre-packaged tokenizer directly from the node folder...")
                 return VibeVoiceTextTokenizerFast(tokenizer_file=packaged_tokenizer_path)
 
             repos_to_try = ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-7B"]
@@ -392,7 +391,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             last_error = None
 
             for repo_id in repos_to_try:
-                logger.info(f"Attempting to download 'tokenizer.json' from Hugging Face repo '{repo_id}'...")
+                logging.debug(f"[ComfyUI-VibeVoice] Attempting to download 'tokenizer.json' from Hugging Face repo '{repo_id}'...")
                 try:
                     hf_hub_download(
                         repo_id=repo_id,
@@ -400,10 +399,10 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
                         local_dir=tokenizer_dir,
                     )
                     download_successful = True
-                    logger.info("Download successful.")
+                    logging.debug("[ComfyUI-VibeVoice] Download successful.")
                     break
                 except Exception as e:
-                    logger.warning(f"Failed to download from '{repo_id}': {e}")
+                    logging.warning(f"[ComfyUI-VibeVoice] Failed to download from '{repo_id}': {e}")
                     last_error = e
 
             if not download_successful:
@@ -488,22 +487,22 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
         single_safetensors = os.path.join(model_path, "model.safetensors")
         if os.path.isfile(single_safetensors):
-            logger.debug(f"Found single safetensors checkpoint: {single_safetensors}")
+            logging.debug(f"[ComfyUI-VibeVoice] Found single safetensors checkpoint: {single_safetensors}")
             return single_safetensors, False
 
         sharded_safetensors_index = os.path.join(model_path, "model.safetensors.index.json")
         if os.path.isfile(sharded_safetensors_index):
-            logger.debug(f"Found sharded safetensors checkpoint: {sharded_safetensors_index}")
+            logging.debug(f"[ComfyUI-VibeVoice] Found sharded safetensors checkpoint: {sharded_safetensors_index}")
             return sharded_safetensors_index, True
 
         single_bin = os.path.join(model_path, "pytorch_model.bin")
         if os.path.isfile(single_bin):
-            logger.debug(f"Found single PyTorch checkpoint: {single_bin}")
+            logging.debug(f"[ComfyUI-VibeVoice] Found single PyTorch checkpoint: {single_bin}")
             return single_bin, False
 
         sharded_bin_index = os.path.join(model_path, "pytorch_model.bin.index.json")
         if os.path.isfile(sharded_bin_index):
-            logger.debug(f"Found sharded PyTorch checkpoint: {sharded_bin_index}")
+            logging.debug(f"[ComfyUI-VibeVoice] Found sharded PyTorch checkpoint: {sharded_bin_index}")
             return sharded_bin_index, True
 
         raise FileNotFoundError(
@@ -564,8 +563,8 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         _recompute_rope_buffers(model)
 
         if tied and "lm_head.weight" in missing_keys:
-            logger.debug(
-                "lm_head.weight absent from checkpoint (tied to input "
+            logging.debug(
+                "[ComfyUI-VibeVoice] lm_head.weight absent from checkpoint (tied to input "
                 "embeddings via tie_word_embeddings) — expected."
             )
         reported_missing = [
@@ -573,18 +572,18 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             if k not in known_missing and not (tied and k == "lm_head.weight")
         ]
         if reported_missing:
-            logger.warning(f"Missing keys when loading state dict: {len(reported_missing)} keys")
+            logging.warning(f"[ComfyUI-VibeVoice] Missing keys when loading state dict: {len(reported_missing)} keys")
             if len(reported_missing) < 20:
-                logger.warning(f"Missing keys: {reported_missing}")
+                logging.warning(f"[ComfyUI-VibeVoice] Missing keys: {reported_missing}")
             else:
-                logger.warning(f"First 10 missing keys: {reported_missing[:10]}")
+                logging.warning(f"[ComfyUI-VibeVoice] First 10 missing keys: {reported_missing[:10]}")
 
         if unexpected_keys:
-            logger.warning(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
+            logging.warning(f"[ComfyUI-VibeVoice] Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
             if len(unexpected_keys) < 20:
-                logger.warning(f"Unexpected keys: {unexpected_keys}")
+                logging.warning(f"[ComfyUI-VibeVoice] Unexpected keys: {unexpected_keys}")
             else:
-                logger.warning(f"First 10 unexpected keys: {unexpected_keys[:10]}")
+                logging.warning(f"[ComfyUI-VibeVoice] First 10 unexpected keys: {unexpected_keys[:10]}")
 
         return missing_keys, unexpected_keys
 
@@ -668,7 +667,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             model_dir = model_path if model_type != "standalone" else os.path.dirname(ckpt_path)
             tensor_pairs = BaseVibeVoiceLoader.iter_sharded_tensors(model_dir)
         else:
-            logger.debug(f"Loading state dict from: {ckpt_path}")
+            logging.debug(f"[ComfyUI-VibeVoice] Loading state dict from: {ckpt_path}")
             tensor_pairs = BaseVibeVoiceLoader.iter_checkpoint_tensors(ckpt_path)
 
         VibeVoiceLoader._stream_apply_dense(
@@ -699,7 +698,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
 
         cache_key = f"{model_name}_attn_{attention_mode}_q4_{int(use_llm_4bit)}"
         if cache_key in LOADED_MODELS_CACHE:
-            logger.debug(f"Using cached model with {attention_mode} attention and q4={use_llm_4bit}")
+            logging.debug(f"[ComfyUI-VibeVoice] Using cached model with {attention_mode} attention and q4={use_llm_4bit}")
             return LOADED_MODELS_CACHE[cache_key]
 
         model_info = AVAILABLE_VIBEVOICE_MODELS[model_name]
@@ -711,7 +710,7 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         config = VibeVoiceLoader._load_config(config_path, model_name)
         is_streaming = isinstance(config, VibeVoiceStreamingConfig)
         if is_streaming:
-            logger.debug(f"Model '{model_name}' detected as streaming model")
+            logging.debug(f"[ComfyUI-VibeVoice] Model '{model_name}' detected as streaming model")
 
         vibevoice_tokenizer = VibeVoiceLoader._load_tokenizer(tokenizer_dir, model_name)
 
@@ -738,8 +737,8 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
         attn_implementation_for_load = get_attn_implementation_for_load(attention_mode)
 
         try:
-            logger.debug(
-                f"Loading model '{model_name}' with dtype: {final_load_dtype} "
+            logging.debug(
+                f"[ComfyUI-VibeVoice] Loading model '{model_name}' with dtype: {final_load_dtype} "
                 f"and attention: '{attn_implementation_for_load}'"
             )
 
@@ -780,9 +779,9 @@ class VibeVoiceLoader(BaseVibeVoiceLoader):
             model.eval()
             setattr(model, "_llm_4bit", bool(quant_config))
             LOADED_MODELS_CACHE[cache_key] = (model, processor)
-            logger.info(f"Successfully configured model '{model_name}' with {attention_mode} attention")
+            logging.debug(f"[ComfyUI-VibeVoice] Successfully configured model '{model_name}' with {attention_mode} attention")
             return model, processor
 
         except Exception as e:
-            logger.error(f"Failed to load model '{model_name}' with {attention_mode} attention: {e}")
+            logging.error(f"[ComfyUI-VibeVoice] Failed to load model '{model_name}' with {attention_mode} attention: {e}")
             raise RuntimeError(f"Failed to load model even with eager attention: {e}")

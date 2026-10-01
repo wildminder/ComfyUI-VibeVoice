@@ -22,7 +22,6 @@ import torch
 
 from .dtype_utils import set_config_dtype
 
-logger = logging.getLogger(__name__)
 
 # model_type of the published ASR-HF checkpoints.
 NATIVE_ASR_MODEL_TYPE = "vibevoice_asr"
@@ -171,8 +170,8 @@ def build_native_asr_processor(tokenizer_dir: str, preprocessor_path: str = ""):
         resolve_asset_file(PACKAGED_CHAT_TEMPLATE_FILE, tokenizer_dir)
     )
 
-    logger.debug(
-        f"Building native VibeVoice-ASR processor from tokenizer "
+    logging.debug(
+        f"[ComfyUI-VibeVoice] Building native VibeVoice-ASR processor from tokenizer "
         f"'{tokenizer_file}' (preprocessor overlay: "
         f"'{preprocessor_path or 'packaged defaults'}')"
     )

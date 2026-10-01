@@ -252,7 +252,7 @@ class TestCastModelToDtypeIfNeeded:
         """
         model = _TinyModel()  # fp32 weights + biases -> 4 mismatched params
 
-        with caplog.at_level(logging.DEBUG, logger="ComfyUI_VibeVoice.modules.dtype_utils"):
+        with caplog.at_level(logging.DEBUG):
             cast_model_to_dtype_if_needed(model, torch.bfloat16)
 
         cast_lines = [r.message for r in caplog.records if "mismatched params" in r.message]
@@ -266,7 +266,7 @@ class TestCastModelToDtypeIfNeeded:
         """A matching bf16 checkpoint must stay silent as well as free."""
         model = _TinyModel().to(torch.bfloat16)
 
-        with caplog.at_level(logging.DEBUG, logger="ComfyUI_VibeVoice.modules.dtype_utils"):
+        with caplog.at_level(logging.DEBUG):
             cast_model_to_dtype_if_needed(model, torch.bfloat16)
 
         assert not [r for r in caplog.records if "mismatched params" in r.message]

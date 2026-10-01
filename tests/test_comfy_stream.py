@@ -241,7 +241,7 @@ class TestConvertTree:
 
     def test_census_resident_skip_and_idempotence(self, caplog):
         t = self._tree()
-        with caplog.at_level(logging.INFO, logger="modules.comfy_stream"):
+        with caplog.at_level(logging.INFO):
             c1 = CS.convert_tree_for_streaming(t)
         # _CustomWithParams owns a direct Parameter (scale) with no leaf
         # compute -> converted via the streaming-container path (NOT skipped,

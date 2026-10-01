@@ -26,7 +26,6 @@ from pathlib import Path
 import torch
 from torch import nn
 
-logger = logging.getLogger(__name__)
 
 QUANT_META_SUFFIX = "comfy_quant"
 CONVROT_FORMAT = "int8_tensorwise"

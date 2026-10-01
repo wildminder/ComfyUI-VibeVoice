@@ -106,7 +106,7 @@ class TestTolerantOpen:
         # fresh session state: the dedupe set must not hold this file
         from ComfyUI_VibeVoice.modules import gguf_quant as _gq
         _gq._FLAT_POOL_WARNED.discard(flat_pool_gguf)
-        with caplog.at_level("WARNING", logger="ComfyUI_VibeVoice.modules.gguf_quant"):
+        with caplog.at_level("WARNING"):
             open_gguf_reader(flat_pool_gguf)
         assert any("automatic recovery" in r.getMessage()
                    for r in caplog.records)
@@ -115,7 +115,7 @@ class TestTolerantOpen:
         """The loader opens one GGUF several times; only the first warns."""
         from ComfyUI_VibeVoice.modules import gguf_quant as _gq
         _gq._FLAT_POOL_WARNED.discard(flat_pool_gguf)
-        with caplog.at_level("WARNING", logger="ComfyUI_VibeVoice.modules.gguf_quant"):
+        with caplog.at_level("WARNING"):
             open_gguf_reader(flat_pool_gguf)
             open_gguf_reader(flat_pool_gguf)
             open_gguf_reader(flat_pool_gguf)
@@ -365,7 +365,7 @@ class TestFingerprintOnFlatPool:
         classification (the stock reader would crash on this file before
         ever looking at shapes).
         """
-        with caplog.at_level("DEBUG", logger="ComfyUI_VibeVoice.modules.config_detect"):
+        with caplog.at_level("DEBUG"):
             fp = fingerprint_weights(flat_pool_gguf)
         assert fp is None
         # "foreign shape" is logged only after the header was successfully

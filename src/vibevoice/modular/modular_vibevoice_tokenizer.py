@@ -13,13 +13,11 @@ import torch.nn.functional as F
 from transformers.models.auto import AutoModel
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
 from transformers.modeling_utils import PreTrainedModel
 from transformers.activations import ACT2FN
 
 from .configuration_vibevoice import VibeVoiceAcousticTokenizerConfig, VibeVoiceSemanticTokenizerConfig
 
-logger = logging.get_logger(__name__)
 
 import os
 # Try to import APEX FusedRMSNorm

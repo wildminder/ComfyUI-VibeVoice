@@ -1,5 +1,7 @@
 """Tests for modules/device_utils.py - Device detection and management."""
 
+import logging
+
 import torch
 import pytest
 from unittest.mock import patch, MagicMock
@@ -143,22 +145,24 @@ class TestGetTorchDevice:
             device = get_torch_device(DEVICE_NPU)
             assert device.type == DEVICE_NPU
 
-    def test_mps_unavailable_falls_back_and_warns(self):
+    def test_mps_unavailable_falls_back_and_warns(self, caplog):
         with patch("ComfyUI_VibeVoice.modules.device_utils._get_model_management") as mock_mm, \
-             patch("torch.backends.mps.is_available", return_value=False), \
-             patch("ComfyUI_VibeVoice.modules.device_utils.logger") as mock_logger:
+             patch("torch.backends.mps.is_available", return_value=False):
             mock_mm.return_value.get_torch_device.return_value = torch.device("cuda")
-            device = get_torch_device(DEVICE_MPS)
+            with caplog.at_level(logging.WARNING):
+                device = get_torch_device(DEVICE_MPS)
             assert device.type == "cuda"
-            mock_logger.warning.assert_called()
+            assert any("mps" in r.getMessage() for r in caplog.records), caplog.records
 
-    def test_unknown_device_falls_back_and_warns(self):
-        with patch("ComfyUI_VibeVoice.modules.device_utils._get_model_management") as mock_mm, \
-             patch("ComfyUI_VibeVoice.modules.device_utils.logger") as mock_logger:
+    def test_unknown_device_falls_back_and_warns(self, caplog):
+        with patch("ComfyUI_VibeVoice.modules.device_utils._get_model_management") as mock_mm:
             mock_mm.return_value.get_torch_device.return_value = torch.device("cuda")
-            device = get_torch_device("something_weird")
+            with caplog.at_level(logging.WARNING):
+                device = get_torch_device("something_weird")
             assert device.type == "cuda"
-            mock_logger.warning.assert_called()
+            assert any(
+                "something_weird" in r.getMessage() for r in caplog.records
+            ), caplog.records
 
 
 class TestIsGpuDevice:

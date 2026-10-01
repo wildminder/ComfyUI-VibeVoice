@@ -35,7 +35,6 @@ import torch
 
 from .diagnostics import census_enabled
 
-logger = logging.getLogger(__name__)
 
 _FILE_SLICE_ATTR = "_comfy_tensor_file_slice"
 _MMAP_REFS_ATTR = "_comfy_tensor_mmap_refs"
@@ -90,7 +89,7 @@ def report_census(model, patcher=None, phase: str = "") -> dict:
     """Log one ``[vvcensus]`` line for ``model`` and return the census."""
     report = census(model, patcher)
     if census_enabled():
-        logger.info(format_census(report, phase=phase))
+        logging.info(f"[ComfyUI-VibeVoice] {format_census(report, phase=phase)}")
     return report
 
 
@@ -186,7 +185,7 @@ def _accumulate(report, tensors, group: str, family: str, seen: _Seen) -> None:
                 key = (storage.data_ptr(), nbytes)
             state = _classify(tensor, storage)
         except Exception:
-            logger.debug("census: unreadable storage, skipped", exc_info=True)
+            logging.debug("[ComfyUI-VibeVoice] census: unreadable storage, skipped", exc_info=True)
             continue
         if key in seen.storages:
             continue
@@ -381,10 +380,10 @@ def read_shape_profile(probe_bytes: int = 64 * 1024 * 1024) -> dict:
                 gc.collect()
                 time.sleep(0.05)
             except Exception:
-                logger.debug("read-shape probe arm failed: %s", shape, exc_info=True)
+                logging.debug("[ComfyUI-VibeVoice] read-shape probe arm failed: %s", shape, exc_info=True)
                 profile.setdefault(shape, {})
     except Exception:
-        logger.debug("read-shape probe failed", exc_info=True)
+        logging.debug("[ComfyUI-VibeVoice] read-shape probe failed", exc_info=True)
         profile = {}
     finally:
         if path is not None:
@@ -562,7 +561,7 @@ class RssSampler:
     def report(self, phase: str = "") -> str:
         line = self.line(phase)
         if census_enabled():
-            logger.info(line)
+            logging.info(f"[ComfyUI-VibeVoice] {line}")
         return line
 
 
@@ -596,6 +595,6 @@ def measured_load(phase: str, series: bool = False):
         try:
             sampler.report(phase)
             if sampler.series is not None:
-                logger.info(sampler.profile())
+                logging.debug(f"[ComfyUI-VibeVoice] {sampler.profile()}")
         except Exception:
-            logger.debug("measured_load report failed", exc_info=True)
+            logging.debug("[ComfyUI-VibeVoice] measured_load report failed", exc_info=True)

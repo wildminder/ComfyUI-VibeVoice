@@ -18,7 +18,6 @@ from .loader import VibeVoiceLoader, LOADED_MODELS_CACHE
 from .asr_loader import LOADED_ASR_MODELS_CACHE
 from .dtype_utils import cast_model_to_dtype, get_dtype_str, representative_dtype
 
-logger = logging.getLogger(__name__)
 
 
 def _init_legacy_attributes(patcher, model, attention_mode, dtype) -> None:
@@ -160,8 +159,8 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         target_device = self.load_device if device_to is None else device_to
 
         if self.model.model is None:
-            logger.info(
-                f"Loading VibeVoice models for '{self.model.model_pack_name}' to {target_device}..."
+            logging.info(
+                f"[ComfyUI-VibeVoice] Loading VibeVoice models for '{self.model.model_pack_name}' to {target_device}..."
             )
             mode_names = {
                 "eager": "Eager (Most Compatible)",
@@ -169,15 +168,15 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                 "flash_attention_2": "Flash Attention 2 (Fastest)",
                 "sage": "SageAttention (Quantized High-Performance)",
             }
-            logger.debug(f"Attention Mode: {mode_names.get(self.attention_mode, self.attention_mode)}")
+            logging.debug(f"[ComfyUI-VibeVoice] Attention Mode: {mode_names.get(self.attention_mode, self.attention_mode)}")
             self.model.load_model(target_device, attention_mode=self.attention_mode)
 
         # Apply dtype casting ONLY if the model's dtype differs from the target.
         if self.target_dtype is not None and self.model.model is not None:
             current_dtype = representative_dtype(self.model.model)
             if current_dtype != self.target_dtype:
-                logger.debug(
-                    f"Casting model to dtype: {self.target_dtype} "
+                logging.debug(
+                    f"[ComfyUI-VibeVoice] Casting model to dtype: {self.target_dtype} "
                     f"(current: {current_dtype})"
                 )
                 cast_model_to_dtype(self.model.model, self.target_dtype)
@@ -228,16 +227,16 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                     offload_target = self.offload_device
                 self.model.model = self.model.model.to(offload_target)
                 self._warm_offloaded = True
-                logger.debug(
-                    f"Warm offloading VibeVoice models for '{self.model.model_pack_name}' "
+                logging.debug(
+                    f"[ComfyUI-VibeVoice] Warm offloading VibeVoice models for '{self.model.model_pack_name}' "
                     f"({self.attention_mode}) to {offload_target} (tensors retained)..."
                 )
                 return super().unpatch_model(device_to, unpatch_weights=False, *args, **kwargs)
 
             if destroy:
                 # Destructive offload (explicit): null references and clear cache.
-                logger.debug(
-                    f"Destroying VibeVoice models for '{self.model.model_pack_name}' "
+                logging.debug(
+                    f"[ComfyUI-VibeVoice] Destroying VibeVoice models for '{self.model.model_pack_name}' "
                     f"({self.attention_mode}) (weights freed)..."
                 )
                 try:
@@ -245,7 +244,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
 
                     unregister_from_comfy(self)
                 except Exception as e:
-                    logger.warning(f"Could not unregister patcher from ComfyUI: {e}")
+                    logging.warning(f"[ComfyUI-VibeVoice] Could not unregister patcher from ComfyUI: {e}")
 
                 self.model.model = None
                 self.model.processor = None
@@ -253,7 +252,7 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
                 cache = self._model_cache
                 if self.cache_key in cache:
                     del cache[self.cache_key]
-                    logger.debug(f"Cleared model cache for: {self.cache_key}")
+                    logging.debug(f"[ComfyUI-VibeVoice] Cleared model cache for: {self.cache_key}")
 
                 gc.collect()
                 model_management.soft_empty_cache()
@@ -261,8 +260,8 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
 
             # Routine offload: keep the model in CPU RAM.
             self._warm_offloaded = False
-            logger.debug(
-                f"Offloading VibeVoice models for '{self.model.model_pack_name}' "
+            logging.debug(
+                f"[ComfyUI-VibeVoice] Offloading VibeVoice models for '{self.model.model_pack_name}' "
                 f"({self.attention_mode}) to {device_to} (weights kept in RAM)..."
             )
 
@@ -306,7 +305,7 @@ def dynamic_vram_available(patcher_cls, load_device) -> bool:
     try:
         device = torch.device(load_device)
     except (TypeError, ValueError, RuntimeError) as e:
-        logger.debug("Dynamic VRAM probe: unusable load_device %r (%s)", load_device, e)
+        logging.debug("[ComfyUI-VibeVoice] Dynamic VRAM probe: unusable load_device %r (%s)", load_device, e)
         return False
 
     if device.type != "cuda":
@@ -319,7 +318,7 @@ def dynamic_vram_available(patcher_cls, load_device) -> bool:
     try:
         return bool(is_dynamic(_PROBE_SENTINEL))
     except Exception as e:
-        logger.debug("Dynamic VRAM probe: is_dynamic() failed on %s (%s)", patcher_cls, e)
+        logging.debug("[ComfyUI-VibeVoice] Dynamic VRAM probe: is_dynamic() failed on %s (%s)", patcher_cls, e)
         return False
 
 
@@ -371,7 +370,7 @@ def make_dynamic_patcher_class(legacy_cls: type = VibeVoicePatcher) -> type:
             try:
                 return bool(self.loaded_size())
             except Exception as e:
-                logger.debug("Dynamic patcher is_loaded probe failed: %s", e)
+                logging.debug("[ComfyUI-VibeVoice] Dynamic patcher is_loaded probe failed: %s", e)
                 return False
 
         def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=False,
@@ -386,16 +385,16 @@ def make_dynamic_patcher_class(legacy_cls: type = VibeVoicePatcher) -> type:
             target_device = self.load_device if device_to is None else device_to
 
             if self.model.model is None:
-                logger.info(
-                    f"Loading VibeVoice models for '{self.model.model_pack_name}' to {target_device}..."
+                logging.info(
+                    f"[ComfyUI-VibeVoice] Loading VibeVoice models for '{self.model.model_pack_name}' to {target_device}..."
                 )
                 self.model.load_model(target_device, attention_mode=self.attention_mode)
 
             if self.target_dtype is not None and self.model.model is not None:
                 current_dtype = representative_dtype(self.model.model)
                 if current_dtype != self.target_dtype:
-                    logger.debug(
-                        f"Casting model to dtype: {self.target_dtype} (current: {current_dtype})"
+                    logging.debug(
+                        f"[ComfyUI-VibeVoice] Casting model to dtype: {self.target_dtype} (current: {current_dtype})"
                     )
                     cast_model_to_dtype(self.model.model, self.target_dtype)
 
@@ -411,15 +410,15 @@ def make_dynamic_patcher_class(legacy_cls: type = VibeVoicePatcher) -> type:
             if unpatch_weights and warm:
                 unpin_all = getattr(self, 'unpin_all_weights', None)
                 if callable(unpin_all):
-                    logger.debug(
-                        f"Warm offloading VibeVoice models for '{self.model.model_pack_name}' "
+                    logging.debug(
+                        f"[ComfyUI-VibeVoice] Warm offloading VibeVoice models for '{self.model.model_pack_name}' "
                         f"({self.attention_mode}) (pins released)..."
                     )
                     unpin_all()
 
             if unpatch_weights and destroy:
-                logger.debug(
-                    f"Destroying VibeVoice models for '{self.model.model_pack_name}' "
+                logging.debug(
+                    f"[ComfyUI-VibeVoice] Destroying VibeVoice models for '{self.model.model_pack_name}' "
                     f"({self.attention_mode}) (weights freed)..."
                 )
                 try:
@@ -427,7 +426,7 @@ def make_dynamic_patcher_class(legacy_cls: type = VibeVoicePatcher) -> type:
 
                     unregister_from_comfy(self)
                 except Exception as e:
-                    logger.warning(f"Could not unregister patcher from ComfyUI: {e}")
+                    logging.warning(f"[ComfyUI-VibeVoice] Could not unregister patcher from ComfyUI: {e}")
 
                 self.model.model = None
                 self.model.processor = None
@@ -435,7 +434,7 @@ def make_dynamic_patcher_class(legacy_cls: type = VibeVoicePatcher) -> type:
                 cache = self._model_cache
                 if self.cache_key in cache:
                     del cache[self.cache_key]
-                    logger.debug(f"Cleared model cache for: {self.cache_key}")
+                    logging.debug(f"[ComfyUI-VibeVoice] Cleared model cache for: {self.cache_key}")
 
                 gc.collect()
                 model_management.soft_empty_cache()

@@ -35,7 +35,6 @@ import torch.nn.functional as F
 
 from .diagnostics import diagnostics_enabled, vbar_observer_enabled
 
-logger = logging.getLogger(__name__)
 
 # Last device on which a streaming forward actually computed. Core streams
 # leaf weights via a cast buffer and never moves the underlying Parameter, so
@@ -232,8 +231,8 @@ def _log_conv_dtype_mismatch(module: nn.Module, x: torch.Tensor, w, b) -> None:
         f"{fr.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{fr.lineno} {fr.name}"
         for fr in reversed(traceback.extract_stack()[-15:-1])
     )
-    logger.warning(
-        "[vvdtype] conv dtype mismatch on %s(id=%x, layer_id=%s): x %s on %s "
+    logging.warning(
+        "[ComfyUI-VibeVoice] [vvdtype] conv dtype mismatch on %s(id=%x, layer_id=%s): x %s on %s "
         "dtype=%s | w %s dtype=%s | b %s dtype=%s | call chain (innermost last): %s",
         type(module).__name__, id(module) & 0xFFFFFF,
         getattr(module, "_layer_id", None),
@@ -468,8 +467,8 @@ def streaming_conversion(enabled: bool):
 def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
     """Swap eligible leaf-module classes for streaming subclasses in place."""
     if not _STREAMING_CONVERSION_ENABLED:
-        logger.debug(
-            "Streaming conversion bypassed: model will execute with native "
+        logging.debug(
+            "[ComfyUI-VibeVoice] Streaming conversion bypassed: model will execute with native "
             "resident PyTorch CUDA tensors."
         )
         return {}
@@ -481,7 +480,7 @@ def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
 
         register_vendored_types(register_streaming_type)
     except Exception as e:
-        logger.debug(f"vendored streaming types unavailable: {e}")
+        logging.debug(f"[ComfyUI-VibeVoice] vendored streaming types unavailable: {e}")
 
     skip_set = [root]
     skip_set.extend(skip)
@@ -514,14 +513,14 @@ def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
         census[kind] = census.get(kind, 0) + 1
 
     if unknown_with_params:
-        logger.warning(
-            "Streaming conversion skipped %d parameter-bearing module "
+        logging.warning(
+            "[ComfyUI-VibeVoice] Streaming conversion skipped %d parameter-bearing module "
             "kind(s) without a registered streaming forward: %s",
             len(unknown_with_params), unknown_with_params[:8],
         )
     if census:
-        logger.debug(
-            "Streaming-enabled %d module(s): %s",
+        logging.debug(
+            "[ComfyUI-VibeVoice] Streaming-enabled %d module(s): %s",
             sum(census.values()),
             ", ".join(f"{k}={v}" for k, v in sorted(census.items())),
         )

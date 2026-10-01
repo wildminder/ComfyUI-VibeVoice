@@ -34,7 +34,6 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "resample_audio",
@@ -233,8 +232,8 @@ def resample_audio_tensor(
                 beta=_KAISER_BETA,
             )
         except Exception as e:  # pragma: no cover - defensive fallthrough
-            logger.warning(
-                f"VibeVoice: torchaudio resample failed ({e}); falling back."
+            logging.warning(
+                f"[ComfyUI-VibeVoice] VibeVoice: torchaudio resample failed ({e}); falling back."
             )
 
     if _HAS_SCIPY:

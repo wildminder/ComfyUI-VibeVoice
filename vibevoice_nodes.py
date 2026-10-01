@@ -7,7 +7,6 @@ Main Node:
 - VibeVoiceTTSNode: Multi-speaker TTS synthesis with voice cloning
 """
 
-import logging
 from typing import List
 
 from comfy_api.latest import ComfyExtension, io
@@ -24,8 +23,6 @@ except ImportError:
         VibeVoiceASRNode,
         VibeVoiceExternalLoaderNode,
     )
-
-logger = logging.getLogger(__name__)
 
 
 class VibeVoiceExtension(ComfyExtension):

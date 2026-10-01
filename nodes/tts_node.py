@@ -39,8 +39,6 @@ from ..modules.device_utils import get_device_options
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 from ..modules.custom_types import VibeVoiceModel
 
-logger = logging.getLogger(__name__)
-
 VOICE_PRESET_HELP = (
     "Official cached .pt voice prompt required by realtime models. Place "
     "prompts in models/tts/VibeVoice/voices (or another registered "
@@ -77,7 +75,9 @@ class VibeVoiceTTSNode(io.ComfyNode):
         try:
             voice_preset_options = [PRESET_NONE, *list_voice_presets().keys()]
         except Exception as exc:
-            logger.warning("Could not discover realtime voice presets: %s", exc)
+            logging.warning(
+                "[ComfyUI-VibeVoice] Could not discover realtime voice presets: %s", exc
+            )
             voice_preset_options = [PRESET_NONE]
 
         available_devices = get_device_options()
@@ -342,9 +342,9 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 "with the VibeVoice realtime processor."
             )
         if family == "tts" and loaded_classification == "realtime":
-            logger.warning(
-                "Model '%s' was classified as standard TTS by name but loaded "
-                "realtime classes; routing through the realtime path.",
+            logging.warning(
+                "[ComfyUI-VibeVoice] Model '%s' was classified as standard TTS by name but "
+                "loaded realtime classes; routing through the realtime path.",
                 model_name,
             )
             family = "streaming_tts"
@@ -400,7 +400,9 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 "sample_rate": sample_rate,
             }
 
-            logger.info(f"Audio generation complete. Sample rate: {sample_rate}Hz")
+            logging.info(
+                f"[ComfyUI-VibeVoice] Audio generation complete. Sample rate: {sample_rate}Hz"
+            )
 
             if force_offload:
                 force_offload_model(patcher, model_name, warm=False)
@@ -408,13 +410,16 @@ class VibeVoiceTTSNode(io.ComfyNode):
             return io.NodeOutput(output_audio, ui=ui.PreviewAudio(output_audio, cls=cls))
 
         except model_management.InterruptProcessingException:
-            logger.info("VibeVoice TTS generation was cancelled")
+            logging.info("[ComfyUI-VibeVoice] VibeVoice TTS generation was cancelled")
             return io.NodeOutput(cls._silent_output())
 
         except Exception as e:
-            logger.error(f"Error during VibeVoice generation with {attention_mode} attention: {e}")
+            logging.error(
+                f"[ComfyUI-VibeVoice] Error during VibeVoice generation with "
+                f"{attention_mode} attention: {e}"
+            )
             if "interrupt" in str(e).lower() or "cancel" in str(e).lower():
-                logger.info("Generation was interrupted")
+                logging.info("[ComfyUI-VibeVoice] Generation was interrupted")
                 return io.NodeOutput(cls._silent_output())
             raise
 
@@ -507,17 +512,17 @@ class VibeVoiceTTSNode(io.ComfyNode):
                 speaker_4_voice,
             )
         ):
-            logger.warning(
-                "Speaker reference audio is ignored for realtime models: the "
-                "VibeVoice realtime architecture is single-speaker and uses "
+            logging.warning(
+                "[ComfyUI-VibeVoice] Speaker reference audio is ignored for realtime "
+                "models: the VibeVoice realtime architecture is single-speaker and uses "
                 "the selected 'voice_preset' cached prompt."
             )
 
         if do_sample or temperature != 0.95 or top_p != 0.95 or top_k != 0:
-            logger.warning(
-                "Sampling controls (do_sample/temperature/top_p/top_k) are not "
-                "used by the current realtime generation loop; model defaults "
-                "are used instead."
+            logging.warning(
+                "[ComfyUI-VibeVoice] Sampling controls "
+                "(do_sample/temperature/top_p/top_k) are not used by the current "
+                "realtime generation loop; model defaults are used instead."
             )
 
         cached_voice_preset = get_cached_voice_preset(

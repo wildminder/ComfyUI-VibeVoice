@@ -32,7 +32,6 @@ from .gguf_quant import log_gguf_forward_counters
 from .memory_census import measured_load, report_census
 from .diagnostics import diagnostics_enabled
 
-logger = logging.getLogger(__name__)
 
 
 def resolve_generation_family(
@@ -101,8 +100,8 @@ class ExternalVibeVoiceModelHandler(torch.nn.Module):
 
     def load_model(self, device, attention_mode: str = "sdpa"):
         """No-op: the model is already loaded."""
-        logger.debug(
-            f"ExternalVibeVoiceModelHandler.load_model called but model is "
+        logging.debug(
+            f"[ComfyUI-VibeVoice] ExternalVibeVoiceModelHandler.load_model called but model is "
             f"already loaded for '{self.model_pack_name}'"
         )
 
@@ -187,8 +186,8 @@ def load_vibevoice_from_external(
             dtype=target_dtype,
         )
         VIBEVOICE_PATCHER_CACHE[cache_key] = patcher
-        logger.debug(
-            f"Created new external patcher for {model_name} with "
+        logging.debug(
+            f"[ComfyUI-VibeVoice] Created new external patcher for {model_name} with "
             f"attn={actual_attention_mode}"
         )
 
@@ -256,7 +255,7 @@ def load_vibevoice_model(
             dtype=target_dtype,
         )
         VIBEVOICE_PATCHER_CACHE[cache_key] = patcher
-        logger.debug(f"Created new patcher for {model_name} with attn={actual_attention_mode}, q4={quantize_4bit}")
+        logging.debug(f"[ComfyUI-VibeVoice] Created new patcher for {model_name} with attn={actual_attention_mode}, q4={quantize_4bit}")
 
     patcher = VIBEVOICE_PATCHER_CACHE[cache_key]
 
@@ -314,12 +313,12 @@ def generate_audio(
         if processed is not None:
             processed = np.asarray(processed, dtype=np.float32)
             if processed.ndim == 0:
-                logger.warning("Voice sample is a scalar (0-d array), skipping")
+                logging.warning("[ComfyUI-VibeVoice] Voice sample is a scalar (0-d array), skipping")
                 continue
             if processed.ndim > 1:
                 processed = np.squeeze(processed)
             if processed.ndim != 1:
-                logger.warning(f"Voice sample has unexpected shape {processed.shape}, skipping")
+                logging.warning(f"[ComfyUI-VibeVoice] Voice sample has unexpected shape {processed.shape}, skipping")
                 continue
             voice_samples_np.append(processed)
 
@@ -347,7 +346,7 @@ def generate_audio(
     for key, value in inputs.items():
         if isinstance(value, torch.Tensor):
             if torch.any(torch.isnan(value)) or torch.any(torch.isinf(value)):
-                logger.error(f"Input tensor '{key}' contains NaN or Inf values")
+                logging.error(f"[ComfyUI-VibeVoice] Input tensor '{key}' contains NaN or Inf values")
                 raise ValueError(f"Invalid values in input tensor: {key}")
 
     compute_device = model_management.get_torch_device()
@@ -392,10 +391,10 @@ def generate_audio(
                 outputs = model.generate(**gen_inputs, progress_callback=_progress)
                 _rss.mark("gen-return")
             if diagnostics_enabled():
-                logger.info(pull_stats_line())
+                logging.info(f"[ComfyUI-VibeVoice] {pull_stats_line()}")
 
         except model_management.InterruptProcessingException:
-            logger.info("VibeVoice generation interrupted by user")
+            logging.info("[ComfyUI-VibeVoice] VibeVoice generation interrupted by user")
             raise
         finally:
             pbar.update_absolute(pbar.total)
@@ -425,7 +424,7 @@ def generate_audio(
 
 def force_offload_model(patcher: VibeVoicePatcher, model_name: str, warm: bool = False) -> None:
     """Force offload a VibeVoice model from VRAM."""
-    logger.info(f"Force offloading VibeVoice model '{model_name}' from VRAM...")
+    logging.info(f"[ComfyUI-VibeVoice] Force offloading VibeVoice model '{model_name}' from VRAM...")
     if patcher.is_loaded:
         if warm:
             patcher.unpatch_model(unpatch_weights=True, warm=True)
@@ -434,4 +433,4 @@ def force_offload_model(patcher: VibeVoicePatcher, model_name: str, warm: bool =
     model_management.unload_all_models()
     gc.collect()
     model_management.soft_empty_cache()
-    logger.info("Model force offload completed")
+    logging.info("[ComfyUI-VibeVoice] Model force offload completed")

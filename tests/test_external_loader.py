@@ -702,7 +702,7 @@ class TestWarnIfLowbitQuantization:
         specs = [(f"model.layers.{i}.weight", "I8", [16, 16]) for i in range(10)]
         path = _write_safetensors_header(tmp_path / "naive.safetensors", specs)
 
-        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+        with caplog.at_level(logging.WARNING):
             warn_if_lowbit_quantization(path)
 
         assert any("NO dequantization scale" in r.message for r in caplog.records)
@@ -713,7 +713,7 @@ class TestWarnIfLowbitQuantization:
         specs += [(f"model.layers.{i}.weight_scale", "BF16", [16]) for i in range(10)]
         path = _write_safetensors_header(tmp_path / "proper.safetensors", specs)
 
-        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+        with caplog.at_level(logging.WARNING):
             warn_if_lowbit_quantization(path)
 
         assert not any("naive int cast" in r.message for r in caplog.records)
@@ -723,7 +723,7 @@ class TestWarnIfLowbitQuantization:
         specs = [(f"model.layers.{i}.weight", "BF16", [16, 16]) for i in range(10)]
         path = _write_safetensors_header(tmp_path / "fp.safetensors", specs)
 
-        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+        with caplog.at_level(logging.WARNING):
             warn_if_lowbit_quantization(path)
 
         assert not any("naive int cast" in r.message for r in caplog.records)
@@ -741,7 +741,7 @@ class TestWarnIfLowbitQuantization:
 
         gguf_path = str(tmp_path / "lowbit.gguf")
         with patch("gguf.GGUFReader", return_value=fake_reader), \
-             caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+             caplog.at_level(logging.WARNING):
             warn_if_lowbit_quantization(gguf_path)
 
         assert any("sub-4-bit" in r.message for r in caplog.records)
@@ -758,7 +758,7 @@ class TestWarnIfLowbitQuantization:
 
         gguf_path = str(tmp_path / "highbit.gguf")
         with patch("gguf.GGUFReader", return_value=fake_reader), \
-             caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+             caplog.at_level(logging.WARNING):
             warn_if_lowbit_quantization(gguf_path)
 
         assert not any("sub-4-bit" in r.message for r in caplog.records)
@@ -767,7 +767,7 @@ class TestWarnIfLowbitQuantization:
         """An unrecognized extension must be a no-op (no crash, no warning)."""
         path = tmp_path / "model.bin"
         path.write_bytes(b"")
-        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"):
+        with caplog.at_level(logging.WARNING):
             warn_if_lowbit_quantization(str(path))
         assert not any("naive int cast" in r.message for r in caplog.records)
 
@@ -814,9 +814,7 @@ class TestReconcileConfig:
         assert (name, changed) == ("VibeVoice-1.5B", False)
 
     def test_mismatch_swaps_to_detected_family(self, caplog):
-        with caplog.at_level(
-            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.WARNING):
             name, changed = reconcile_config(
                 "VibeVoice-1.5B", _cfg_stub(1536, 151936), _FP_7B
             )
@@ -825,9 +823,7 @@ class TestReconcileConfig:
         assert any("VibeVoice-7B" in r.message for r in caplog.records)
 
     def test_mismatch_reverse_direction(self, caplog):
-        with caplog.at_level(
-            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.WARNING):
             name, changed = reconcile_config(
                 "VibeVoice-7B", _cfg_stub(3584, 152064), _FP_15B
             )
@@ -840,9 +836,7 @@ class TestReconcileConfig:
         assert (name, changed) == ("VibeVoice-Realtime-0.5B", False)
 
     def test_no_warning_when_matching(self, caplog):
-        with caplog.at_level(
-            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.WARNING):
             reconcile_config("VibeVoice-7B", _cfg_stub(3584, 152064), _FP_7B)
         assert not any("Config mismatch" in r.message for r in caplog.records)
 
@@ -962,9 +956,7 @@ class TestLoaderReconciliationWiring:
         return result, resolve_calls
 
     def test_mismatched_selection_is_swapped(self, weight_file, caplog):
-        with caplog.at_level(
-            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.WARNING):
             result, resolve_calls = self._run(
                 weight_file, "VibeVoice-1.5B", _FP_7B
             )
@@ -974,9 +966,7 @@ class TestLoaderReconciliationWiring:
         assert any("Config mismatch" in r.message for r in caplog.records)
 
     def test_matching_selection_not_swapped(self, weight_file, caplog):
-        with caplog.at_level(
-            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.WARNING):
             result, resolve_calls = self._run(
                 weight_file, "VibeVoice-1.5B", _FP_15B
             )
@@ -991,9 +981,7 @@ class TestLoaderReconciliationWiring:
 
     def test_sidecar_config_mismatch_still_swapped(self, weight_file, caplog):
         """A sidecar-resolved config is not exempt: fingerprint wins (D5)."""
-        with caplog.at_level(
-            logging.WARNING, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.WARNING):
             result, resolve_calls = self._run(
                 weight_file, "VibeVoice-7B", _FP_15B
             )
@@ -1038,9 +1026,7 @@ class TestResolveAutoConfigName:
         return str(weight)
 
     def test_conclusive_fingerprint_returns_family(self, weight_file, caplog):
-        with caplog.at_level(
-            logging.DEBUG, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.DEBUG):
             name = resolve_auto_config_name(weight_file, weights_fp=_FP_7B)
         assert name == "VibeVoice-7B"
         assert any("Auto-detected" in r.message for r in caplog.records)
@@ -1122,9 +1108,7 @@ class TestAutoDetectLoaderSemantics:
 
     def test_auto_adopts_detected_family(self, weight_file, caplog):
         harness = TestLoaderReconciliationWiring()
-        with caplog.at_level(
-            logging.DEBUG, logger="ComfyUI_VibeVoice.modules.external_loader"
-        ):
+        with caplog.at_level(logging.DEBUG):
             result, resolve_calls = harness._run(
                 weight_file, AUTO_CONFIG_NAME, _FP_7B
             )

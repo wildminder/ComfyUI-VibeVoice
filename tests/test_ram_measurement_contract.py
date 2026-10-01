@@ -171,8 +171,7 @@ class TestMeasuredLoadContract:
 
     def test_yields_a_sampler_and_logs_on_exit(self, caplog, monkeypatch):
         monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
-        with caplog.at_level(logging.INFO,
-                             logger="ComfyUI_VibeVoice.modules.memory_census"):
+        with caplog.at_level(logging.INFO):
             with measured_load("phase-under-test") as sampler:
                 assert isinstance(sampler, RssSampler)
                 sampler.mark("mid")
@@ -182,8 +181,7 @@ class TestMeasuredLoadContract:
     def test_reports_even_when_the_body_raises(self, caplog, monkeypatch):
         """A failed load still reached a peak; that peak is the evidence."""
         monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
-        with caplog.at_level(logging.INFO,
-                             logger="ComfyUI_VibeVoice.modules.memory_census"):
+        with caplog.at_level(logging.INFO):
             with pytest.raises(ValueError):
                 with measured_load("phase-that-fails"):
                     raise ValueError("boom")
@@ -193,8 +191,7 @@ class TestMeasuredLoadContract:
     def test_respects_the_env_gate(self, monkeypatch, caplog):
         monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
         monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", "0")
-        with caplog.at_level(logging.INFO,
-                             logger="ComfyUI_VibeVoice.modules.memory_census"):
+        with caplog.at_level(logging.INFO):
             with measured_load("silenced"):
                 pass
         assert "[vvrss]" not in caplog.text

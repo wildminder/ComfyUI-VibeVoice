@@ -8,7 +8,6 @@ import torch
 import logging
 from typing import List
 
-logger = logging.getLogger(__name__)
 
 # Lazy import to avoid circular dependencies
 _model_management = None
@@ -128,23 +127,23 @@ def get_torch_device(device_type: str = None) -> torch.device:
     if device_type == DEVICE_MPS:
         if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             return torch.device(DEVICE_MPS)
-        logger.warning("Device 'mps' requested but not available; using default device.")
+        logging.warning("[ComfyUI-VibeVoice] Device 'mps' requested but not available; using default device.")
         return mm.get_torch_device()
 
     if device_type == DEVICE_XPU:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return torch.device(DEVICE_XPU)
-        logger.warning("Device 'xpu' requested but not available; using default device.")
+        logging.warning("[ComfyUI-VibeVoice] Device 'xpu' requested but not available; using default device.")
         return mm.get_torch_device()
 
     if device_type == DEVICE_NPU:
         if hasattr(torch, "npu") and torch.npu.is_available():
             return torch.device(DEVICE_NPU)
-        logger.warning("Device 'npu' requested but not available; using default device.")
+        logging.warning("[ComfyUI-VibeVoice] Device 'npu' requested but not available; using default device.")
         return mm.get_torch_device()
 
     # Unknown device type — fall back to ComfyUI's default.
-    logger.warning(f"Device '{device_type}' not available; using default device.")
+    logging.warning(f"[ComfyUI-VibeVoice] Device '{device_type}' not available; using default device.")
     return mm.get_torch_device()
 
 

@@ -29,8 +29,6 @@ from ..modules.device_utils import get_available_devices
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
 from ..modules.attention_utils import get_available_attention_modes, check_dtype_attention_compatible
 
-logger = logging.getLogger(__name__)
-
 
 class VibeVoiceASRNode(io.ComfyNode):
     """VibeVoice ASR node for speech-to-text transcription.
@@ -283,7 +281,7 @@ class VibeVoiceASRNode(io.ComfyNode):
             # Format segments as JSON string
             segments_json = json.dumps(segments, indent=2, ensure_ascii=False)
 
-            logger.info(f"ASR transcription complete. {len(segments)} segments.")
+            logging.info(f"[ComfyUI-VibeVoice] ASR transcription complete. {len(segments)} segments.")
 
             if force_offload:
                 force_offload_asr_model(model_name, patcher)
@@ -291,9 +289,9 @@ class VibeVoiceASRNode(io.ComfyNode):
             return io.NodeOutput(raw_text, segments_json)
 
         except model_management.InterruptProcessingException:
-            logger.info("VibeVoice ASR transcription was cancelled")
+            logging.info("[ComfyUI-VibeVoice] VibeVoice ASR transcription was cancelled")
             return io.NodeOutput("", "[]")
 
         except Exception as e:
-            logger.error(f"Error during VibeVoice ASR transcription: {e}")
+            logging.error(f"[ComfyUI-VibeVoice] Error during VibeVoice ASR transcription: {e}")
             raise

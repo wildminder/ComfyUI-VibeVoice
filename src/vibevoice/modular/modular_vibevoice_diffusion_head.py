@@ -9,12 +9,8 @@ from transformers.models.auto import AutoModel
 from transformers.modeling_utils import PreTrainedModel
 # from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.activations import ACT2FN
-from transformers.utils import logging
 
 from .configuration_vibevoice import VibeVoiceDiffusionHeadConfig
-
-
-logger = logging.get_logger(__name__)
 
 
 class RMSNorm(nn.Module):

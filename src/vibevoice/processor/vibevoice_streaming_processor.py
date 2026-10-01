@@ -8,10 +8,10 @@ import numpy as np
 import torch
 
 from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTokenizedInput, TextInput, TruncationStrategy
-from transformers.utils import TensorType, logging
+from transformers.utils import TensorType
+import logging
 from .vibevoice_tokenizer_processor import AudioNormalizer
 
-logger = logging.get_logger(__name__)
 
 
 class VibeVoiceStreamingProcessor:
@@ -78,8 +78,8 @@ class VibeVoiceStreamingProcessor:
                 with open(config_file, 'r') as f:
                     config = json.load(f)
             except Exception as e:
-                logger.warning(f"Could not load preprocessor_config.json from {pretrained_model_name_or_path}: {e}")
-                logger.warning("Using default configuration")
+                logging.warning(f"[ComfyUI-VibeVoice] Could not load preprocessor_config.json from {pretrained_model_name_or_path}: {e}")
+                logging.warning("[ComfyUI-VibeVoice] Using default configuration")
                 config = {
                     "speech_tok_compress_ratio": 3200,
                     "db_normalize": True,
@@ -91,7 +91,7 @@ class VibeVoiceStreamingProcessor:
         
         # Load tokenizer - try from model path first, then fall back to Qwen        
         language_model_pretrained_name = config.get("language_model_pretrained_name", None) or kwargs.pop("language_model_pretrained_name", "Qwen/Qwen2.5-1.5B")
-        logger.info(f"Loading tokenizer from {language_model_pretrained_name}")
+        logging.info(f"[ComfyUI-VibeVoice] Loading tokenizer from {language_model_pretrained_name}")
         if 'qwen' in language_model_pretrained_name.lower():
             tokenizer = VibeVoiceTextTokenizerFast.from_pretrained(
                 language_model_pretrained_name,
@@ -154,7 +154,7 @@ class VibeVoiceStreamingProcessor:
         with open(config_path, 'w') as f:
             json.dump(processor_config, f, indent=2)
         
-        logger.info(f"Processor configuration saved in {config_path}")
+        logging.debug(f"[ComfyUI-VibeVoice] Processor configuration saved in {config_path}")
     
     def __call__(self) -> BatchEncoding:
         """

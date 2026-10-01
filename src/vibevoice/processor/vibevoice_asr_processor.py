@@ -12,7 +12,8 @@ import numpy as np
 import torch
 
 from transformers.tokenization_utils_base import BatchEncoding
-from transformers.utils import TensorType, logging
+from transformers.utils import TensorType
+import logging
 from .vibevoice_tokenizer_processor import VibeVoiceTokenizerProcessor, AudioNormalizer
 from ....modules.audio_utils import resample_audio
 from ....modules import audio_backend
@@ -24,7 +25,6 @@ except ImportError:
     HAS_FFMPEG_UTILS = False
     warnings.warn("audio_utils not available; the audio backend (PyAV/soundfile) handles file loading")
 
-logger = logging.get_logger(__name__)
 
 SYSTEM_PROMPT = "You are a helpful assistant that transcribes audio input into text output in JSON format."
 
@@ -170,8 +170,8 @@ class VibeVoiceASRProcessor:
                 with open(config_file, 'r') as f:
                     config = json.load(f)
             except Exception as e:
-                logger.warning(f"Could not load preprocessor_config.json: {e}")
-                logger.warning("Using default configuration")
+                logging.warning(f"[ComfyUI-VibeVoice] Could not load preprocessor_config.json: {e}")
+                logging.warning("[ComfyUI-VibeVoice] Using default configuration")
         
         # Extract parameters
         speech_tok_compress_ratio = config.get("speech_tok_compress_ratio", 3200)
@@ -193,12 +193,12 @@ class VibeVoiceASRProcessor:
         if explicit_name and explicit_name != language_model_pretrained_name:
             # Dropping it silently surfaces much later as a vocabulary
             # mismatch, by which point the argument looks like it was honoured.
-            logger.warning(
-                f"ignoring language_model_pretrained_name={explicit_name!r}: "
+            logging.warning(
+                f"[ComfyUI-VibeVoice] ignoring language_model_pretrained_name={explicit_name!r}: "
                 f"loading the tokenizer from {language_model_pretrained_name}, "
                 + ("which ships its own tokenizer files" if own_tokenizer
                    else "as named in preprocessor_config.json"))
-        logger.info(f"Loading tokenizer from {language_model_pretrained_name}")
+        logging.info(f"[ComfyUI-VibeVoice] Loading tokenizer from {language_model_pretrained_name}")
 
         if own_tokenizer or 'qwen' in str(language_model_pretrained_name).lower():
             tokenizer = VibeVoiceASRTextTokenizerFast.from_pretrained(
@@ -256,7 +256,7 @@ class VibeVoiceASRProcessor:
         with open(config_path, 'w') as f:
             json.dump(processor_config, f, indent=2)
         
-        logger.info(f"Processor configuration saved in {config_path}")
+        logging.debug(f"[ComfyUI-VibeVoice] Processor configuration saved in {config_path}")
     
     def __call__(
         self,
@@ -626,11 +626,11 @@ class VibeVoiceASRProcessor:
             return cleaned_result
             
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON from transcription: {e}")
-            logger.debug(f"Raw text: {text}")
+            logging.warning(f"[ComfyUI-VibeVoice] Failed to parse JSON from transcription: {e}")
+            logging.debug(f"[ComfyUI-VibeVoice] Raw text: {text}")
             return []
         except Exception as e:
-            logger.warning(f"Error post-processing transcription: {e}")
+            logging.warning(f"[ComfyUI-VibeVoice] Error post-processing transcription: {e}")
             return []
     
     @property

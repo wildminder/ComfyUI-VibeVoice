@@ -430,9 +430,7 @@ class TestUnifiedTTSNodeLoadedPairSafety:
             "ComfyUI_VibeVoice.nodes.tts_node.generate_audio"
         ) as standard, patch(
             "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
-        ), caplog.at_level(
-            logging.WARNING, logger="ComfyUI_VibeVoice.nodes.tts_node"
-        ):
+        ), caplog.at_level(logging.WARNING):
             VibeVoiceTTSNode.execute(
                 **_kwargs(
                     model_name="my-local-copy",
@@ -494,7 +492,7 @@ class TestUnifiedTTSNodeWarnings:
             return_value=(torch.zeros(1, 1, 8), 24000),
         ), patch(
             "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
-        ), caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.nodes.tts_node"):
+        ), caplog.at_level(logging.WARNING):
             VibeVoiceTTSNode.execute(
                 **_kwargs(
                     model_name="VibeVoice-Realtime-0.5B",
@@ -524,7 +522,7 @@ class TestUnifiedTTSNodeWarnings:
             return_value=(torch.zeros(1, 1, 8), 24000),
         ) as realtime, patch(
             "ComfyUI_VibeVoice.nodes.tts_node.ui.PreviewAudio", MagicMock()
-        ), caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.nodes.tts_node"):
+        ), caplog.at_level(logging.WARNING):
             VibeVoiceTTSNode.execute(
                 **_kwargs(
                     model_name="VibeVoice-Realtime-0.5B",

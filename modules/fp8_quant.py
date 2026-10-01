@@ -30,7 +30,6 @@ from .convrot_quant import (
     resolve_orig_dtype,
 )
 
-logger = logging.getLogger(__name__)
 
 FP8_DEQUANT_CAPABILITY = "dequantize_per_tensor_fp8"
 

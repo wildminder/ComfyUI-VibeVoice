@@ -53,6 +53,20 @@ def _patch_model_management():
     return patch("ComfyUI_VibeVoice.modules.generation.model_management", mm)
 
 
+def _prefixed(caplog):
+    """Only this package's own lines.
+
+    ``caplog.at_level`` without a ``logger=`` pin captures root, so unrelated
+    library chatter is in ``caplog.records`` too. Every line this node emits
+    starts with the package prefix, which is also what proves the prefix is
+    actually on the record.
+    """
+    return "\n".join(
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("[ComfyUI-VibeVoice]")
+    )
+
+
 def _bump_both_counters():
     """One resident forward + one hook-forced (streamed) forward."""
     G.reset_gguf_forward_counters()
@@ -129,7 +143,7 @@ class TestLoadLineNoLongerFakesACounter:
     def test_load_diagnostics_line_omits_forward_counters(self, caplog, monkeypatch):
         monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         _bump_both_counters()
-        with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.external_loader"):
+        with caplog.at_level(logging.INFO):
             _log_load_diagnostics(
                 config_name="VibeVoice-7B",
                 requested_attention_mode="eager",
@@ -137,7 +151,7 @@ class TestLoadLineNoLongerFakesACounter:
                 weight_family="gguf",
                 load_device=torch.device("cpu"),
             )
-        line = "\n".join(r.getMessage() for r in caplog.records)
+        line = _prefixed(caplog)
         assert "gguf_forward" not in line, (
             "forward counters read at LOAD time are always 0 and read as "
             "'the hook path is not firing'; they are reported after generation"
@@ -152,9 +166,9 @@ class TestPostForwardReport:
     def test_reports_counts_after_forwards(self, caplog, monkeypatch):
         monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         _bump_both_counters()
-        with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.gguf_quant"):
+        with caplog.at_level(logging.INFO):
             G.log_gguf_forward_counters("tts_generate")
-        line = "\n".join(r.getMessage() for r in caplog.records)
+        line = _prefixed(caplog)
         assert "gguf_forward_fast=1" in line
         assert "gguf_forward_streamed=1" in line
         assert "tts_generate" in line
@@ -163,7 +177,7 @@ class TestPostForwardReport:
         """With no env var set the counters must not reach the console."""
         monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
         _bump_both_counters()
-        with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.gguf_quant"):
+        with caplog.at_level(logging.INFO):
             G.log_gguf_forward_counters("tts_generate")
         assert not [r for r in caplog.records
                     if "GGUF forward diagnostics" in r.getMessage()]
@@ -171,7 +185,7 @@ class TestPostForwardReport:
     def test_silent_when_no_gguf_forward_happened(self, caplog):
         """A non-GGUF model must not get a meaningless line per generation."""
         G.reset_gguf_forward_counters()
-        with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.gguf_quant"):
+        with caplog.at_level(logging.INFO):
             G.log_gguf_forward_counters("tts_generate")
         assert not [r for r in caplog.records if "GGUF forward diagnostics" in r.getMessage()]
 

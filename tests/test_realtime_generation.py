@@ -403,7 +403,7 @@ class TestRealtimeCfgScaleFloor:
 
     def test_adapter_warns_only_when_it_actually_adjusts(self, caplog):
         model, processor = _pair()
-        with caplog.at_level("WARNING", logger=realtime_generation.logger.name):
+        with caplog.at_level("WARNING"):
             _run(model, processor, cfg_scale=1.0)
         assert any(
             "cfg_scale" in r.message and "raised" in r.message
@@ -412,7 +412,7 @@ class TestRealtimeCfgScaleFloor:
 
         caplog.clear()
         model, processor = _pair()
-        with caplog.at_level("WARNING", logger=realtime_generation.logger.name):
+        with caplog.at_level("WARNING"):
             _run(model, processor, cfg_scale=1.6)
         assert not any(
             "has been raised" in r.message for r in caplog.records
@@ -442,7 +442,7 @@ class TestTruncationIsReported:
 
     def test_warns_when_the_budget_ran_out(self, caplog):
         model, processor = self._pair_with(self._output(True))
-        with caplog.at_level("WARNING", logger=realtime_generation.logger.name):
+        with caplog.at_level("WARNING"):
             _run(model, processor)
         assert any(
             "without the model signalling end of speech" in r.message
@@ -451,7 +451,7 @@ class TestTruncationIsReported:
 
     def test_quiet_when_the_model_finished_on_its_own(self, caplog):
         model, processor = self._pair_with(self._output(False))
-        with caplog.at_level("WARNING", logger=realtime_generation.logger.name):
+        with caplog.at_level("WARNING"):
             _run(model, processor)
         assert not any(
             "without the model signalling end of speech" in r.message

@@ -8,7 +8,6 @@ import torch
 import logging
 from typing import Optional
 
-logger = logging.getLogger(__name__)
 
 # Try to import sageattention
 try:
@@ -73,8 +72,8 @@ def check_sage_attention_compatible() -> bool:
         return False
     arch = f"sm{sage_arch_code()}"
     if arch not in SAGE_SUPPORTED_ARCHS:
-        logger.warning(
-            f"Your GPU (compute capability {torch.cuda.get_device_capability()[0]}."
+        logging.warning(
+            f"[ComfyUI-VibeVoice] Your GPU (compute capability {torch.cuda.get_device_capability()[0]}."
             f"{torch.cuda.get_device_capability()[1]}, {arch}) is not one of the "
             f"architectures SageAttention ships kernels for "
             f"({', '.join(sorted(SAGE_SUPPORTED_ARCHS))}). "
@@ -147,29 +146,29 @@ def resolve_attention_mode(
     mode = requested_mode
 
     if quantize_4bit and mode in ["eager", "flash_attention_2"]:
-        logger.warning(
-            f"Attention mode '{mode}' is not recommended with 4-bit quantization. "
+        logging.warning(
+            f"[ComfyUI-VibeVoice] Attention mode '{mode}' is not recommended with 4-bit quantization. "
             f"Falling back to 'sdpa' for stability and performance."
         )
         mode = "sdpa"
 
     if mode == "flash_attention_2" and not check_flash_attention_available():
-        logger.warning(
-            f"flash_attention_2 is not available on this hardware; "
+        logging.warning(
+            f"[ComfyUI-VibeVoice] flash_attention_2 is not available on this hardware; "
             f"falling back to 'sdpa'."
         )
         mode = "sdpa"
 
     if mode == "sage" and not check_sage_attention_compatible():
-        logger.warning(
-            f"sage is not usable on this machine (SageAttention missing, no "
+        logging.warning(
+            f"[ComfyUI-VibeVoice] sage is not usable on this machine (SageAttention missing, no "
             f"CUDA device, or an unsupported GPU architecture); "
             f"falling back to 'sdpa'."
         )
         mode = "sdpa"
 
     if mode not in ATTENTION_MODES:
-        logger.warning(f"Unknown attention mode '{mode}', falling back to eager")
+        logging.warning(f"[ComfyUI-VibeVoice] Unknown attention mode '{mode}', falling back to eager")
         mode = "eager"
 
     return mode
@@ -250,8 +249,8 @@ def resolve_realtime_attention_mode(attention_mode: str) -> str:
     reason = REALTIME_EXCLUDED_ATTENTION_MODES.get(attention_mode)
     if reason is None:
         return attention_mode
-    logger.warning(
-        "Attention mode '%s' is not used for realtime (VibeVoice-Realtime) "
+    logging.warning(
+        "[ComfyUI-VibeVoice] Attention mode '%s' is not used for realtime (VibeVoice-Realtime) "
         "models: %s. Falling back to '%s' for this load. The standard TTS "
         "family is unaffected.",
         attention_mode,
@@ -314,8 +313,8 @@ def resolve_asr_attention_mode(attention_mode: str) -> str:
     reason = ASR_EXCLUDED_ATTENTION_MODES.get(attention_mode)
     if reason is None:
         return attention_mode
-    logger.warning(
-        "Attention mode '%s' is not used for ASR models: %s. Falling back to "
+    logging.warning(
+        "[ComfyUI-VibeVoice] Attention mode '%s' is not used for ASR models: %s. Falling back to "
         "'%s' for this load. The TTS family is unaffected.",
         attention_mode,
         reason,

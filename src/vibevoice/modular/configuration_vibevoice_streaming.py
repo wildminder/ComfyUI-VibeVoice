@@ -2,13 +2,10 @@
 
 import torch
 from transformers.configuration_utils import PretrainedConfig 
-from transformers.utils import logging
 
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
 from .configuration_vibevoice import VibeVoiceAcousticTokenizerConfig, VibeVoiceDiffusionHeadConfig, _convert_dtype_to_string
-
-logger = logging.get_logger(__name__)
 
 
 class VibeVoiceStreamingConfig(PretrainedConfig):

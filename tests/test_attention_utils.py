@@ -273,8 +273,7 @@ class TestResolveAttentionModeHonoursSageAvailability:
                    return_value=False), \
              patch("ComfyUI_VibeVoice.modules.attention_utils.ATTENTION_MODES",
                    self._WITH_SAGE), \
-             caplog.at_level("WARNING",
-                             logger="ComfyUI_VibeVoice.modules.attention_utils"):
+             caplog.at_level("WARNING"):
             resolve_attention_mode("sage")
         assert "sage" in caplog.text
         assert "falling back" in caplog.text
@@ -322,8 +321,7 @@ class TestASRExcludesSage:
         assert "pad" in ASR_EXCLUDED_ATTENTION_MODES["sage"].lower()
 
     def test_downgrade_warns(self, caplog):
-        with caplog.at_level("WARNING",
-                             logger="ComfyUI_VibeVoice.modules.attention_utils"):
+        with caplog.at_level("WARNING"):
             resolve_asr_attention_mode("sage")
         assert "sage" in caplog.text
         assert "ASR" in caplog.text

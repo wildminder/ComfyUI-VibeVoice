@@ -11,13 +11,12 @@ import numpy as np
 import torch
 
 from transformers.feature_extraction_utils import FeatureExtractionMixin
-from transformers.utils import logging
+import logging
 
 from .audio_utils import AudioNormalizer
 from ....modules.audio_utils import resample_audio
 from ....modules import audio_backend
 
-logger = logging.get_logger(__name__)
 
 # Change from ProcessorMixin to FeatureExtractionMixin which is designed for single components
 class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
@@ -146,8 +145,8 @@ class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
         
         # Validate sampling rate
         if sampling_rate is not None and sampling_rate != self.sampling_rate:
-            logger.warning(
-                f"Input sampling rate ({sampling_rate}) differs from expected "
+            logging.warning(
+                f"[ComfyUI-VibeVoice] Input sampling rate ({sampling_rate}) differs from expected "
                 f"sampling rate ({self.sampling_rate}). Please resample your audio."
             )
         

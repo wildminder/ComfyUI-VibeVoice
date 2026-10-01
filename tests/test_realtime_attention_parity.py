@@ -187,7 +187,7 @@ def test_realtime_excludes_a_diverging_backend_loudly(caplog):
     """Excluded backends are downgraded, and the reason reaches the log."""
     assert REALTIME_EXCLUDED_ATTENTION_MODES, "the exclusion registry is empty"
 
-    with caplog.at_level("WARNING", logger="ComfyUI_VibeVoice.modules.attention_utils"):
+    with caplog.at_level("WARNING"):
         resolved = resolve_realtime_attention_mode("sage")
     assert resolved == REALTIME_ATTENTION_FALLBACK
     assert "sage" in caplog.text

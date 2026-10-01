@@ -30,7 +30,6 @@ import torch
 
 from .diagnostics import diagnostics_enabled
 
-logger = logging.getLogger(__name__)
 
 # Files already announced with the flat-pool recovery warning this session
 # (the loader opens one GGUF several times; warn once per file, not per open).
@@ -557,8 +556,8 @@ def open_gguf_reader(weight_path):
             raise
         if weight_path not in _FLAT_POOL_WARNED:
             _FLAT_POOL_WARNED.add(weight_path)
-            logger.warning(
-                "GGUF file '%s' was written by a converter that stores "
+            logging.warning(
+                "[ComfyUI-VibeVoice] GGUF file '%s' was written by a converter that stores "
                 "some data in a nonstandard layout; loading it with automatic "
                 "recovery.",
                 os.path.basename(weight_path),
@@ -675,8 +674,8 @@ def log_gguf_forward_counters(tag: str) -> None:
     if counters["fast"] == 0 and counters["streamed"] == 0:
         return
     cache = dequant_cache_stats()
-    logger.info(
-        "GGUF forward diagnostics: stage=%s gguf_forward_fast=%d "
+    logging.info(
+        "[ComfyUI-VibeVoice] GGUF forward diagnostics: stage=%s gguf_forward_fast=%d "
         "gguf_forward_streamed=%d dequant_cache_entries=%d "
         "dequant_cache_mb=%.1f dequant_cache_budget_mb=%.1f",
         tag, counters["fast"], counters["streamed"],
@@ -894,8 +893,8 @@ def map_keys(keys, scheme: str = None) -> dict:
         if n_hf * 2 == n:
             raise UnmappedKeyError(sorted(keys)[:10], scheme)
         scheme = "hf" if n_hf * 2 > n else "llamacpp"
-        logger.info(
-            "GGUF file mixes tensor naming conventions (%d HF / %d llamacpp); "
+        logging.warning(
+            "[ComfyUI-VibeVoice] GGUF file mixes tensor naming conventions (%d HF / %d llamacpp); "
             "resolving with the %s convention and aliasing the rest.",
             n_hf, n - n_hf, scheme,
         )

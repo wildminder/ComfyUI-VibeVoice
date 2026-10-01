@@ -1,5 +1,7 @@
 """Tests for modules/audio_utils.py - Script parsing and audio preprocessing."""
 
+import logging
+
 import numpy as np
 import torch
 import pytest
@@ -170,6 +172,87 @@ class TestPreprocessComfyAudio:
         result = preprocess_comfy_audio(audio, target_sr=24000)
         assert result is not None
         assert np.abs(result).max() <= 1.0
+
+    def test_44k_reference_audio_resamples_and_stays_quiet(self, caplog):
+        """44.1 kHz reference audio is the NORMAL case, not a fault.
+
+        The 'Resampling reference audio ...' notice was deleted as noise: it
+        fired on nearly every real reference clip. What must NOT have been
+        deleted along with it is the resample itself. So this pins both halves
+        at once -- the backend is still called with (44100, 24000), and not a
+        single record reaches the log.
+        """
+        from ComfyUI_VibeVoice.modules import audio_backend
+
+        audio = {"waveform": torch.randn(1, 1, 44100), "sample_rate": 44100}
+        with patch.object(audio_backend, "resample_audio_tensor") as mock_resample:
+            # A real (non-silent) stub: returning zeros would trip the
+            # unrelated "waveform is completely silent" warning and make this
+            # test assert about the wrong thing.
+            mock_resample.side_effect = (
+                lambda t, orig, target: torch.zeros(1, target // 2) + 0.5
+            )
+            with caplog.at_level(logging.DEBUG):
+                result = preprocess_comfy_audio(audio, target_sr=24000)
+
+        assert result is not None
+        mock_resample.assert_called_once()
+        args = mock_resample.call_args[0]
+        assert args[1] == 44100
+        assert args[2] == 24000
+        assert caplog.records == [], (
+            "44.1 kHz reference audio must not log anything; got "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_nan_input_still_reports_an_error(self, caplog):
+        """The sibling error line must survive the deletion of the notice.
+
+        Scrubbing NaN is a genuine data fault the user may need to act on, so
+        it stays an ERROR. Asserting both the level and the message content
+        means the test cannot pass against a silently demoted or deleted line.
+        """
+        audio = {
+            "waveform": torch.tensor([[[float("nan"), 0.5, 0.3]]]),
+            "sample_rate": 24000,
+        }
+        with caplog.at_level(logging.DEBUG):
+            result = preprocess_comfy_audio(audio, target_sr=24000)
+
+        assert result is not None
+        assert not np.any(np.isnan(result))
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1, [r.getMessage() for r in caplog.records]
+        assert "NaN or Inf" in errors[0].getMessage()
+        assert errors[0].getMessage().startswith("[ComfyUI-VibeVoice] ")
+
+    def test_nan_input_logs_at_no_other_level(self):
+        """Both directions: the NaN report is an ERROR and not also anything
+        lower, so a future edit cannot quietly double-report it."""
+        audio = {
+            "waveform": torch.tensor([[[float("inf"), 0.5, 0.3]]]),
+            "sample_rate": 24000,
+        }
+        seen = []
+        root = logging.getLogger()
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                seen.append(record)
+
+        handler = _Capture()
+        root.addHandler(handler)
+        prev = root.level
+        root.setLevel(logging.DEBUG)
+        try:
+            preprocess_comfy_audio(audio, target_sr=24000)
+        finally:
+            root.setLevel(prev)
+            root.removeHandler(handler)
+        matching = [r for r in seen if "NaN or Inf" in r.getMessage()]
+        assert [r.levelname for r in matching] == ["ERROR"], [
+            r.levelname for r in matching
+        ]
 
 
 class TestExtractAudioTensor:

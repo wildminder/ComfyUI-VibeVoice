@@ -87,7 +87,6 @@ from .memory_census import measured_load, report_census
 if SAGE_ATTENTION_AVAILABLE:
     from ..src.vibevoice.modular.sage_attention_patch import set_sage_attention
 
-logger = logging.getLogger(__name__)
 
 _PACKAGED_CONFIG_FILES = {
     "VibeVoice-1.5B": "default_VibeVoice-1.5B_config.json",
@@ -145,8 +144,8 @@ def resolve_auto_config_name(weight_path: str, gguf_reader=None, weights_fp=None
             f"{', '.join(explicit)}) or place a sidecar config.json next to "
             f"the weight file."
         )
-    logger.debug(
-        f"Auto-detected architecture '{detected}' from "
+    logging.debug(
+        f"[ComfyUI-VibeVoice] Auto-detected architecture '{detected}' from "
         f"'{os.path.basename(weight_path)}'"
     )
     return detected
@@ -167,8 +166,8 @@ def reconcile_config(selected_name: str, resolved_config, weights_fp):
     if not detected or detected == selected_name:
         return selected_name, False
 
-    logger.warning(
-        f"Config mismatch: weights contain '{weights_fp.source_key}' with "
+    logging.warning(
+        f"[ComfyUI-VibeVoice] Config mismatch: weights contain '{weights_fp.source_key}' with "
         f"shape (vocab={weights_fp.vocab_size}, hidden={weights_fp.hidden_size}) "
         f"-> {detected}, but config '{selected_name}' "
         f"(hidden={cfg_fp[0]}, vocab={cfg_fp[1]}) was selected. "
@@ -237,17 +236,17 @@ def _get_packaged_config_path(config_name: str) -> str:
 def resolve_sidecar_config(weight_path: str, config_name: str) -> str:
     sidecar_path = weight_path + ".config.json"
     if os.path.exists(sidecar_path):
-        logger.debug(f"Using sidecar config: {sidecar_path}")
+        logging.debug(f"[ComfyUI-VibeVoice] Using sidecar config: {sidecar_path}")
         return sidecar_path
 
     dir_sidecar = os.path.join(os.path.dirname(weight_path), "config.json")
     if os.path.exists(dir_sidecar):
-        logger.debug(f"Using directory sidecar config: {dir_sidecar}")
+        logging.debug(f"[ComfyUI-VibeVoice] Using directory sidecar config: {dir_sidecar}")
         return dir_sidecar
 
     packaged = _get_packaged_config_path(config_name)
     if packaged and os.path.exists(packaged):
-        logger.debug(f"Using packaged default config for '{config_name}': {packaged}")
+        logging.debug(f"[ComfyUI-VibeVoice] Using packaged default config for '{config_name}': {packaged}")
         return packaged
 
     raise FileNotFoundError(
@@ -264,12 +263,12 @@ def resolve_sidecar_config(weight_path: str, config_name: str) -> str:
 def resolve_sidecar_preprocessor(weight_path: str) -> str:
     sidecar_path = weight_path + ".preprocessor.json"
     if os.path.exists(sidecar_path):
-        logger.debug(f"Using sidecar preprocessor config: {sidecar_path}")
+        logging.debug(f"[ComfyUI-VibeVoice] Using sidecar preprocessor config: {sidecar_path}")
         return sidecar_path
 
     dir_sidecar = os.path.join(os.path.dirname(weight_path), "preprocessor_config.json")
     if os.path.exists(dir_sidecar):
-        logger.debug(f"Using directory sidecar preprocessor config: {dir_sidecar}")
+        logging.debug(f"[ComfyUI-VibeVoice] Using directory sidecar preprocessor config: {dir_sidecar}")
         return dir_sidecar
 
     return ""
@@ -306,8 +305,8 @@ def _load_asr_tokenizer(tokenizer_dir: str) -> "VibeVoiceASRTextTokenizerFast":
             _packaged_configs_dir(), "tokenizer.json"
         )
         if os.path.exists(packaged_tokenizer_path):
-            logger.debug(
-                f"Using packaged tokenizer.json fallback for ASR: {packaged_tokenizer_path}"
+            logging.debug(
+                f"[ComfyUI-VibeVoice] Using packaged tokenizer.json fallback for ASR: {packaged_tokenizer_path}"
             )
             tokenizer_file_path = packaged_tokenizer_path
         else:
@@ -391,7 +390,7 @@ def _load_gguf_state_dict(weight_path: str, device=None) -> dict:
             "Install it with: pip install gguf"
         ) from e
 
-    logger.debug(f"Loading GGUF state dict from: {weight_path}")
+    logging.debug(f"[ComfyUI-VibeVoice] Loading GGUF state dict from: {weight_path}")
     from .gguf_quant import dequantize_reader_tensor, open_gguf_reader
 
     reader = open_gguf_reader(weight_path)
@@ -401,7 +400,7 @@ def _load_gguf_state_dict(weight_path: str, device=None) -> dict:
         dequantized = dequantize_reader_tensor(tensor)
         state_dict[tensor.name] = dequantized.to(device)
 
-    logger.debug(f"Loaded {len(state_dict)} tensors from GGUF file")
+    logging.debug(f"[ComfyUI-VibeVoice] Loaded {len(state_dict)} tensors from GGUF file")
     return state_dict
 
 
@@ -774,8 +773,8 @@ def _demote_nonlinear_fp8_residents(model, quant_map: dict) -> dict:
             except KeyError:
                 target = None
             if target is not None and not isinstance(target, torch.nn.Linear):
-                logger.debug(
-                    f"fp8-resident layer '{prefix}' targets "
+                logging.debug(
+                    f"[ComfyUI-VibeVoice] fp8-resident layer '{prefix}' targets "
                     f"{type(target).__name__}, not nn.Linear — falling back "
                     f"to dequant-at-load"
                 )
@@ -966,8 +965,8 @@ def _install_gguf_weights(model, reader, target_device=None) -> dict:
     )
 
     if dequant_load:
-        logger.debug(
-            f"Dequantized {len(dequant_load)} non-Linear GGUF weight(s) at "
+        logging.debug(
+            f"[ComfyUI-VibeVoice] Dequantized {len(dequant_load)} non-Linear GGUF weight(s) at "
             f"load (embeddings/conv heads): "
             f"{', '.join(dequant_load[:5])}"
             + (f" (+{len(dequant_load) - 5} more)" if len(dequant_load) > 5 else "")
@@ -1055,8 +1054,8 @@ def warn_if_lowbit_quantization(weight_path: str) -> None:
             return
         frac = info["int_count"] / info["total"]
         if frac >= _LOWBIT_FRACTION_THRESHOLD and not info["has_scale_meta"]:
-            logger.warning(
-                f"[low-bit check] '{os.path.basename(weight_path)}' stores "
+            logging.warning(
+                f"[ComfyUI-VibeVoice] [low-bit check] '{os.path.basename(weight_path)}' stores "
                 f"{info['int_count']}/{info['total']} tensors as raw integers with "
                 f"NO dequantization scale/zero-point metadata. Use a proper "
                 f"quantized or full-precision (BF16/FP16) checkpoint instead."
@@ -1069,8 +1068,8 @@ def warn_if_lowbit_quantization(weight_path: str) -> None:
             return
         frac = info["low_bit_count"] / info["total"]
         if frac >= _LOWBIT_FRACTION_THRESHOLD:
-            logger.warning(
-                f"[low-bit check] '{os.path.basename(weight_path)}' contains "
+            logging.warning(
+                f"[ComfyUI-VibeVoice] [low-bit check] '{os.path.basename(weight_path)}' contains "
                 f"{info['low_bit_count']}/{info['total']} tensors at sub-4-bit "
                 f"I-quant precision. Consider a higher-quality quant "
                 f"(Q4_K_M / Q5_K_M / Q8_0 / BF16)."
@@ -1119,8 +1118,8 @@ def _log_load_diagnostics(
 ) -> None:
     if not diagnostics_enabled():
         return
-    logger.info(
-        "Load diagnostics: model='%s' family=%s requested_attention=%s "
+    logging.info(
+        "[ComfyUI-VibeVoice] Load diagnostics: model='%s' family=%s requested_attention=%s "
         "resolved_attention=%s device=%s",
         config_name, weight_family, requested_attention_mode,
         resolved_attention_mode, load_device,
@@ -1185,7 +1184,7 @@ def load_external_vibevoice_model(
         except UnsupportedQuantFormat:
             raise
         except Exception as e:
-            logger.debug(f"ConvRot scan skipped for {weight_path}: {e}")
+            logging.debug(f"[ComfyUI-VibeVoice] ConvRot scan skipped for {weight_path}: {e}")
             convrot_quant_map = {}
     validate_weight_plan(
         is_gguf_file=is_gguf_file,
@@ -1212,7 +1211,7 @@ def load_external_vibevoice_model(
 
     is_streaming = isinstance(config, VibeVoiceStreamingConfig)
     if is_streaming:
-        logger.debug(f"External model '{config_name}' detected as streaming model")
+        logging.debug(f"[ComfyUI-VibeVoice] External model '{config_name}' detected as streaming model")
         attention_mode = resolve_realtime_attention_mode(attention_mode)
 
     tokenizer_dir = resolve_sidecar_tokenizer_dir(weight_path)
@@ -1246,8 +1245,8 @@ def load_external_vibevoice_model(
     attn_implementation_for_load = get_attn_implementation_for_load(attention_mode)
 
     try:
-        logger.debug(
-            f"Instantiating external VibeVoice model '{config_name}' with "
+        logging.debug(
+            f"[ComfyUI-VibeVoice] Instantiating external VibeVoice model '{config_name}' with "
             f"dtype={final_load_dtype}, attention='{attn_implementation_for_load}'"
         )
 
@@ -1350,10 +1349,6 @@ def load_external_vibevoice_model(
 
         report_census(model, phase=f"pre-h2d:{config_name}")
 
-        logger.info(
-            f"Successfully loaded external VibeVoice model '{config_name}' "
-            f"from {weight_path}"
-        )
         _log_load_diagnostics(
             config_name=config_name,
             requested_attention_mode=requested_attention_mode,
@@ -1381,8 +1376,8 @@ def load_external_vibevoice_model(
         }
 
     except Exception as e:
-        logger.error(
-            f"Failed to load external VibeVoice model '{config_name}' "
+        logging.error(
+            f"[ComfyUI-VibeVoice] Failed to load external VibeVoice model '{config_name}' "
             f"from {weight_path}: {e}"
         )
         raise RuntimeError(
@@ -1434,7 +1429,7 @@ def load_external_vibevoice_asr_model(
         except UnsupportedQuantFormat:
             raise
         except Exception as e:
-            logger.debug(f"ConvRot scan skipped for {weight_path}: {e}")
+            logging.debug(f"[ComfyUI-VibeVoice] ConvRot scan skipped for {weight_path}: {e}")
             convrot_quant_map = {}
     validate_weight_plan(
         is_gguf_file=is_gguf_file,
@@ -1465,8 +1460,8 @@ def load_external_vibevoice_asr_model(
     attn_implementation_for_load = get_attn_implementation_for_load(attention_mode)
 
     try:
-        logger.debug(
-            f"Instantiating external VibeVoice ASR model '{config_name}' with "
+        logging.debug(
+            f"[ComfyUI-VibeVoice] Instantiating external VibeVoice ASR model '{config_name}' with "
             f"dtype={model_dtype}, attention='{attn_implementation_for_load}'"
         )
 
@@ -1554,10 +1549,6 @@ def load_external_vibevoice_asr_model(
 
         model.eval()
 
-        logger.info(
-            f"Successfully loaded external VibeVoice ASR model '{config_name}' "
-            f"from {weight_path}"
-        )
         _log_load_diagnostics(
             config_name=config_name,
             requested_attention_mode=requested_attention_mode,
@@ -1585,8 +1576,8 @@ def load_external_vibevoice_asr_model(
         }
 
     except Exception as e:
-        logger.error(
-            f"Failed to load external VibeVoice ASR model '{config_name}' "
+        logging.error(
+            f"[ComfyUI-VibeVoice] Failed to load external VibeVoice ASR model '{config_name}' "
             f"from {weight_path}: {e}"
         )
         raise RuntimeError(

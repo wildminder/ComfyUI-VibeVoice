@@ -9,7 +9,6 @@ from transformers.models.auto import AutoModel, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutput, BaseModelOutputWithPast
 from transformers import modeling_utils
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import logging
 from transformers.generation import GenerationMixin
 
 from .modular_vibevoice_tokenizer import (
@@ -23,7 +22,6 @@ from .modeling_vibevoice import (
     SpeechConnector
 )
 
-logger = logging.get_logger(__name__)
 
 if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]

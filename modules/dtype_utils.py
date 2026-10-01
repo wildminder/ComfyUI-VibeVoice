@@ -10,7 +10,6 @@ from typing import List
 
 from .device_utils import should_use_bf16, should_use_fp16, _get_model_management
 
-logger = logging.getLogger(__name__)
 
 # Dtype string constants
 DTYPE_AUTO = "auto"
@@ -181,7 +180,7 @@ def cast_model_to_dtype(model, dtype: torch.dtype) -> None:
     if dtype is None:
         return
     _cast_mismatched_params(model, dtype)
-    logger.debug(f"Model cast to dtype (filtered): {dtype}")
+    logging.debug(f"[ComfyUI-VibeVoice] Model cast to dtype (filtered): {dtype}")
 
 
 def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
@@ -202,6 +201,6 @@ def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
 
     _cast_mismatched_params(model, dtype)
     sources = ", ".join(sorted({str(src) for _, src in mismatched}))
-    logger.debug(
-        f"Model cast {sources} -> {dtype} ({len(mismatched)} mismatched params)"
+    logging.debug(
+        f"[ComfyUI-VibeVoice] Model cast {sources} -> {dtype} ({len(mismatched)} mismatched params)"
     )

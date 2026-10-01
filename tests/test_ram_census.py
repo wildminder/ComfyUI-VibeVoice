@@ -297,11 +297,11 @@ class TestRendering:
         monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         for tensor in list(synthetic.parameters()) + list(synthetic.buffers()):
             _tag(tensor)
-        logger_name = "ComfyUI_VibeVoice.modules.memory_census"
-        with caplog.at_level(logging.INFO, logger=logger_name):
+        with caplog.at_level(logging.INFO):
             report_census(synthetic, phase="pre-h2d:synthetic")
         lines = [
-            r for r in caplog.records if r.getMessage().startswith("[vvcensus]")
+            r for r in caplog.records
+            if r.getMessage().startswith("[ComfyUI-VibeVoice] [vvcensus]")
         ]
         assert len(lines) == 1
         message = lines[0].getMessage()
@@ -316,9 +316,7 @@ class TestRendering:
         monkeypatch.delenv("VIBEVOICE_RAM_CENSUS", raising=False)
         for tensor in list(synthetic.parameters()) + list(synthetic.buffers()):
             _tag(tensor)
-        with caplog.at_level(
-            logging.INFO, logger="ComfyUI_VibeVoice.modules.memory_census"
-        ):
+        with caplog.at_level(logging.INFO):
             report_census(synthetic, phase="pre-h2d:synthetic")
         assert not [r for r in caplog.records if "[vvcensus]" in r.getMessage()]
 
@@ -349,9 +347,7 @@ class TestRendering:
     def test_disabled_gate_still_returns_the_report(self, synthetic, caplog, monkeypatch):
         monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
         monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", "0")
-        with caplog.at_level(
-            logging.INFO, logger="ComfyUI_VibeVoice.modules.memory_census"
-        ):
+        with caplog.at_level(logging.INFO):
             report = report_census(synthetic)
         assert not [r for r in caplog.records if "[vvcensus]" in r.getMessage()]
         assert report["param_bytes"] > 0

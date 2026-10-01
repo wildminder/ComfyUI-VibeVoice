@@ -49,8 +49,6 @@ if "pytest" in sys.modules:
     __all__ = []
 
 else:
-    logger = logging.getLogger(__name__)
-
     # -- Environment Detection
     try:
         import folder_paths
@@ -66,15 +64,6 @@ else:
     from .modules.folder_registration import (
         register_vibevoice_folders, register_voice_preset_folder,
     )
-
-    # -- Logger Setup
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if not logger.hasHandlers():
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter("[ComfyUI-VibeVoice] %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
 
     # -- sys.path Registration
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +106,7 @@ else:
             vibevoice_search_paths.insert(0, primary_vibevoice_models_path)
 
         for search_path in vibevoice_search_paths:
-            logger.info(f"Scanning for VibeVoice models in: {search_path}")
+            logging.debug(f"[ComfyUI-VibeVoice] Scanning for VibeVoice models in: {search_path}")
             if not os.path.isdir(search_path):
                 continue
             for model_info in scan_vibevoice_models(search_path):
@@ -129,7 +118,9 @@ else:
                         "tokenizer_repo": model_info.get("tokenizer_repo", "Qwen/Qwen2.5-1.5B"),
                     }
 
-        logger.info(f"Discovered VibeVoice models: {sorted(list(AVAILABLE_VIBEVOICE_MODELS.keys()))}")
+        logging.debug(
+            f"[ComfyUI-VibeVoice] Discovered VibeVoice models: {sorted(list(AVAILABLE_VIBEVOICE_MODELS.keys()))}"
+        )
 
     # -- Exports ─
     from .vibevoice_nodes import comfy_entrypoint

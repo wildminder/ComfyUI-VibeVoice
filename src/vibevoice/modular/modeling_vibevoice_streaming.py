@@ -15,7 +15,6 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers import modeling_utils
 from transformers.modeling_utils import PreTrainedModel
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.utils import logging
 
 from .modular_vibevoice_diffusion_head import VibeVoiceDiffusionHead
 from ..schedule.dpm_solver import DPMSolverMultistepScheduler
@@ -23,8 +22,6 @@ from ..schedule.dpm_solver import DPMSolverMultistepScheduler
 from .configuration_vibevoice_streaming import VibeVoiceStreamingConfig
 from .configuration_vibevoice import get_config_dtype
 
-
-logger = logging.get_logger(__name__)
 
 if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]

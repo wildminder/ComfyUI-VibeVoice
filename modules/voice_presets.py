@@ -22,7 +22,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from .folder_registration import VOICE_PRESET_FOLDER_KEY
 
 
-logger = logging.getLogger(__name__)
 
 VOICE_PRESET_SUBDIR = "voices"
 _DEFAULT_VOICE_PRESET_SUBDIR = os.path.join("VibeVoice", VOICE_PRESET_SUBDIR)
@@ -76,12 +75,12 @@ def voice_preset_search_dirs() -> list[str]:
         for path in registry.get(VOICE_PRESET_FOLDER_KEY, ([], set()))[0]:
             paths.append(os.fspath(path))
     except Exception as exc:
-        logger.warning("Cannot inspect registered VibeVoice voice folders: %s", exc)
+        logging.warning("[ComfyUI-VibeVoice] Cannot inspect registered VibeVoice voice folders: %s", exc)
 
     try:
         tts_roots = folder_paths.get_folder_paths("tts")
     except Exception as exc:
-        logger.warning("Cannot inspect registered TTS folders: %s", exc)
+        logging.warning("[ComfyUI-VibeVoice] Cannot inspect registered TTS folders: %s", exc)
         tts_roots = []
 
     for tts_root in tts_roots:
@@ -120,15 +119,15 @@ def list_voice_presets(search_dirs: list[str] | None = None) -> dict[str, str]:
                 )
             )
         except OSError as exc:
-            logger.warning("Cannot scan VibeVoice voice folder '%s': %s", root, exc)
+            logging.warning("[ComfyUI-VibeVoice] Cannot scan VibeVoice voice folder '%s': %s", root, exc)
             continue
 
         for path in candidates:
             stem = os.path.splitext(os.path.basename(path))[0]
             collision_key = stem.casefold()
             if collision_key in owners:
-                logger.warning(
-                    "Ignoring duplicate VibeVoice voice preset '%s'; first "
+                logging.warning(
+                    "[ComfyUI-VibeVoice] Ignoring duplicate VibeVoice voice preset '%s'; first "
                     "registration wins: '%s' then '%s'",
                     stem,
                     owners[collision_key],

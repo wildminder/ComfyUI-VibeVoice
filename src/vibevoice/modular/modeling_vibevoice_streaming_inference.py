@@ -11,7 +11,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers import modeling_utils
 from transformers.modeling_utils import PreTrainedModel
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.utils import logging
+import logging
 
 from .modular_vibevoice_tokenizer import VibeVoiceTokenizerStreamingCache
 from .modular_vibevoice_diffusion_head import VibeVoiceDiffusionHead
@@ -21,7 +21,6 @@ from .modular_vibevoice_text_tokenizer import VibeVoiceTextTokenizer, VibeVoiceT
 from .modeling_vibevoice_streaming import VibeVoiceStreamingPreTrainedModel, VibeVoiceStreamingModel, BinaryClassifier
 from .streamer import AudioStreamer, AsyncAudioStreamer
 
-logger = logging.get_logger(__name__)
 
 if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
@@ -390,8 +389,8 @@ def _ensure_cache_has_layers(cache):
     # into an AttributeError, and the adapted layers carry no per-layer device
     # bookkeeping that would make CPU offloading meaningful anyway.
     if getattr(cache, 'offloading', False) and not hasattr(cache, 'prefetch_stream'):
-        logger.warning(
-            "VibeVoice realtime: dropping `offloading=True` from a cached voice prompt - "
+        logging.warning(
+            "[ComfyUI-VibeVoice] VibeVoice realtime: dropping `offloading=True` from a cached voice prompt - "
             "the pickled cache has no prefetch stream, and Cache.update would raise on it."
         )
         try:

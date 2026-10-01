@@ -158,7 +158,7 @@ class TestValidateWeightPlan:
 
     def test_sage_with_kquants_allowed_but_warns(self, caplog):
         import logging
-        with caplog.at_level(logging.WARNING, logger="ComfyUI_VibeVoice.modules.quant_common"):
+        with caplog.at_level(logging.WARNING):
             validate_weight_plan(is_gguf_file=True, convrot_quant_map={},
                                  use_llm_4bit=False, attention_mode="sage",
                                  gguf_kquant_present=True)

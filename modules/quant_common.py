@@ -20,7 +20,6 @@ import logging
 
 import torch
 
-logger = logging.getLogger(__name__)
 
 
 class QuantTargetMismatch(RuntimeError):
@@ -96,7 +95,7 @@ def replace_linears_for_quant(model: torch.nn.Module, layer_plan: dict) -> list:
         setattr(parent_cache[parent_name], child_name, new_mod)
         replaced.append(prefix)
 
-    logger.debug(f"Replaced {len(replaced)} nn.Linear(s) with quant-resident modules")
+    logging.debug(f"[ComfyUI-VibeVoice] Replaced {len(replaced)} nn.Linear(s) with quant-resident modules")
     return replaced
 
 
@@ -128,8 +127,8 @@ def validate_weight_plan(
             "quantized linears; 'quantize_llm_4bit' cannot be combined with it."
         )
     if attention_mode == "sage" and is_gguf_file and gguf_kquant_present:
-        logger.warning(
-            "SageAttention requested alongside GGUF K-quants: sage patches "
+        logging.warning(
+            "[ComfyUI-VibeVoice] SageAttention requested alongside GGUF K-quants: sage patches "
             "attention computation only, quantized linear layers still run "
             "through per-matmul dequantization."
         )

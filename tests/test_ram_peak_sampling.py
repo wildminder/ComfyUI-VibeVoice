@@ -130,7 +130,7 @@ class TestRssSampler:
         with RssSampler() as sampler:
             pass
         monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", "0")
-        with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.memory_census"):
+        with caplog.at_level(logging.INFO):
             line = sampler.report("silenced")
         assert "[vvrss] silenced" in line
         assert "[vvrss]" not in caplog.text

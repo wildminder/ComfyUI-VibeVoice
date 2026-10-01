@@ -111,7 +111,7 @@ class TestVoicePresetDiscovery:
     def test_first_registration_wins_collision_and_warns_both_paths(self, tmp_path, caplog):
         first = _write_preset(tmp_path / "first" / "Voice.pt")
         second = _write_preset(tmp_path / "second" / "voice.pt")
-        with caplog.at_level(logging.WARNING, logger=voice_presets.__name__):
+        with caplog.at_level(logging.WARNING):
             result = list_voice_presets([str(first.parent), str(second.parent)])
 
         assert result == {"Voice": str(first)}

@@ -13,9 +13,8 @@ from ..modular.configuration_vibevoice import (
     VibeVoiceConfig
 )
 from ..modular.modeling_vibevoice import VibeVoiceForConditionalGeneration
-from transformers.utils import logging
+import logging
 
-logger = logging.get_logger(__name__)
 
 def convert_vibevoice_nnscaler_checkpoint_to_hf(
     checkpoint_path: str,
@@ -28,7 +27,7 @@ def convert_vibevoice_nnscaler_checkpoint_to_hf(
     """
     
     # Load regular checkpoint
-    logger.info(f"Loading regular checkpoint from {checkpoint_path}")
+    logging.info(f"[ComfyUI-VibeVoice] Loading regular checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu") # ['model', 'optimizer', 'lr_scheduler', 'train_status', 'train_args', 'rng_states', 'nnscaler', 'dataloader']
     
     # config = checkpoint['train_args']
@@ -37,14 +36,14 @@ def convert_vibevoice_nnscaler_checkpoint_to_hf(
     
     init_config_path = Path(__file__).parent.parent / 'configs' / init_config_name.split('/')[-1]
     if init_config_path.exists():
-        logger.info(f"Loading initial config from {init_config_path}")
+        logging.info(f"[ComfyUI-VibeVoice] Loading initial config from {init_config_path}")
         with open(init_config_path, 'r') as f:
             init_config = json.load(f)
     else:
         raise FileNotFoundError(f"Initial config file {init_config_path} not found. Please provide a valid path.")
 
     tie_word_embeddings = init_config['decoder_config'].get('tie_word_embeddings', True)
-    logger.info(f"Tie word embeddings: {tie_word_embeddings}")
+    logging.info(f"[ComfyUI-VibeVoice] Tie word embeddings: {tie_word_embeddings}")
 
     init_config['decoder_config']['use_cache'] = True
     config = VibeVoiceConfig(**init_config, tie_word_embeddings=tie_word_embeddings)
@@ -57,7 +56,7 @@ def convert_vibevoice_nnscaler_checkpoint_to_hf(
     
     # Override with provided config if available
     if config_path:
-        logger.info(f"Loading config from {config_path}")
+        logging.info(f"[ComfyUI-VibeVoice] Loading config from {config_path}")
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
         config = VibeVoiceConfig.from_dict(config_dict)
@@ -67,32 +66,32 @@ def convert_vibevoice_nnscaler_checkpoint_to_hf(
     torch.set_default_dtype(torch.bfloat16)
 
     # Create the HuggingFace model
-    logger.info("Creating HuggingFace VibeVoiceForConditionalGeneration model")
+    logging.info("[ComfyUI-VibeVoice] Creating HuggingFace VibeVoiceForConditionalGeneration model")
     model = VibeVoiceForConditionalGeneration(config)
     
     # Restore original dtype
     torch.set_default_dtype(original_dtype)
 
     # Load the state dict
-    logger.info("Loading weights into model")
+    logging.info("[ComfyUI-VibeVoice] Loading weights into model")
     missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
     
     if missing_keys:
-        logger.warning(f"Missing keys: {missing_keys}")
+        logging.warning(f"[ComfyUI-VibeVoice] Missing keys: {missing_keys}")
     if unexpected_keys:
-        logger.warning(f"Unexpected keys: {unexpected_keys}")
+        logging.warning(f"[ComfyUI-VibeVoice] Unexpected keys: {unexpected_keys}")
     
     # Create output directory
     os.makedirs(pytorch_dump_folder_path, exist_ok=True)
     
     # Save the model and config
-    logger.info(f"Saving model to {pytorch_dump_folder_path}")
+    logging.info(f"[ComfyUI-VibeVoice] Saving model to {pytorch_dump_folder_path}")
     
     # Save config
     config.save_pretrained(pytorch_dump_folder_path)
     
     # Save VibeVoiceProcessor configuration
-    logger.info("Saving VibeVoiceProcessor configuration")
+    logging.info("[ComfyUI-VibeVoice] Saving VibeVoiceProcessor configuration")
     processor_config = {
         "processor_class": "VibeVoiceProcessor",
         "speech_tok_compress_ratio": 3200,
@@ -111,24 +110,24 @@ def convert_vibevoice_nnscaler_checkpoint_to_hf(
     processor_config_path = os.path.join(pytorch_dump_folder_path, "preprocessor_config.json")
     with open(processor_config_path, 'w') as f:
         json.dump(processor_config, f, indent=2)
-    logger.info(f"Saved processor config to {processor_config_path}")
+    logging.info(f"[ComfyUI-VibeVoice] Saved processor config to {processor_config_path}")
     
     # Save model with sharding
     # save_pretrained handles tied weights automatically
-    logger.info("Saving model weights with sharding...")
+    logging.info("[ComfyUI-VibeVoice] Saving model weights with sharding...")
     model.save_pretrained(
         pytorch_dump_folder_path,
         max_shard_size="2GB",  # Set maximum size for each shard
         safe_serialization=True  # Ensure saving in .safetensors format
     )
-    logger.info(f"Model weights saved to {pytorch_dump_folder_path}")
+    logging.info(f"[ComfyUI-VibeVoice] Model weights saved to {pytorch_dump_folder_path}")
     
-    logger.info("Conversion complete!")
+    logging.info("[ComfyUI-VibeVoice] Conversion complete!")
     
     # Verify the saved model can be loaded
-    logger.info("Verifying saved model...")
+    logging.info("[ComfyUI-VibeVoice] Verifying saved model...")
     loaded_model = VibeVoiceForConditionalGeneration.from_pretrained(pytorch_dump_folder_path)
-    logger.info("Model successfully loaded from saved checkpoint!")
+    logging.info("[ComfyUI-VibeVoice] Model successfully loaded from saved checkpoint!")
 
 def main():
     parser = argparse.ArgumentParser()
