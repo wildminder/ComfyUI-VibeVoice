@@ -209,6 +209,16 @@ class VibeVoicePatcher(comfy.model_patcher.ModelPatcher):
         | True  | False   | Warm path: move to intermediate device, keep refs. |
         | False | True    | Destructive path: handler.model=None, processor=None, evict cache, gc.collect(). |
         """
+        # A cached GGUF dequant weight is real VRAM core does not know about.
+        # Offloading must not strand it, or a second load in the same session
+        # fails for a reason nothing in the accounting explains.
+        try:
+            from .gguf_quant import clear_dequant_cache
+
+            clear_dequant_cache()
+        except Exception:
+            pass
+
         if unpatch_weights:
             if warm and self.model is not None and self.model.model is not None:
                 # Warm offload: keep tensors on the intermediate device for fast re-attach.

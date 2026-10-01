@@ -21,7 +21,9 @@ Float passthrough: F32, F16, BF16 (zero-copy torch views where possible).
 from __future__ import annotations
 
 import logging
+import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -288,6 +290,130 @@ def dequantize_blocks(raw: torch.Tensor, ggml_type, out_dtype: torch.dtype, shap
     return out.reshape(shape).to(out_dtype)
 
 
+# ====================================================================
+# 3. Dequantized-weight cache
+# ====================================================================
+#
+# A quant-resident GGUFLinear dequantizes its ENTIRE weight on every forward
+# call. At 7B q8_0 that is 151,382 full dequantizations of ~8.6 GB of raw
+# blocks for one prompt, and it is the reason q8_0 infers ~2.2x slower than the
+# fp8 checkpoint, which pays the same logical work through a fused CUDA kernel
+# (comfy_kitchen) that writes bf16 in one pass. See
+# .dev/docs/2026-10-01-gguf-inference-speed/13-gguf-inference-speed-analysis.md
+#
+# This cache reuses the dequantized result for a layer that is hit again while
+# its bytes still fit the VRAM headroom. It is deliberately partial: 8.6 GB of
+# raw blocks dequantize to 16.5 GB of bf16 and only ~2.9 GB is cacheable at
+# 7B, so eviction is SMALLEST-FIRST rather than least-recently-used. Pure LRU
+# would evict the 18944-wide acoustic-decoder Linears -- which are ~10x a
+# decoder Linear and are exactly where dequant dominates -- and leave a cache
+# of little value.
+
+_DEQUANT_CACHE_ENABLED = True
+_cache: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+_cache_bytes: int = 0
+_cache_budget: int | None = None
+_cache_epoch: int = 0
+
+
+def _cache_budget_bytes(device=None) -> int:
+    """Bytes the cache may hold, or 0 to disable it.
+
+    Sampled once. Half of free VRAM, not all of it: the acoustic decoder's
+    activations need headroom on a card that already holds the whole model.
+    ``VIBEVOICE_GGUF_DEQUANT_CACHE_MB`` overrides for measurement; a negative
+    value disables the cache, 0 means auto.
+    """
+    global _cache_budget
+    if _cache_budget is not None:
+        return _cache_budget
+
+    override = os.environ.get("VIBEVOICE_GGUF_DEQUANT_CACHE_MB")
+    if override is not None and override.strip():
+        mb = int(override)
+        if mb < 0:
+            _cache_budget = 0
+            return 0
+        _cache_budget = mb * 1024 ** 2
+        return _cache_budget
+
+    free = 0
+    try:
+        import comfy.model_management as mm
+
+        free = mm.get_free_memory(device) if device is not None else \
+            mm.get_free_memory(mm.get_torch_device())
+    except Exception:
+        free = 0
+    _cache_budget = max(0, int(free * 0.5))
+    return _cache_budget
+
+
+def clear_dequant_cache() -> None:
+    """Drop every cached dequantized weight and bump the invalidation epoch.
+
+    Called when the model is offloaded: a cached weight is real VRAM that core
+    does not know about, and stranding it across a cold offload is how a model
+    that loads fine later fails to load a second time.
+    """
+    global _cache, _cache_bytes, _cache_epoch
+    _cache.clear()
+    _cache_bytes = 0
+    _cache_epoch += 1
+
+
+def dequant_cache_stats() -> dict:
+    """Snapshot for the generate-time log line."""
+    return {"entries": len(_cache), "bytes": _cache_bytes,
+            "budget": _cache_budget_bytes(None)}
+
+
+def _cache_insert(key, tensor, budget) -> None:
+    """Insert, evicting smallest-first until the budget is respected.
+
+    A tensor larger than the whole budget is simply not cached -- the
+    transient dequant already worked, and holding it would starve everything.
+    """
+    global _cache_bytes
+    size = tensor.numel() * tensor.element_size()
+    if size > budget:
+        return
+    _cache[key] = tensor
+    _cache_bytes += size
+    while _cache and _cache_bytes > budget:
+        victim = min(_cache, key=lambda k: _cache[k].numel() * _cache[k].element_size())
+        _cache_bytes -= _cache[victim].numel() * _cache[victim].element_size()
+        del _cache[victim]
+
+
+def cached_dequantize_blocks(linear, out_dtype):
+    """``dequantize_blocks`` for ``linear``'s weight, reusing a cached result.
+
+    The cached tensor is returned directly, not cloned: ``F.linear`` does not
+    mutate its weight, and cloning would defeat the entire point. A hit is
+    dtype-exact, because ``out_dtype`` selects the output dtype and a mismatch
+    would change numerics silently.
+    """
+    if not _DEQUANT_CACHE_ENABLED:
+        return dequantize_blocks(
+            linear.weight, linear.ggml_type, out_dtype,
+            (linear.out_features, linear.in_features),
+        )
+
+    key = (id(linear.weight), _cache_epoch, out_dtype)
+    hit = _cache.get(key)
+    if hit is not None:
+        _cache.move_to_end(key)
+        return hit
+
+    tensor = dequantize_blocks(
+        linear.weight, linear.ggml_type, out_dtype,
+        (linear.out_features, linear.in_features),
+    )
+    _cache_insert(key, tensor, _cache_budget_bytes(linear.weight.device))
+    return tensor
+
+
 def dequantize_dense(raw_or_view: torch.Tensor, ggml_type) -> torch.Tensor:
     """Materialize a FLOAT ggml tensor (F32/F16/BF16) as a native torch tensor."""
     T = _T
@@ -449,10 +575,14 @@ def log_gguf_forward_counters(tag: str) -> None:
     counters = gguf_forward_counters()
     if counters["fast"] == 0 and counters["streamed"] == 0:
         return
+    cache = dequant_cache_stats()
     logger.info(
         "GGUF forward diagnostics: stage=%s gguf_forward_fast=%d "
-        "gguf_forward_streamed=%d",
+        "gguf_forward_streamed=%d dequant_cache_entries=%d "
+        "dequant_cache_mb=%.1f dequant_cache_budget_mb=%.1f",
         tag, counters["fast"], counters["streamed"],
+        cache["entries"], cache["bytes"] / 1024 ** 2,
+        cache["budget"] / 1024 ** 2,
     )
 
 
@@ -494,6 +624,7 @@ class GGUFLinear(torch.nn.Module):
                 f"(ggml_type={getattr(self.ggml_type, 'name', self.ggml_type)}, "
                 f"shape=({self.out_features}, {self.in_features}))"
             )
+        clear_dequant_cache()  # the raw blocks changed; any cached dequant is stale
         self.weight = torch.nn.Parameter(raw_uint8.contiguous(), requires_grad=False)
         self._gguf = GGUFTensor(
             raw=self.weight.data, ggml_type=self.ggml_type,
@@ -512,10 +643,10 @@ class GGUFLinear(torch.nn.Module):
 
         _FORWARD_COUNTERS["fast"] += 1
 
-        w = dequantize_blocks(
-            self.weight, self.ggml_type, x.dtype,
-            (self.out_features, self.in_features),
-        )
+        # Cached on the fast path ONLY. _forward_streamed below must not cache:
+        # it hands the weight to cast_bias_weight(offloadable=True) and unpins
+        # it in a finally, so a retained reference would pin host memory.
+        w = cached_dequantize_blocks(self, x.dtype)
         return torch.nn.functional.linear(x, w, self.bias)
 
     def _forward_streamed(self, x):
