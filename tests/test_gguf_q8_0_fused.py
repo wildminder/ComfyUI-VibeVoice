@@ -94,12 +94,51 @@ class TestCapabilityProbe:
     def test_available_is_a_bool(self):
         assert isinstance(G.triton_q8_0_available(), bool)
 
-    def test_fused_path_is_taken_for_cuda_q8_0(self, cuda_required):
-        """The wiring, not just the kernel: dequantize_blocks must route here."""
-        blocks = _blocks(1024, 0.5).cuda()
-        assert torch.equal(
-            G.dequantize_blocks(blocks, G._T.Q8_0, torch.bfloat16, (1024 * 32,)),
-            _fused(blocks, torch.bfloat16),
+    def test_routing_uses_the_fused_kernel_when_enabled(self, cuda_required,
+                                                       monkeypatch):
+        """Assert on ROUTING, not on values.
+
+        The two paths are bitwise equal, so comparing outputs can never tell
+        which one ran — a value-based version of this test passes vacuously and
+        reports nothing. Spy on the fused entry point instead.
+        """
+        called = []
+        real = G._dequant_q8_0_fused
+
+        def _spy(blocks, out_dtype):
+            called.append(1)
+            return real(blocks, out_dtype)
+
+        monkeypatch.setattr(G, "_dequant_q8_0_fused", _spy)
+        monkeypatch.setattr(G, "_FUSED_Q8_0_ENABLED", True)
+        G.dequantize_blocks(_blocks(512, 0.5).cuda(), G._T.Q8_0,
+                            torch.bfloat16, (512 * 32,))
+        assert called, "enabled but the fused kernel was never called"
+
+    def test_routing_skips_the_fused_kernel_when_disabled(self, cuda_required,
+                                                          monkeypatch):
+        """`_FUSED_Q8_0_ENABLED` is False after the live 10x regression."""
+        called = []
+        real = G._dequant_q8_0_fused
+
+        def _spy(blocks, out_dtype):
+            called.append(1)
+            return real(blocks, out_dtype)
+
+        monkeypatch.setattr(G, "_dequant_q8_0_fused", _spy)
+        monkeypatch.setattr(G, "_FUSED_Q8_0_ENABLED", False)
+        out = G.dequantize_blocks(_blocks(512, 0.5).cuda(), G._T.Q8_0,
+                                  torch.bfloat16, (512 * 32,))
+        assert not called, "disabled but the fused kernel ran anyway"
+        # Still correct — the torch chain is the reference.
+        assert out.numel() == 512 * 32
+
+    def test_fused_is_disabled_by_default(self):
+        """The regression gate, asserted so it cannot be flipped silently."""
+        assert G._FUSED_Q8_0_ENABLED is False, (
+            "the fused Q8_0 kernel slowed live generation ~10x; enabling it "
+            "requires a measured win against test_gguf_dequant_perf.py's "
+            "reference numbers, not merely bitwise correctness"
         )
 
     def test_cpu_tensors_never_take_the_fused_path(self):
