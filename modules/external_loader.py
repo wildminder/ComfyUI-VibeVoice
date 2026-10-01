@@ -72,6 +72,7 @@ from .attention_utils import (
 from .dtype_utils import resolve_dtype, cast_model_to_dtype_if_needed, set_config_dtype
 from .convrot_quant import UnsupportedQuantFormat
 from .quant_common import validate_weight_plan
+from .diagnostics import diagnostics_enabled
 from pathlib import Path
 
 from .patcher import (
@@ -1116,6 +1117,8 @@ def _log_load_diagnostics(
     weight_family: str,
     load_device,
 ) -> None:
+    if not diagnostics_enabled():
+        return
     logger.info(
         "Load diagnostics: model='%s' family=%s requested_attention=%s "
         "resolved_attention=%s device=%s",

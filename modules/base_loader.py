@@ -22,6 +22,7 @@ import comfy.utils
 import folder_paths
 
 from .model_info import get_tokenizer_repo
+from .diagnostics import diagnostics_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ def place_tensor_on_device(tensor, device):
         )
         if read_tensor_file_slice_into(tensor, destination):
             global _DMA_ANNOUNCED
-            if not _DMA_ANNOUNCED:
+            if not _DMA_ANNOUNCED and diagnostics_enabled():
                 _DMA_ANNOUNCED = True
                 logger.info(
                     "[vvload] weights are DMA'd file->VRAM (core aimdo); "

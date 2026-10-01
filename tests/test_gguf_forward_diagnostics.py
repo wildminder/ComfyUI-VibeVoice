@@ -126,7 +126,8 @@ class TestLoadResetsCounterScope:
 class TestLoadLineNoLongerFakesACounter:
     """(2) the load-time line must not carry a structurally-zero readout."""
 
-    def test_load_diagnostics_line_omits_forward_counters(self, caplog):
+    def test_load_diagnostics_line_omits_forward_counters(self, caplog, monkeypatch):
+        monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         _bump_both_counters()
         with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.external_loader"):
             _log_load_diagnostics(
@@ -148,7 +149,8 @@ class TestLoadLineNoLongerFakesACounter:
 class TestPostForwardReport:
     """(3) the real readout, taken where it can actually be non-zero."""
 
-    def test_reports_counts_after_forwards(self, caplog):
+    def test_reports_counts_after_forwards(self, caplog, monkeypatch):
+        monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         _bump_both_counters()
         with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.gguf_quant"):
             G.log_gguf_forward_counters("tts_generate")
@@ -156,6 +158,15 @@ class TestPostForwardReport:
         assert "gguf_forward_fast=1" in line
         assert "gguf_forward_streamed=1" in line
         assert "tts_generate" in line
+
+    def test_silent_in_production(self, caplog, monkeypatch):
+        """With no env var set the counters must not reach the console."""
+        monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
+        _bump_both_counters()
+        with caplog.at_level(logging.INFO, logger="ComfyUI_VibeVoice.modules.gguf_quant"):
+            G.log_gguf_forward_counters("tts_generate")
+        assert not [r for r in caplog.records
+                    if "GGUF forward diagnostics" in r.getMessage()]
 
     def test_silent_when_no_gguf_forward_happened(self, caplog):
         """A non-GGUF model must not get a meaningless line per generation."""

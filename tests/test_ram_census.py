@@ -275,7 +275,8 @@ class TestTotality:
 
 
 class TestRendering:
-    def test_line_is_single_and_prefixed(self, synthetic, caplog):
+    def test_line_is_single_and_prefixed(self, synthetic, caplog, monkeypatch):
+        monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         for tensor in list(synthetic.parameters()) + list(synthetic.buffers()):
             _tag(tensor)
         logger_name = "ComfyUI_VibeVoice.modules.memory_census"
@@ -291,6 +292,18 @@ class TestRendering:
         assert "private=0B" in message
         assert "100.0%" in message
 
+    def test_line_is_silent_in_production(self, synthetic, caplog, monkeypatch):
+        """Default (no env var set) must publish nothing."""
+        monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
+        monkeypatch.delenv("VIBEVOICE_RAM_CENSUS", raising=False)
+        for tensor in list(synthetic.parameters()) + list(synthetic.buffers()):
+            _tag(tensor)
+        with caplog.at_level(
+            logging.INFO, logger="ComfyUI_VibeVoice.modules.memory_census"
+        ):
+            report_census(synthetic, phase="pre-h2d:synthetic")
+        assert not [r for r in caplog.records if "[vvcensus]" in r.getMessage()]
+
     def test_families_are_capped_but_counted(self):
         report = census(Synthetic())
         report["families"] = {f"Kind{i}/params": 1024 * (i + 1) for i in range(10)}
@@ -298,16 +311,25 @@ class TestRendering:
         assert "families[10]" in message
         assert "+2 more" in message
 
-    def test_gate_defaults_on_and_honours_env(self, monkeypatch):
+    def test_gate_defaults_off_and_honours_env(self, monkeypatch):
+        monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
         monkeypatch.delenv("VIBEVOICE_RAM_CENSUS", raising=False)
-        assert census_enabled() is True
+        assert census_enabled() is False, "production must be silent"
         for value in ("0", "false", "No", "OFF", " off "):
             monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", value)
             assert census_enabled() is False
         monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", "1")
         assert census_enabled() is True
 
+    def test_master_switch_overrides_the_sub_gate(self, monkeypatch):
+        monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", "0")
+        monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
+        assert census_enabled() is True
+        monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "0")
+        assert census_enabled() is False
+
     def test_disabled_gate_still_returns_the_report(self, synthetic, caplog, monkeypatch):
+        monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
         monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", "0")
         with caplog.at_level(
             logging.INFO, logger="ComfyUI_VibeVoice.modules.memory_census"

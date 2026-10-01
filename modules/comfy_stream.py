@@ -33,6 +33,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .diagnostics import diagnostics_enabled, vbar_observer_enabled
+
 logger = logging.getLogger(__name__)
 
 # Last device on which a streaming forward actually computed. Core streams
@@ -117,10 +119,8 @@ def _install_vbar_observer() -> None:
     global _VBAR_OBSERVER
     if _VBAR_OBSERVER is not None:
         return
-    import os
 
-    if os.environ.get("VIBEVOICE_VBAR_OBSERVER", "1").strip().lower() in (
-            "0", "false", "off", "no"):
+    if not vbar_observer_enabled():
         _VBAR_OBSERVER = False
         return
     try:
@@ -222,6 +222,8 @@ _DTYPE_MISMATCH_LOGGED: set = set()
 
 def _log_conv_dtype_mismatch(module: nn.Module, x: torch.Tensor, w, b) -> None:
     """One-shot diagnostic for dtype-mismatched conv inputs."""
+    if not diagnostics_enabled():
+        return
     key = (id(module), str(x.dtype))
     if key in _DTYPE_MISMATCH_LOGGED:
         return

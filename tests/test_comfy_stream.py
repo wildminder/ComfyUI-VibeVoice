@@ -666,10 +666,12 @@ class TestVbarResidencyObserver:
         to core's call (counts, then delegates the SAME arguments) without
         dragging core's real vbar machinery into a CPU-only test. The
         module-level ``_VBAR_OBSERVER`` guard is cleared so the install path
-        itself is exercised rather than short-circuited.
+        itself is exercised rather than short-circuited. The observer is a
+        diagnostic, off in production, so its gate is switched on here.
         """
         import comfy.ops
 
+        monkeypatch.setenv("VIBEVOICE_VBAR_OBSERVER", "1")
         monkeypatch.setattr(comfy.ops, "resolve_cast_module_with_vbar", delegate)
         monkeypatch.setattr(CS, "_VBAR_OBSERVER", None)
         CS._install_vbar_observer()
@@ -748,3 +750,16 @@ class TestVbarResidencyObserver:
         CS._VBAR_SPLIT["reread_calls"] = 7
         CS.reset_pull_stats()
         assert CS._VBAR_SPLIT["reread_calls"] == 0
+
+    def test_observer_is_not_installed_in_production(self, monkeypatch):
+        """No env var set => the observer must leave core's resolver alone."""
+        import comfy.ops
+
+        monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
+        monkeypatch.delenv("VIBEVOICE_VBAR_OBSERVER", raising=False)
+        original = comfy.ops.resolve_cast_module_with_vbar
+        monkeypatch.setattr(CS, "_VBAR_OBSERVER", None)
+        CS._install_vbar_observer()
+        assert CS._VBAR_OBSERVER is False
+        assert comfy.ops.resolve_cast_module_with_vbar is original
+        monkeypatch.setattr(CS, "_VBAR_OBSERVER", None)

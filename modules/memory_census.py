@@ -33,6 +33,8 @@ import threading
 
 import torch
 
+from .diagnostics import census_enabled
+
 logger = logging.getLogger(__name__)
 
 _FILE_SLICE_ATTR = "_comfy_tensor_file_slice"
@@ -45,7 +47,6 @@ _STASH_GROUPS = (("backup", "backup"), ("backup_buffers", "backup_buffer"))
 
 _MAX_RENDERED_FAMILIES = 8
 _STREAMING_PREFIX = "_ComfyStream"
-_FALSEY_ENV = frozenset({"0", "false", "no", "off"})
 
 
 class _Seen:
@@ -56,11 +57,6 @@ class _Seen:
     def __init__(self, mmap_refs=None):
         self.storages = set()
         self.mmap_refs = set() if mmap_refs is None else mmap_refs
-
-
-def census_enabled() -> bool:
-    """True unless ``VIBEVOICE_RAM_CENSUS`` is explicitly switched off."""
-    return os.environ.get("VIBEVOICE_RAM_CENSUS", "1").strip().lower() not in _FALSEY_ENV
 
 
 def census(model, patcher=None) -> dict:

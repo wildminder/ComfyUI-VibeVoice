@@ -30,6 +30,7 @@ from .dtype_utils import resolve_dtype, DTYPE_AUTO
 from .attention_utils import resolve_attention_mode, resolve_realtime_attention_mode
 from .gguf_quant import log_gguf_forward_counters
 from .memory_census import measured_load, report_census
+from .diagnostics import diagnostics_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -390,7 +391,8 @@ def generate_audio(
                 _rss.mark("gen-enter")
                 outputs = model.generate(**gen_inputs, progress_callback=_progress)
                 _rss.mark("gen-return")
-            logger.info(pull_stats_line())
+            if diagnostics_enabled():
+                logger.info(pull_stats_line())
 
         except model_management.InterruptProcessingException:
             logger.info("VibeVoice generation interrupted by user")

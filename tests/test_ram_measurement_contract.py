@@ -169,7 +169,8 @@ class TestTheDenseRouteIsSampled:
 class TestMeasuredLoadContract:
     """``measured_load`` must never be able to break a load, and must report."""
 
-    def test_yields_a_sampler_and_logs_on_exit(self, caplog):
+    def test_yields_a_sampler_and_logs_on_exit(self, caplog, monkeypatch):
+        monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         with caplog.at_level(logging.INFO,
                              logger="ComfyUI_VibeVoice.modules.memory_census"):
             with measured_load("phase-under-test") as sampler:
@@ -178,8 +179,9 @@ class TestMeasuredLoadContract:
         assert any("[vvrss] phase-under-test" in r.message
                    for r in caplog.records)
 
-    def test_reports_even_when_the_body_raises(self, caplog):
+    def test_reports_even_when_the_body_raises(self, caplog, monkeypatch):
         """A failed load still reached a peak; that peak is the evidence."""
+        monkeypatch.setenv("VIBEVOICE_DIAGNOSTICS", "1")
         with caplog.at_level(logging.INFO,
                              logger="ComfyUI_VibeVoice.modules.memory_census"):
             with pytest.raises(ValueError):
@@ -189,6 +191,7 @@ class TestMeasuredLoadContract:
                    for r in caplog.records)
 
     def test_respects_the_env_gate(self, monkeypatch, caplog):
+        monkeypatch.delenv("VIBEVOICE_DIAGNOSTICS", raising=False)
         monkeypatch.setenv("VIBEVOICE_RAM_CENSUS", "0")
         with caplog.at_level(logging.INFO,
                              logger="ComfyUI_VibeVoice.modules.memory_census"):

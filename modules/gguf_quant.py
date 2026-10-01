@@ -28,6 +28,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .diagnostics import diagnostics_enabled
+
 logger = logging.getLogger(__name__)
 
 # Files already announced with the flat-pool recovery warning this session
@@ -664,6 +666,8 @@ def reset_gguf_forward_counters() -> None:
 
 
 def log_gguf_forward_counters(tag: str) -> None:
+    if not diagnostics_enabled():
+        return
     counters = gguf_forward_counters()
     if counters["fast"] == 0 and counters["streamed"] == 0:
         return
