@@ -266,6 +266,14 @@ def _dequant_q6_k(
 
 _TRITON_Q8_0_OK: "bool | None" = None
 
+# DISABLED 2026-10-01: live generation slowed ~10x. The kernel launches one
+# program per q8_0 block (32 elements, num_warps=1), so a 18944x3584 weight is
+# ~2.1M program launches per dequant — launch overhead swamps the arithmetic.
+# Bitwise correct, pathologically slow. The kernel and its tests stay; the
+# routing does not, until a tiled version is benchmarked against the torch chain
+# before it is ever enabled. Do not flip this back on without a measured win.
+_FUSED_Q8_0_ENABLED = False
+
 
 def triton_q8_0_available() -> bool:
     """Whether the fused Q8_0 kernel can be used on this box."""
@@ -366,7 +374,7 @@ def dequantize_blocks(raw: torch.Tensor, ggml_type, out_dtype: torch.dtype, shap
     # scratch plus a second full cast pass. Only for Q8_0 on CUDA, only when
     # Triton is importable — everything else falls through to the torch chain
     # below, which stays the reference implementation.
-    if (ggml_type == _T.Q8_0 and blocks.is_cuda and _DEQUANT_CACHE_ENABLED
+    if (_FUSED_Q8_0_ENABLED and ggml_type == _T.Q8_0 and blocks.is_cuda
             and triton_q8_0_available()):
         return _dequant_q8_0_fused(blocks, out_dtype).reshape(shape)
 
