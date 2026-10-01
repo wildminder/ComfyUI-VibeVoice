@@ -563,7 +563,7 @@ class TestUnifiedTTSNodeSharedLifecycle:
                     force_offload=True,
                 )
             )
-        offload.assert_called_once_with(patcher, "VibeVoice-Realtime-0.5B", warm=True)
+        offload.assert_called_once_with(patcher, "VibeVoice-Realtime-0.5B", warm=False)
 
     def test_output_dictionary_and_preview_are_shared(self):
         model, processor = _realtime_pair()

@@ -107,10 +107,12 @@ class TestBitwiseParityAgainstOracle:
         always-runs coverage of the same code path is
         ``test_synthetic_q8_0_tensor`` above.
         """
-        path = os.environ.get(
-            "VIBEVOICE_TEST_GGUF",
-            r"C:/AI/ComfyUI/ComfyUI/models/diffusion_models/vibevoice-1.5b-q8_0.gguf",
-        )
+        path = os.environ.get("VIBEVOICE_TEST_GGUF", "")
+        if not path:
+            pytest.skip(
+                "set VIBEVOICE_TEST_GGUF to a real q8_0 VibeVoice GGUF to run "
+                "this; it stays optional because the file is 3.2 GB"
+            )
         try:
             reader = gguf.GGUFReader(path)
         except Exception:

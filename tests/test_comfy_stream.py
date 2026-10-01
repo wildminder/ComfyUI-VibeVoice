@@ -2,6 +2,12 @@
 
 Parity against the ORIGINAL classes, conversion census/idempotence,
 meta-safety, fast-path vs cast-path plumbing.
+
+Production runs with ``_STREAMING_CONVERSION_ENABLED = False`` so a model that
+fits in VRAM executes at native PyTorch speed with no streaming interceptors.
+Everything below therefore tests the CAPABILITY, and switches the gate on for
+the duration of each test: without it ``convert_tree_for_streaming`` is a
+no-op returning ``{}`` and these assertions would pass for the wrong reason.
 """
 
 import logging
@@ -12,7 +18,14 @@ import pytest
 import torch
 from torch import nn
 
-from modules import comfy_stream as CS
+from ComfyUI_VibeVoice.modules import comfy_stream as CS
+
+
+@pytest.fixture(autouse=True)
+def _conversion_enabled():
+    """Run every test in this module with streaming conversion switched on."""
+    with CS.streaming_conversion(True):
+        yield
 
 
 # ---------------------------------------------------------------------
@@ -457,11 +470,27 @@ class TestConvertTree:
 # ---------------------------------------------------------------------
 
 class TestStreamingConversionGate:
-    """``streaming_conversion(False)`` must suppress the sweep and nothing
-    else. No caller opts in yet, so the default path has to be unchanged."""
+    """The gate is OFF in production and the context manager is the only way
+    on. Both directions are load-bearing: the default keeps a VRAM-resident
+    model on native PyTorch ops, and an explicit ``True`` must still work."""
 
-    def test_conversion_runs_by_default(self):
-        assert CS._STREAMING_CONVERSION_ENABLED is True
+    def test_conversion_is_off_by_default(self):
+        """The module default, read from a clean import, not a fixture."""
+        import importlib
+
+        reloaded = importlib.reload(CS)
+        try:
+            assert reloaded._STREAMING_CONVERSION_ENABLED is False
+            t = nn.Module()
+            t.lin = nn.Linear(4, 4)
+            assert reloaded.convert_tree_for_streaming(t) == {}
+            assert type(t.lin) is nn.Linear
+            assert getattr(t.lin, "comfy_cast_weights", False) is False
+        finally:
+            importlib.reload(CS)
+
+    def test_conversion_runs_when_enabled(self):
+        assert CS._STREAMING_CONVERSION_ENABLED is True  # set by the fixture
         t = nn.Module()
         t.lin = nn.Linear(4, 4)
         assert CS.convert_tree_for_streaming(t) == {"Linear": 1}
@@ -517,9 +546,9 @@ class TestStreamingConversionGate:
         rewrapped, whichever way the gate is set."""
         from gguf.constants import GGMLQuantizationType as T
 
-        from modules.convrot_quant import ConvRotInt8Linear
-        from modules.fp8_quant import FP8Linear
-        from modules.gguf_quant import GGUFLinear
+        from ComfyUI_VibeVoice.modules.convrot_quant import ConvRotInt8Linear
+        from ComfyUI_VibeVoice.modules.fp8_quant import FP8Linear
+        from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
 
         t = nn.Module()
         t.gguf = GGUFLinear(32, 32, bias=False, ggml_type=T.Q8_0)

@@ -211,7 +211,16 @@ class TestP01LedgerHarness:
 # P1.1/P1.2 — State dict is ALWAYS loaded onto CPU (DF-001/DF-002 fix)
 # ====================================================================
 class TestP1StateDictLoadedToCpu:
-    """Contract: checkpoints are read to CPU regardless of target device."""
+    """Contract: the streaming iterator is device-agnostic; the LOADER places.
+
+    The iterator still has no device parameter -- that is unchanged. What
+    changed is what happens next: ``_stream_apply_dense`` takes a
+    ``target_device`` and places every tensor itself (through core's
+    file->VRAM DMA when the storage is an aimdo view), instead of leaving a
+    CPU-resident model for the patcher to move in one bulk H2D later. So the
+    weight lands on the REQUESTED device, and the thing worth pinning is that
+    the loader -- not the iterator, and not the patcher -- decided.
+    """
 
     @pytest.mark.parametrize("model_type", ["official", "local_dir", "standalone"])
     def test_state_dict_loaded_to_cpu_single_file(self, ledger, ledger_model, model_type):
@@ -226,10 +235,8 @@ class TestP1StateDictLoadedToCpu:
             )
 
         mock_iter.assert_called_once_with("fake.safetensors")
-        # Streaming iterator contract: tensors always arrive on CPU (the
-        # iterator has no device parameter); the patcher owns the single
-        # H2D transfer after ComfyUI's VRAM arbitration.
-        assert ledger_model.w.device.type == "cpu"
+        # The iterator yields CPU tensors; the loader places them on CUDA.
+        assert ledger_model.w.device.type == CUDA.type
 
     def test_state_dict_loaded_to_cpu_sharded(self, ledger, ledger_model):
         """Sharded path: the streaming shard iterator feeds the assign loop."""
@@ -250,11 +257,17 @@ class TestP1StateDictLoadedToCpu:
 
         mock_iter.assert_called_once()
         assert captured["model_dir"] == "mp"
-        # Shards stream onto CPU; the merged-dict device arg is gone.
-        assert ledger_model.w.device.type == "cpu"
+        # Shards stream in on CPU and are placed onto the target by the loader.
+        assert ledger_model.w.device.type == CUDA.type
 
-    def test_load_state_dict_into_model_ignores_device_arg(self, ledger, ledger_model):
-        """Direct unit test of _load_state_dict_into_model: device arg is reserved."""
+    def test_load_state_dict_into_model_places_on_the_requested_device(
+        self, ledger, ledger_model
+    ):
+        """``device`` is the placement target, not a reserved argument.
+
+        A CPU target must still be honoured -- placement follows the request
+        rather than hardcoding the accelerator.
+        """
         with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
                    return_value=("fake.safetensors", False)), \
              patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
@@ -264,9 +277,21 @@ class TestP1StateDictLoadedToCpu:
                 model_path="mp",
                 model_type="official",
                 model_info={"type": "official"},
-                device=CUDA,  # must be ignored for placement
+                device=CUDA,
             )
-        # Streaming iterator yields CPU tensors unconditionally.
+        assert ledger_model.w.device.type == CUDA.type
+
+        with patch("ComfyUI_VibeVoice.modules.loader.VibeVoiceLoader._resolve_checkpoint_path",
+                   return_value=("fake.safetensors", False)), \
+             patch("ComfyUI_VibeVoice.modules.base_loader.BaseVibeVoiceLoader.iter_checkpoint_tensors",
+                   return_value=iter([("w", torch.zeros(1))])):
+            VibeVoiceLoader._load_state_dict_into_model(
+                model=ledger_model,
+                model_path="mp",
+                model_type="official",
+                model_info={"type": "official"},
+                device=torch.device("cpu"),
+            )
         assert ledger_model.w.device.type == "cpu"
 
 
@@ -804,12 +829,17 @@ class TestP4VramArbitration:
         assert patcher.loaded_size() == handler.model_loaded_weight_memory
 
     def test_no_untracked_vram_during_lazy_load(self, ledger, ledger_model):
-        """The lazy load itself must perform zero CUDA operations.
+        """The load must not perform CUDA operations the patcher cannot see.
 
-        DF-006: the step-2 VRAM spike existed because the lazy load touched
-        CUDA. With the fix, the entire handler.load_model → loader path is
-        CPU-only, so ComfyUI's free_memory() arbitration (which runs before
-        patch_model) sees all GPU traffic.
+        DF-006 originally meant "the lazy load touched CUDA behind core's
+        back, so ``free_memory()`` arbitration ran against a stale number".
+        That is still the property worth pinning -- but the mechanism is
+        different now. The load no longer stages on CPU and leaves one bulk
+        H2D to the patcher; it places each tensor itself as it streams. The
+        weight therefore ends up on the target device during the load, and
+        the contract is that this happens through ``place_tensor_on_device``
+        (core's file->VRAM DMA, or a plain ``.to()``) rather than through a
+        whole-tree ``model.to(cuda)`` that would spike outside arbitration.
         """
         handler = VibeVoiceModelHandler("VibeVoice-1.5B", attention_mode="sdpa")
         registry = {"VibeVoice-1.5B": {"type": "official", "repo_id": "test/repo", "path": "x"}}
@@ -820,12 +850,15 @@ class TestP4VramArbitration:
                    return_value=iter([("w", torch.zeros(1))])):
             handler.load_model(CUDA, attention_mode="sdpa")
 
-        assert ledger_model.w.device.type == "cpu"
-        assert ledger_model.device == CPU
+        # Placed by the loader onto the requested device -- no CPU staging.
+        assert ledger_model.w.device.type == CUDA.type
+        # And no whole-tree device move snuck in behind core's arbitration:
+        # a bare ``.to()`` on the container would show up as a module-level
+        # "to" event with no tensor argument.
         assert not any(
-            e[0] == "to" and e[1] is not None and e[1].type == "cuda"
+            e[0] == "to" and e[1] is None
             for e in ledger
-        ), f"lazy load touched CUDA: {ledger}"
+        ), f"load moved the whole tree at once: {ledger}"
 
 
 def VibeVoicePatcherForP4(handler):

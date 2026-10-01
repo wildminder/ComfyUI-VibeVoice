@@ -1,5 +1,6 @@
 """Phase C tests: ConvRot INT8 module, checkpoint scanning, group-size rules."""
 
+import importlib.util
 import json
 
 import pytest
@@ -232,6 +233,10 @@ class TestRowwiseFormatScanning:
         _sf(tensors, str(path))
         return path
 
+    @pytest.mark.skipif(
+        importlib.util.find_spec("comfy_kitchen") is None,
+        reason="comfy_kitchen (optional fp8 dequant backend) is not installed",
+    )
     def test_fp8_scalar_scale_marked_resident(self, tmp_path):
         """Scalar per-tensor scale + available kitchen backend -> resident."""
         p = self._write_fp8(tmp_path / "fp8s.safetensors",
@@ -242,6 +247,10 @@ class TestRowwiseFormatScanning:
         assert info.rowwise_dtype == torch.float8_e4m3fn
         assert (info.out_features, info.in_features) == (64, 64)
 
+    @pytest.mark.skipif(
+        importlib.util.find_spec("comfy_kitchen") is None,
+        reason="comfy_kitchen (optional fp8 dequant backend) is not installed",
+    )
     def test_fp8_single_element_1d_scale_marked_resident(self, tmp_path):
         p = self._write_fp8(tmp_path / "fp8s1.safetensors",
                             "model.prediction_head.cond_proj",

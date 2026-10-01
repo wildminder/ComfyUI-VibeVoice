@@ -548,17 +548,16 @@ class TestLoadASRFromExternal:
 
 
 class TestLoadASRUnderBothPatcherClasses:
-    """T8: the external ASR load path must work on EITHER patcher class.
+    """T8: the external ASR load path, driven through the real selector.
 
-    The selector (modules/patcher.py:select_patcher_class) is the only thing
-    that chooses, so the class is forced here by rebinding the name the
-    consuming module imported. Everything downstream — construction, the lazy
-    build, ``load_to_device``'s branch, the cache registration — then runs for
-    real.
+    ``select_patcher_class`` (modules/patcher.py) is the only thing that
+    chooses the patcher class, so the test uses its real answer rather than
+    forcing one. Everything downstream — construction, the lazy build,
+    ``load_to_device``'s branch, the cache registration — then runs for real.
 
     Assertions are on ``is_dynamic()`` and ``is_loaded``, never on
     ``isinstance``: ``ModelPatcherDynamic.__new__``
-    (comfy/model_patcher.py:1754-1757) reroutes a CPU load_device to a plain
+    (comfy/model_patcher.py) reroutes a CPU load_device to a plain
     ModelPatcher, so a "dynamic" instance is not necessarily an instance of the
     dynamic subclass. This is a correctness requirement, not a style preference.
     """
@@ -578,14 +577,18 @@ class TestLoadASRUnderBothPatcherClasses:
             "dynamic_vram_route": True,
         }
 
-    @pytest.mark.parametrize("patcher_kind", ["legacy", "dynamic"])
-    def test_asr_generation_works_under_both_patcher_classes(
-        self, monkeypatch, dynamic_core_alias, patcher_kind
-    ):
+    def test_asr_generation_works_under_the_selected_patcher_class(self, monkeypatch):
+        """Driven through the selector's real answer, with no forcing.
+
+        This used to be parametrized over the legacy and the minted dynamic
+        class. ``select_patcher_class`` now always returns the legacy class
+        (a model that fits in VRAM must not be trapped in vbar paging), so the
+        dynamic arm exercised a configuration production cannot produce.
+        """
         from ComfyUI_VibeVoice.modules.asr_generation import load_asr_from_external
         from ComfyUI_VibeVoice.modules.patcher import (
             VibeVoiceASRPatcher,
-            make_dynamic_patcher_class,
+            select_patcher_class,
         )
         from ComfyUI_VibeVoice.modules.utils import VIBEVOICE_ASR_PATCHER_CACHE
         from ComfyUI_VibeVoice.modules.asr_loader import LOADED_ASR_MODELS_CACHE
@@ -593,14 +596,14 @@ class TestLoadASRUnderBothPatcherClasses:
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
         LOADED_ASR_MODELS_CACHE.clear()
 
-        patcher_cls = (
-            make_dynamic_patcher_class(VibeVoiceASRPatcher)
-            if patcher_kind == "dynamic"
-            else VibeVoiceASRPatcher
+        # The ASR path selects with its own legacy class, exactly as
+        # load_asr_from_external does in production.
+        selected = select_patcher_class(
+            "dense", torch.device("cpu"), legacy_cls=VibeVoiceASRPatcher
         )
         monkeypatch.setattr(
             _asr_generation_module(), "select_patcher_class",
-            lambda *args, **kwargs: patcher_cls,
+            lambda *args, **kwargs: selected,
         )
 
         bundle = self._bundle()
@@ -611,7 +614,9 @@ class TestLoadASRUnderBothPatcherClasses:
                 bundle, device="cpu", dtype="fp32", attention_mode="sdpa"
             )
 
-        assert patcher.is_dynamic() is (patcher_kind == "dynamic")
+        # The selector is the single source of truth, and today it is legacy.
+        assert selected is VibeVoiceASRPatcher
+        assert patcher.is_dynamic() is False
         assert patcher.is_loaded is True
         assert model is not None
         assert processor is not None
@@ -627,35 +632,31 @@ class TestLoadASRUnderBothPatcherClasses:
         VIBEVOICE_ASR_PATCHER_CACHE.clear()
         LOADED_ASR_MODELS_CACHE.clear()
 
-    @pytest.mark.parametrize("patcher_kind", ["legacy", "dynamic"])
-    def test_asr_family_label_no_longer_decides_the_protocol(
-            self, monkeypatch, dynamic_core_alias, patcher_kind):
-        """2026-09-30: see the TTS twin — the ASR selector is the same rule
-        keyed on ``legacy_cls``. (The previous version asserted the removed
-        quant-family exclusion using a CPU device, where every family returns
-        legacy anyway — vacuous.)"""
+    def test_asr_family_label_no_longer_decides_the_protocol(self):
+        """See the TTS twin: the selector returns ``legacy_cls`` for EVERY
+        family and device.
+
+        The version this replaces asserted a whitelist (quant families on
+        CUDA select dynamic, except ``gguf_block``). That whitelist was what
+        pinned weights in CPU virtual memory; it is gone, and the contract now
+        is that no weight family can be routed into vbar paging by its label.
+        """
         import torch
         from ComfyUI_VibeVoice.modules.patcher import (
             VibeVoiceASRPatcher,
             select_patcher_class,
         )
 
-        for family in ("gguf_block", "convrot_int8", "fp8_resident", "", None):
-            assert select_patcher_class(
-                family, torch.device("cpu"), legacy_cls=VibeVoiceASRPatcher
-            ) is VibeVoiceASRPatcher
-
+        families = ("gguf_block", "convrot_int8", "fp8_resident", "dense", "", None)
+        devices = [torch.device("cpu")]
         if torch.cuda.is_available():
-            for family in ("convrot_int8", "fp8_resident", "", None):
-                selected = select_patcher_class(
-                    family, torch.device("cuda"), legacy_cls=VibeVoiceASRPatcher
-                )
-                assert selected is not VibeVoiceASRPatcher, family
-            assert select_patcher_class(
-                "gguf_block", torch.device("cuda"), legacy_cls=VibeVoiceASRPatcher
-            ) is VibeVoiceASRPatcher
+            devices.append(torch.device("cuda"))
 
-        del patcher_kind  # the parametrisation runs the same body twice
+        for family in families:
+            for device in devices:
+                assert select_patcher_class(
+                    family, device, legacy_cls=VibeVoiceASRPatcher
+                ) is VibeVoiceASRPatcher, f"family={family!r} device={device}"
 
 
 

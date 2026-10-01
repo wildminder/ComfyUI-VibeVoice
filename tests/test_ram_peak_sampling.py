@@ -44,7 +44,11 @@ _READING_DRIFT_TOLERANCE = 64 * 1024 * 1024
 class TestMemorySnapshot:
     def test_reports_all_three_quantities(self):
         snapshot = memory_snapshot()
-        assert set(snapshot) == {"ws", "uss", "private"}
+        # The three PROCESS counters are the contract. ``sys_used``
+        # (machine-wide RAM) rides along so a [vvrss] line can attribute a
+        # jump to this process or to the box, so assert the required keys are
+        # present rather than pinning the whole key set.
+        assert {"ws", "uss", "private"} <= set(snapshot)
         assert snapshot["ws"] > 0, "this platform must be able to read a working set"
         assert snapshot["uss"] > 0
         assert snapshot["private"] > 0

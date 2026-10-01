@@ -461,21 +461,24 @@ class TestPatcherLowvramContract:
                 stripped = line.strip()
                 if "lowvram_model_memory" not in stripped:
                     continue
-                if stripped.startswith(("def ", "lowvram_model_memory=")) or (
-                    stripped.startswith("lowvram_model_memory=")
-                ):
+                if stripped.startswith(("def ", "lowvram_model_memory=")):
                     continue
-                if "lowvram_model_memory=" in stripped and not stripped.startswith("def "):
-                    # A keyword argument in a super() forward is fine; an
-                    # attribute store (``self.lowvram_model_memory = ...``) is
-                    # not, and that is the thing this test exists to forbid.
-                    lhs = stripped.split("=", 1)[0]
-                    if "self." in lhs or "patcher." in lhs:
-                        assignments.append(f"{name}:{lineno}: {stripped}")
+                if "lowvram_model_memory=" not in stripped:
+                    continue
+                # A keyword argument in a call is fine; an attribute store
+                # (``self.lowvram_model_memory = ...``) is not, and that is the
+                # thing this test exists to forbid. Both forms put a receiver
+                # to the left of the ``=``, so the receiver alone cannot
+                # decide it: ``patcher.patch_model(..., lowvram_model_memory=0)``
+                # is the full-VRAM load path and is correct.
+                lhs = stripped.split("=", 1)[0]
+                if "(" in lhs or "self." not in lhs:
+                    continue
+                assignments.append(f"{name}:{lineno}: {stripped}")
         # Every mention lives in the patcher module: the legacy signature, its
         # docstring, the legacy forward (which names the parameter twice — once
-        # as key, once as value), and the DynamicVRAM sibling class's
-        # signature + forward added by the 2026-09-29 T6 selector port.
+        # as key, once as value), the full-VRAM call in ``load_to_device``, and
+        # the retired dynamic sibling's signature + forward.
         assert set(hits) == {"patcher.py"}, hits
         assert hits["patcher.py"] >= 3, hits
         assert assignments == [], assignments

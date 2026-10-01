@@ -6,6 +6,7 @@ against ``comfy_kitchen.dequantize_per_tensor_fp8`` on this box. All tests
 run on CPU (eager backend); no GPU required.
 """
 
+import importlib.util
 import json
 import sys
 import types
@@ -25,6 +26,26 @@ from ComfyUI_VibeVoice.modules.convrot_quant import QuantLayerInfo
 from ComfyUI_VibeVoice.modules.dtype_utils import (
     cast_model_to_dtype,
     cast_model_to_dtype_if_needed,
+)
+
+
+# comfy-kitchen provides the fp8 dequant kernels FP8Linear.forward calls. It is
+# in neither requirements.txt nor pyproject.toml, so a machine without it must
+# SKIP these rather than error: the fp8 path is simply unavailable there.
+#
+# find_spec is wrapped because it can raise on a broken or partially-installed
+# package, and this runs at COLLECTION time -- an exception here would error the
+# whole file instead of skipping the fp8 tests.
+def _has_comfy_kitchen() -> bool:
+    try:
+        return importlib.util.find_spec("comfy_kitchen") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+requires_kitchen = pytest.mark.skipif(
+    not _has_comfy_kitchen(),
+    reason="comfy_kitchen (optional fp8 dequant backend) is not installed",
 )
 
 
@@ -48,6 +69,7 @@ def _reference(m, x):
     return F.linear(x, ref_w, bias)
 
 
+@requires_kitchen
 class TestProbeFP8Backend:
     def test_returns_backend_on_this_box(self):
         assert probe_fp8_backend() in ("triton", "cuda", "eager")
@@ -67,7 +89,9 @@ class TestProbeFP8Backend:
             assert probe_fp8_backend() is None
 
     def test_none_when_no_backend_available(self):
-        import comfy_kitchen
+        # comfy_kitchen is in neither requirements.txt nor pyproject.toml, so a
+        # bare import here ERRORS on a machine without it instead of skipping.
+        comfy_kitchen = pytest.importorskip("comfy_kitchen")
 
         fake = types.ModuleType("comfy_kitchen")
         fake.dequantize_per_tensor_fp8 = comfy_kitchen.dequantize_per_tensor_fp8
@@ -107,6 +131,7 @@ class TestFP8LinearConstruction:
         assert tuple(m.weight.shape) == (8, 6)
 
 
+@requires_kitchen
 class TestFP8LinearForward:
     @pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float32])
     def test_parity_bit_exact(self, act_dtype):

@@ -985,7 +985,14 @@ class TestPostLoadParity:
 
     def test_legacy_config_still_reaches_the_vendored_pair(self, tmp_path):
         """The other side of the dispatch: a ``model_type "vibevoice"``
-        config must keep calling the vendored tokenizer and processor."""
+        config must keep calling the vendored tokenizer and processor.
+
+        The assertion is on the DISPATCH, not on how far the load then gets.
+        This used to require a ``RuntimeError`` from the vendored model
+        instantiation, but that was only ever a side-effect of conftest mocking
+        the vendored classes: pinning the failure mode made the test break for
+        reasons unrelated to the routing it exists to check.
+        """
         weight_path = str(tmp_path / "legacy.safetensors")
         torch.manual_seed(1)
         state_dict = {
@@ -1003,14 +1010,19 @@ class TestPostLoadParity:
              patch.object(EL.model_management, "get_torch_device", return_value=torch.device("cpu")):
             # The vendored classes are MagicMocks in conftest, so the vendored
             # model instantiation cannot build a real tree here; the point of
-            # this test is only the tokenizer/processor selection.
-            with pytest.raises(RuntimeError):
+            # this test is only the tokenizer/processor selection. Whether the
+            # load afterwards completes or raises is not the contract.
+            try:
                 EL.load_external_vibevoice_asr_model(
                     weight_path=str(weight_path),
                     config_name="VibeVoice-ASR",
                     attention_mode="sdpa",
                     dtype_str="fp32",
                 )
+            except Exception:
+                pass
 
+        # A "vibevoice" model_type must reach the VENDORED pair exactly once
+        # and must not fall through to the transformers-native classes.
         assert load_tokenizer.call_count == 1
         assert load_processor.call_count == 1

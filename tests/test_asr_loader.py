@@ -15,15 +15,24 @@ from ComfyUI_VibeVoice.modules.base_loader import BaseVibeVoiceLoader
 
 
 @pytest.fixture(autouse=True)
-def mock_tts_folder():
-    """Register a 'tts' folder with folder_paths for tests."""
-    import os
+def mock_tts_folder(tmp_path):
+    """Register a 'tts' folder with folder_paths for tests.
+
+    Points at a per-test tmp dir and restores the previous registry entry on
+    teardown. It used to register the REAL ``folder_paths.models_dir`` and
+    never undo it, which leaked global state into every later test in the
+    session and tied the suite to whatever the developer had installed.
+    """
     import folder_paths
-    tts_path = os.path.join(folder_paths.models_dir, "tts")
-    if "tts" not in folder_paths.folder_names_and_paths:
-        supported_exts = folder_paths.supported_pt_extensions.union({".safetensors", ".json"})
-        folder_paths.folder_names_and_paths["tts"] = ([tts_path], supported_exts)
+
+    supported_exts = folder_paths.supported_pt_extensions.union({".safetensors", ".json"})
+    previous = folder_paths.folder_names_and_paths.get("tts")
+    folder_paths.folder_names_and_paths["tts"] = ([str(tmp_path)], supported_exts)
     yield
+    if previous is None:
+        folder_paths.folder_names_and_paths.pop("tts", None)
+    else:
+        folder_paths.folder_names_and_paths["tts"] = previous
 
 
 class TestVibeVoiceASRModelHandler:

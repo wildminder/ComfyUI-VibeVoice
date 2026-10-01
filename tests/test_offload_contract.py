@@ -47,6 +47,21 @@ def _clean_cache():
     LOADED_MODELS_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def _conversion_enabled():
+    """Switch streaming conversion on for this module.
+
+    ``TestNativePartialResidency`` builds a tree and converts it explicitly
+    to prove core's lowvram machinery treats a CONVERTED module natively.
+    Production runs with the gate off, where ``convert_tree_for_streaming``
+    is a no-op -- so without this the test would pass while asserting nothing.
+    """
+    from ComfyUI_VibeVoice.modules.comfy_stream import streaming_conversion
+
+    with streaming_conversion(True):
+        yield
+
+
 # ====================================================================
 # D5/RC-6 — routine offload is non-destructive
 # ====================================================================
@@ -559,7 +574,7 @@ class TestNativePartialResidency:
     the REAL core ModelPatcher on CPU devices."""
 
     def _converted_tree(self):
-        from modules.comfy_stream import convert_tree_for_streaming
+        from ComfyUI_VibeVoice.modules.comfy_stream import convert_tree_for_streaming
 
         class _Tree(nn.Module):
             def __init__(self):
@@ -608,7 +623,7 @@ class TestNativePartialResidency:
         assert torch.isfinite(y).all()
 
     def test_forward_works_after_partial_unload(self):
-        from modules.comfy_stream import convert_tree_for_streaming
+        from ComfyUI_VibeVoice.modules.comfy_stream import convert_tree_for_streaming
 
         tree = self._converted_tree()
         mp = self._patcher(tree)
@@ -623,7 +638,7 @@ class TestNativePartialResidency:
         assert torch.isfinite(y).all()
 
     def test_round_trip_partial_unload_load(self):
-        from modules.comfy_stream import convert_tree_for_streaming
+        from ComfyUI_VibeVoice.modules.comfy_stream import convert_tree_for_streaming
 
         tree = self._converted_tree()
         mp = self._patcher(tree)

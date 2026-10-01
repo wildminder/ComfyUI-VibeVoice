@@ -19,31 +19,28 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 # 1. PATH CONFIGURATION
 # ====================================================================
 def _resolve_comfyui_root() -> str:
-    """Locate a ComfyUI checkout that actually exists on this machine.
+    """Locate a ComfyUI checkout for the suite to import.
 
     An explicit ``COMFYUI_ROOT`` always wins and is returned verbatim (even if
     missing — a bad override should surface as a loud import error, not be
     silently "helpfully" replaced).
 
-    The previous hardcoded default (``C:\\_Dev\\ComfyUI_dev\\ComfyUI``) pointed
-    at a path that no longer exists on the dev host, so with no env var set the
-    stale root was prepended to ``sys.path`` and six tests in
-    ``test_unified_tts_node.py`` errored with the opaque
-    "attempted relative import beyond top-level package" (the repo's own
-    ``nodes`` package shadowed ComfyUI's). Those tests deliberately fail loudly
-    rather than skip, so a stale root is a hard error, not a soft one — hence
-    the discovery below instead of a skip.
+    Otherwise the parent of this repo and its siblings are scanned for a
+    checkout carrying ComfyUI's top-level ``nodes.py`` and ``execution.py``.
+    There is deliberately NO hardcoded fallback. An earlier revision defaulted
+    to ``C:\\_Dev\\ComfyUI_dev\\ComfyUI``, which on any other machine put a
+    nonexistent path on ``sys.path`` and surfaced as an opaque "attempted
+    relative import beyond top-level package" (the repo's own ``nodes`` package
+    shadowing ComfyUI's) across a dozen unrelated test files. Failing here, by
+    name, is the only actionable outcome.
 
-    A root qualifies when it contains ComfyUI's top-level ``nodes.py`` and
-    ``execution.py`` (the modules ``test_unified_tts_node.py`` imports).
+    The scan is a convenience for a developer who keeps ComfyUI beside this
+    repo; ``COMFYUI_ROOT`` is the portable answer and the only one a fresh
+    checkout needs.
     """
     explicit = os.environ.get("COMFYUI_ROOT")
     if explicit:
         return explicit
-
-    default = r"C:\_Dev\ComfyUI_dev\ComfyUI"
-    if _is_comfyui_root(default):
-        return default
 
     # Search the parent of the ComfyUI_vendored-nodes tree first, then its
     # siblings, for any checkout that carries ComfyUI's top-level modules.
@@ -66,9 +63,22 @@ def _resolve_comfyui_root() -> str:
             if _is_comfyui_root(nested):
                 return nested
 
-    # Nothing found: keep the historical default so the failure message names
-    # a concrete path rather than an empty string.
-    return default
+    # Nothing found. There is deliberately NO hardcoded fallback: a stale path
+    # on sys.path produces an opaque import error deep inside an unrelated test
+    # ("attempted relative import beyond top-level package", or a module that
+    # silently resolves to the wrong tree). Naming the missing prerequisite is
+    # the only actionable thing this function can do, so it says so loudly and
+    # stops collection here rather than 14 files later.
+    raise RuntimeError(
+        "Could not locate a ComfyUI checkout.\n"
+        "These tests import ComfyUI itself (`comfy`, `folder_paths`), so a "
+        "real installation is required.\n"
+        "Point COMFYUI_ROOT at it and re-run, e.g.:\n"
+        "    COMFYUI_ROOT=/path/to/ComfyUI pytest tests/\n"
+        "A directory qualifies when it contains ComfyUI's top-level nodes.py "
+        "and execution.py.\n"
+        f"Searched: {search_dirs}"
+    )
 
 
 def _is_comfyui_root(path: str) -> bool:

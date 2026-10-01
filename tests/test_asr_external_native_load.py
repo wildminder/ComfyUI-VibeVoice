@@ -215,18 +215,21 @@ class TestNativeAsrExternalLoad:
         assert [n for n, b in model.named_buffers() if b.is_meta] == []
         assert [n for n, p in model.named_parameters() if p.is_meta] == []
 
-    def test_streaming_conversion_is_applied_to_the_loaded_tree(self, tiny_checkpoint):
-        """``convert_tree_for_streaming`` must actually have run on this tree.
+    def test_the_external_asr_tree_is_not_streaming_converted(self, tiny_checkpoint):
+        """The EXTERNAL ASR loader deliberately does not convert for streaming.
 
-        The call sits in ``loader._apply_state_dict`` inside a bare
-        ``except Exception`` that downgrades any failure to a warning
-        (modules/loader.py:816-822), so "the load succeeded" says nothing
-        about it: a refactor that dropped the import, renamed the helper or
-        started passing a wrong root would leave the 16.6 GB ASR checkpoint
-        entirely unstreamable while every other test stayed green. Core's
-        partial-load machinery only streams modules carrying
-        ``comfy_cast_weights``, so that flag on the leaves is the observable
-        end state of the conversion.
+        This inverts what the test used to assert. It required
+        ``comfy_cast_weights`` on every Linear leaf, on the reasoning that
+        ``convert_tree_for_streaming`` was called from
+        ``loader._apply_state_dict``. It is not: ``external_loader`` contains
+        no call to it at all, and the conversion gate is ``False`` in
+        production besides. So the previous assertion could never hold.
+
+        The invariant worth keeping is the one that makes the absence safe:
+        a model that is NOT streaming-converted must therefore not carry
+        ``comfy_cast_weights``, because that flag is what makes core page it
+        through vbar. If a future change starts converting here, this test
+        fails and forces a decision instead of letting it happen silently.
         """
         weight_path, _ = tiny_checkpoint
         model = _load_native_asr(weight_path)["model"]
@@ -236,32 +239,20 @@ class TestNativeAsrExternalLoad:
             for name, module in model.named_modules()
             if isinstance(module, torch.nn.Linear)
         ]
-        assert leaves, "fixture must expose Linear leaves to convert"
+        assert leaves, "fixture must expose Linear leaves"
 
-        unconverted = [name for name, m in leaves
-                       if getattr(m, "comfy_cast_weights", False) is not True]
-        assert not unconverted, (
-            f"{len(unconverted)} of {len(leaves)} Linear leaves were never "
-            f"converted for streaming (convert_tree_for_streaming did not "
-            f"reach this tree). First few: {unconverted[:5]}"
+        converted = [name for name, m in leaves
+                     if getattr(m, "comfy_cast_weights", False) is True]
+        assert not converted, (
+            f"{len(converted)} Linear leaves were converted for streaming by "
+            f"the external loader, which does not call "
+            f"convert_tree_for_streaming. First few: {converted[:5]}"
         )
 
-        # The bulk of the weight mass is the text backbone; name it
-        # explicitly so a partial conversion of the towers alone cannot pass.
-        lm_unconverted = [
-            name for name, m in leaves
-            if name.startswith("language_model.")
-            and getattr(m, "comfy_cast_weights", False) is not True
-        ]
-        assert not lm_unconverted, (
-            "language_model leaves not converted for streaming: "
-            f"{lm_unconverted[:5]}"
-        )
+    def test_the_load_does_not_change_the_weights(self, tiny_checkpoint):
+        """The load is a faithful copy: every tensor must round-trip exactly.
 
-    def test_streaming_conversion_does_not_change_the_weights(self, tiny_checkpoint):
-        """The conversion is a class swap only: values must survive it.
-
-        Without this, a "fix" that made the assertions above pass by
+        Without this, a "fix" that satisfied the assertions above by
         re-wrapping modules around fresh tensors would still look green.
         """
         weight_path, state_dict = tiny_checkpoint

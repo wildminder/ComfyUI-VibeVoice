@@ -12,7 +12,6 @@ Covers:
 
 import importlib
 import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -20,19 +19,19 @@ import torch
 
 from ComfyUI_VibeVoice.modules import audio_backend as ab
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TMP_DIR = PROJECT_ROOT / "tmp" / "test_audio_backend"
-
-
 # ====================================================================
 # Fixtures
 # ====================================================================
 
 @pytest.fixture()
-def audio_tmp_dir():
-    """Project-root tmp/ folder for scratch audio files (per project rule)."""
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    yield TMP_DIR
+def audio_tmp_dir(tmp_path):
+    """Per-test scratch dir for audio files.
+
+    Uses pytest's ``tmp_path`` rather than a folder inside the repo: writing
+    into the working tree leaves artefacts behind after a run and makes the
+    checkout dirty for anyone who has it under version control.
+    """
+    return tmp_path
 
 
 class _BlockingFinder:
@@ -397,9 +396,9 @@ class TestFileIO:
         assert sr == 16000
         assert data.ndim == 1
 
-    def test_load_missing_file_raises(self):
+    def test_load_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
-            ab.load_audio_file(str(TMP_DIR / "does_not_exist.wav"))
+            ab.load_audio_file(str(tmp_path / "does_not_exist.wav"))
 
     def test_save_invalid_rate_raises(self, audio_tmp_dir):
         with pytest.raises(ValueError):

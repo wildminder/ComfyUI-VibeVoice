@@ -26,17 +26,20 @@ from ComfyUI_VibeVoice.modules.config_detect import (
     fingerprint_weights,
 )
 
-# The user's file, the first external dense TTS checkpoint in play.
-FIXTURE = (
-    r"C:\AI\ComfyUI\ComfyUI\models\diffusion_models"
-    r"\VibeVoice-1.5B-bf16.safetensors"
-)
+# The first external dense TTS checkpoint in play. Opt-in: the file is 5.4 GB
+# and lived in one developer's models directory, so there is no portable
+# default and no fallback path. Set VIBEVOICE_TEST_DENSE_CHECKPOINT to run
+# these; the always-runs coverage of the same header-reading code lives in
+# test_config_detect.py and test_external_loader.py.
+FIXTURE = os.environ.get("VIBEVOICE_TEST_DENSE_CHECKPOINT", "")
 
 # 5,408,306,126 bytes, as reported by the filesystem.
 EXPECTED_BYTES = 5_408_306_126
 
 
 def _require_fixture():
+    if not FIXTURE:
+        pytest.skip("set VIBEVOICE_TEST_DENSE_CHECKPOINT to run this")
     if not os.path.isfile(FIXTURE):
         pytest.skip(f"fixture not present: {FIXTURE}")
     return FIXTURE

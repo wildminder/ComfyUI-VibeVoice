@@ -601,7 +601,10 @@ def dequantize_reader_tensor(
     if n_elements % block_size != 0:
         raise ValueError(
             f"GGUF tensor '{t.name}': element count {n_elements} is not a "
-            f"multiple of the {t.tensor_type.name} block size {block_size}."
+            f"multiple of the {t.tensor_type.name} block size {block_size}, "
+            f"so the block layout cannot be recovered. Re-export the "
+            f"checkpoint at a higher precision, or keep the small-kernel "
+            f"conv weights in float."
         )
     raw = torch.from_numpy(np.ascontiguousarray(t.data).copy())
     if raw.dtype != torch.uint8:
@@ -815,7 +818,9 @@ class UnmappedKeyError(ValueError):
         super().__init__(
             f"{len(self.unknown_keys)} GGUF tensor key(s) could not be mapped "
             f"onto the VibeVoice module tree (scheme='{scheme}'). First "
-            f"unknown keys: [{preview}]."
+            f"unknown keys: [{preview}]. If the file was written by a "
+            f"non-standard converter, place a sidecar config.json next to "
+            f"it to declare the architecture explicitly."
         )
 
 

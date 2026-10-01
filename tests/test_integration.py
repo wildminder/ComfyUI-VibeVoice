@@ -480,9 +480,15 @@ class TestExternalModelFullFlow:
         VIBEVOICE_PATCHER_CACHE.clear()
         LOADED_MODELS_CACHE.clear()
 
-        # Create a real dummy weight file so os.path.isfile passes.
+        # A REAL safetensors file, not a placeholder: the loader calls
+        # warn_if_lowbit_quantization(), which parses the header to decide
+        # whether the checkpoint is a naive int8 cast. b"dummy" made that
+        # raise SafetensorError before any of the flow under test ran.
+        from safetensors.torch import save_file
+
         weight_file = tmp_path / "weight.safetensors"
-        weight_file.write_bytes(b"dummy")
+        save_file({"model.language_model.weight": torch.zeros(2, 2)},
+                  str(weight_file))
 
         # --- Stage 1: load_external_vibevoice_model (mocked internals) ---
         fake_state_dict = {"model.language_model.weight": torch.zeros(2, 2)}

@@ -624,11 +624,11 @@ class TestReleasedVoicePromptPickle:
 
         import folder_paths
 
-        from modules.folder_registration import (
+        from ComfyUI_VibeVoice.modules.folder_registration import (
             register_voice_preset_folder,
             register_vibevoice_folders,
         )
-        from modules.voice_presets import resolve_voice_preset_path
+        from ComfyUI_VibeVoice.modules.voice_presets import resolve_voice_preset_path
 
         name = os.environ.get("VIBEVOICE_REALTIME_VOICE_PRESET", "en-Carter_man")
         try:
@@ -648,7 +648,7 @@ class TestReleasedVoicePromptPickle:
         if path is None:
             pytest.skip("no local voice preset available")
 
-        from modules.voice_presets import load_voice_preset
+        from ComfyUI_VibeVoice.modules.voice_presets import load_voice_preset
 
         preset = load_voice_preset(path, torch.device("cpu"))
         cache = mod._ensure_cache_has_layers(preset["tts_lm"].past_key_values)
