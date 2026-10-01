@@ -246,6 +246,80 @@ def _dequant_q6_k(
     return (d * q).reshape(n, _QK_K)
 
 
+# --- Fused Q8_0 dequant (Triton) ---------------------------------------
+#
+# The pure-torch `_dequant_q8_0` below is deliberately pinned bitwise to
+# gguf-quants semantics by `test_every_kernel_computes_in_fp32`: it computes in
+# fp32 and rounds ONCE, to the output dtype. That is the correctness contract.
+# What it costs is memory traffic — a weight-sized fp32 scratch, then a second
+# full pass to cast it (~6 B/elem of writes plus an allocation) — because it is
+# four separate kernel launches.
+#
+# The fused kernel keeps the arithmetic identical and removes the traffic: the
+# fp16 scale is lifted out once (one value per 32 elements, so it is ~1/32 of
+# the weight) and the Triton program multiplies in fp32 and stores the output
+# dtype in a single pass. One read stream, one write stream, one cast.
+#
+# The scale is pre-widened to fp32 in torch rather than bit-reinterpreted in
+# Triton: it costs one tiny op and removes the easiest thing to get subtly
+# wrong. Correctness of the multiply is untouched.
+
+_TRITON_Q8_0_OK: "bool | None" = None
+
+
+def triton_q8_0_available() -> bool:
+    """Whether the fused Q8_0 kernel can be used on this box."""
+    global _TRITON_Q8_0_OK
+    if _TRITON_Q8_0_OK is None:
+        try:
+            import triton  # noqa: F401
+            import triton.language as tl  # noqa: F401
+
+            _TRITON_Q8_0_OK = torch.cuda.is_available()
+        except Exception:
+            _TRITON_Q8_0_OK = False
+    return _TRITON_Q8_0_OK
+
+
+def _q8_0_scale_f32(blocks: torch.Tensor) -> torch.Tensor:
+    """The fp16 scale of every q8_0 block, widened to fp32: ``(n,)``."""
+    return blocks[:, :2].contiguous().view(torch.float16).to(torch.float32)
+
+
+def _build_q8_0_triton_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _kernel(blocks_ptr, scales_ptr, out_ptr, n_blocks,
+                BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        if pid >= n_blocks:
+            return
+        lane = tl.arange(0, BLOCK)                      # 32 lanes per block
+        d = tl.load(scales_ptr + pid)                   # fp32, one per block
+        base = pid * 34 + 2
+        # The payload is int8 but the buffer is uint8: a plain load would read
+        # 0..255 and give every value above 127 the wrong sign. Reinterpret.
+        x = tl.load(blocks_ptr + base + lane).to(tl.int8, bitcast=True)
+        acc = x.to(tl.float32) * d                      # fp32 multiply, once
+        tl.store(out_ptr + pid * 32 + lane, acc)
+
+    return _kernel
+
+
+def _dequant_q8_0_fused(blocks: torch.Tensor, out_dtype: torch.dtype):
+    """Q8_0 via Triton. Bitwise equal to the torch chain by construction:
+    int8 -> fp32 and the scale -> fp32, multiply in fp32, round once."""
+    kernel = _build_q8_0_triton_kernel()
+    n_blocks = blocks.shape[0]
+    scales = _q8_0_scale_f32(blocks)
+    out = torch.empty((n_blocks, 32), dtype=torch.float32, device=blocks.device)
+    kernel[(n_blocks,)](blocks, scales, out, n_blocks, BLOCK=32,
+                        num_warps=1)
+    return out.to(out_dtype)
+
+
 def _kernel_for(ggml_type):
     T = _T
     if ggml_type == T.Q8_0:
@@ -286,6 +360,16 @@ def dequantize_blocks(raw: torch.Tensor, ggml_type, out_dtype: torch.dtype, shap
             f"{ggml_type.name} type size {ts}"
         )
     blocks = raw.reshape(-1, ts)
+
+    # Fused path: same arithmetic (int8 -> fp32, fp32 multiply, round ONCE to
+    # out_dtype) with one read and one write instead of a weight-sized fp32
+    # scratch plus a second full cast pass. Only for Q8_0 on CUDA, only when
+    # Triton is importable — everything else falls through to the torch chain
+    # below, which stays the reference implementation.
+    if (ggml_type == _T.Q8_0 and blocks.is_cuda and _DEQUANT_CACHE_ENABLED
+            and triton_q8_0_available()):
+        return _dequant_q8_0_fused(blocks, out_dtype).reshape(shape)
+
     out = kernel(blocks, _compute_dtype_for(ggml_type, out_dtype))
     return out.reshape(shape).to(out_dtype)
 
