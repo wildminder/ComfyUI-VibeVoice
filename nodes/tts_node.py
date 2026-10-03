@@ -76,7 +76,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
             voice_preset_options = [PRESET_NONE, *list_voice_presets().keys()]
         except Exception as exc:
             logging.warning(
-                "[ComfyUI-VibeVoice] Could not discover realtime voice presets: %s", exc
+                "[VibeVoice TTS] Could not discover realtime voice presets: %s", exc
             )
             voice_preset_options = [PRESET_NONE]
 
@@ -343,7 +343,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
             )
         if family == "tts" and loaded_classification == "realtime":
             logging.warning(
-                "[ComfyUI-VibeVoice] Model '%s' was classified as standard TTS by name but "
+                "[VibeVoice TTS] Model '%s' was classified as standard TTS by name but "
                 "loaded realtime classes; routing through the realtime path.",
                 model_name,
             )
@@ -401,7 +401,7 @@ class VibeVoiceTTSNode(io.ComfyNode):
             }
 
             logging.info(
-                f"[ComfyUI-VibeVoice] Audio generation complete. Sample rate: {sample_rate}Hz"
+                f"[VibeVoice TTS] Audio generation complete. Sample rate: {sample_rate}Hz"
             )
 
             if force_offload:
@@ -410,16 +410,16 @@ class VibeVoiceTTSNode(io.ComfyNode):
             return io.NodeOutput(output_audio, ui=ui.PreviewAudio(output_audio, cls=cls))
 
         except model_management.InterruptProcessingException:
-            logging.info("[ComfyUI-VibeVoice] VibeVoice TTS generation was cancelled")
+            logging.info("[VibeVoice TTS] VibeVoice TTS generation was cancelled")
             return io.NodeOutput(cls._silent_output())
 
         except Exception as e:
             logging.error(
-                f"[ComfyUI-VibeVoice] Error during VibeVoice generation with "
+                f"[VibeVoice TTS] Error during VibeVoice generation with "
                 f"{attention_mode} attention: {e}"
             )
             if "interrupt" in str(e).lower() or "cancel" in str(e).lower():
-                logging.info("[ComfyUI-VibeVoice] Generation was interrupted")
+                logging.info("[VibeVoice TTS] Generation was interrupted")
                 return io.NodeOutput(cls._silent_output())
             raise
 
@@ -513,14 +513,14 @@ class VibeVoiceTTSNode(io.ComfyNode):
             )
         ):
             logging.warning(
-                "[ComfyUI-VibeVoice] Speaker reference audio is ignored for realtime "
+                "[VibeVoice TTS] Speaker reference audio is ignored for realtime "
                 "models: the VibeVoice realtime architecture is single-speaker and uses "
                 "the selected 'voice_preset' cached prompt."
             )
 
         if do_sample or temperature != 0.95 or top_p != 0.95 or top_k != 0:
             logging.warning(
-                "[ComfyUI-VibeVoice] Sampling controls "
+                "[VibeVoice TTS] Sampling controls "
                 "(do_sample/temperature/top_p/top_k) are not used by the current "
                 "realtime generation loop; model defaults are used instead."
             )

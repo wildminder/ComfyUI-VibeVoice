@@ -64,22 +64,22 @@ def get_sage_attention_function_and_params():
     if arch_code in (80, 86):  # Ampere
         pv_accum_dtype = "fp32"
         attn_func = sageattn_qk_int8_pv_fp16_cuda
-        logging.debug(f"[ComfyUI-VibeVoice] SageAttention: Using SM80+ (Ampere) FP16 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
+        logging.debug(f"[VibeVoice TTS] SageAttention: Using SM80+ (Ampere) FP16 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
     elif arch_code == 89:  # Ada Lovelace
         pv_accum_dtype = "fp32+fp32"
         attn_func = sageattn_qk_int8_pv_fp8_cuda
-        logging.debug(f"[ComfyUI-VibeVoice] SageAttention: Using SM89 (Ada) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
+        logging.debug(f"[VibeVoice TTS] SageAttention: Using SM89 (Ada) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
     elif arch_code == 90:  # Hopper
         pv_accum_dtype = "fp32+fp32"
         attn_func = sageattn_qk_int8_pv_fp8_cuda_sm90
-        logging.debug(f"[ComfyUI-VibeVoice] SageAttention: Using SM90 (Hopper) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
+        logging.debug(f"[VibeVoice TTS] SageAttention: Using SM90 (Hopper) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
     elif arch_code == 120:  # Blackwell
         pv_accum_dtype = "fp32+fp32"
         attn_func = sageattn_qk_int8_pv_fp8_cuda
-        logging.debug(f"[ComfyUI-VibeVoice] SageAttention: Using SM120 (Blackwell) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
+        logging.debug(f"[VibeVoice TTS] SageAttention: Using SM120 (Blackwell) FP8 kernel with pv_accum_dtype='{pv_accum_dtype}'.")
     else:
         logging.warning(
-            f"[ComfyUI-VibeVoice] SageAttention has no kernel for SM{arch_code}; SageAttention "
+            f"[VibeVoice TTS] SageAttention has no kernel for SM{arch_code}; SageAttention "
             f"supports SM80/86/89/90/120."
         )
         return None, None, None

@@ -143,12 +143,12 @@ def fingerprint_safetensors(path: str) -> Optional[WeightsFingerprint]:
                                 is_asr=True,
                             )
                         logging.debug(
-                            "[ComfyUI-VibeVoice] ASR embedding key '%s' in '%s' has foreign shape %s",
+                            "[VibeVoice TTS] ASR embedding key '%s' in '%s' has foreign shape %s",
                             candidate, os.path.basename(path), shape,
                         )
                         return None
                 logging.debug(
-                    "[ComfyUI-VibeVoice] '%s' carries ASR-only prefixes but none of the ASR "
+                    "[VibeVoice TTS] '%s' carries ASR-only prefixes but none of the ASR "
                     "embedding keys %s; refusing to classify it as a TTS family.",
                     os.path.basename(path), list(_ASR_EMBEDDING_CANDIDATES),
                 )
@@ -165,12 +165,12 @@ def fingerprint_safetensors(path: str) -> Optional[WeightsFingerprint]:
                             source_key=candidate,
                         )
                     logging.debug(
-                        "[ComfyUI-VibeVoice] Embedding key '%s' in '%s' has foreign shape %s",
+                        "[VibeVoice TTS] Embedding key '%s' in '%s' has foreign shape %s",
                         candidate, os.path.basename(path), shape,
                     )
                     return None
     except Exception as e:
-        logging.debug("[ComfyUI-VibeVoice] Safetensors fingerprint failed for '%s': %s", path, e)
+        logging.debug("[VibeVoice TTS] Safetensors fingerprint failed for '%s': %s", path, e)
     return None
 
 
@@ -189,12 +189,12 @@ def fingerprint_gguf_reader(reader) -> Optional[WeightsFingerprint]:
                         source_key=candidate,
                     )
                 logging.debug(
-                    "[ComfyUI-VibeVoice] GGUF tensor '%s' has foreign shape %s",
+                    "[VibeVoice TTS] GGUF tensor '%s' has foreign shape %s",
                     candidate, list(tensor.shape),
                 )
                 return None
     except Exception as e:
-        logging.debug("[ComfyUI-VibeVoice] GGUF fingerprint failed: %s", e)
+        logging.debug("[VibeVoice TTS] GGUF fingerprint failed: %s", e)
     return None
 
 
@@ -211,7 +211,7 @@ def fingerprint_weights(weight_path: str, gguf_reader=None) -> Optional[WeightsF
             reader = open_gguf_reader(weight_path)
             return fingerprint_gguf_reader(reader)
         except Exception as e:
-            logging.debug("[ComfyUI-VibeVoice] GGUF reader open failed for '%s': %s", weight_path, e)
+            logging.debug("[VibeVoice TTS] GGUF reader open failed for '%s': %s", weight_path, e)
             return None
 
     if lower.endswith(".safetensors"):

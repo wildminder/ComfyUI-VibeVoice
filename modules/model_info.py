@@ -214,7 +214,7 @@ def scan_vibevoice_models(search_path: str) -> list[dict]:
     try:
         items = os.listdir(search_path)
     except OSError as e:
-        logging.warning(f"[ComfyUI-VibeVoice] Cannot read directory {search_path}: {e}")
+        logging.warning(f"[VibeVoice TTS] Cannot read directory {search_path}: {e}")
         return results
 
     for item in sorted(items, key=str.casefold):
@@ -229,7 +229,7 @@ def scan_vibevoice_models(search_path: str) -> list[dict]:
             try:
                 child_files = os.listdir(item_path)
             except OSError as exc:
-                logging.warning(f"[ComfyUI-VibeVoice] Cannot read model directory {item_path}: {exc}")
+                logging.warning(f"[VibeVoice TTS] Cannot read model directory {item_path}: {exc}")
                 continue
             weights_exist = (
                 os.path.exists(os.path.join(item_path, "model.safetensors.index.json"))

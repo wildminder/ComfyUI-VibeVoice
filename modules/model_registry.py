@@ -36,7 +36,7 @@ def _neutralize_bundle(bundle) -> None:
             bundle[field] = None
         except Exception as e:
             logging.warning(
-                f"[ComfyUI-VibeVoice] model_registry: could not null bundle field '{field}': {e}"
+                f"[VibeVoice TTS] model_registry: could not null bundle field '{field}': {e}"
             )
 
 
@@ -49,7 +49,7 @@ def register_model_bundle(cache_key: str, bundle) -> None:
         _BUNDLE_REGISTRY[cache_key] = bundle
     except Exception as e:
         logging.warning(
-            f"[ComfyUI-VibeVoice] model_registry.register_model_bundle({cache_key!r}) failed: {e}"
+            f"[VibeVoice TTS] model_registry.register_model_bundle({cache_key!r}) failed: {e}"
         )
 
 
@@ -59,7 +59,7 @@ def release_model_bundles(cache_key: str) -> int:
         bundle = _BUNDLE_REGISTRY.pop(cache_key, None)
     except Exception as e:
         logging.warning(
-            f"[ComfyUI-VibeVoice] model_registry.release_model_bundles({cache_key!r}) failed: {e}"
+            f"[VibeVoice TTS] model_registry.release_model_bundles({cache_key!r}) failed: {e}"
         )
         return 0
     if bundle is None:
@@ -74,7 +74,7 @@ def get_live_bundle(cache_key: str):
         bundle = _BUNDLE_REGISTRY.get(cache_key)
     except Exception as e:
         logging.warning(
-            f"[ComfyUI-VibeVoice] model_registry.get_live_bundle({cache_key!r}) failed: {e}"
+            f"[VibeVoice TTS] model_registry.get_live_bundle({cache_key!r}) failed: {e}"
         )
         return None
     if bundle is None:
@@ -142,7 +142,7 @@ def unregister_from_comfy(patcher) -> list:
     try:
         import comfy.model_management as model_management
     except Exception as e:
-        logging.warning(f"[ComfyUI-VibeVoice] model_registry.unregister_from_comfy: cannot import comfy.model_management: {e}")
+        logging.warning(f"[VibeVoice TTS] model_registry.unregister_from_comfy: cannot import comfy.model_management: {e}")
         return removed
 
     loaded_list = getattr(model_management, "current_loaded_models", None)
@@ -179,7 +179,7 @@ def unregister_from_comfy(patcher) -> list:
     if removed:
         loaded_list[:] = survivors
         logging.debug(
-            f"[ComfyUI-VibeVoice] Unregistered {len(removed)} ComfyUI loaded-model entr(y/ies) for "
+            f"[VibeVoice TTS] Unregistered {len(removed)} ComfyUI loaded-model entr(y/ies) for "
             f"patcher {getattr(patcher, 'cache_key', '<unknown>')}"
         )
     return removed
@@ -223,7 +223,7 @@ def evict_patcher(patcher, cache_dict: dict, key: str) -> list:
         errors.append(f"soft_empty_cache failed: {e}")
 
     for err in errors:
-        logging.warning(f"[ComfyUI-VibeVoice] model_registry.evict_patcher({key}): {err}")
+        logging.warning(f"[VibeVoice TTS] model_registry.evict_patcher({key}): {err}")
     return errors
 
 
@@ -240,7 +240,7 @@ def evict_if_changed(family: str, new_key: str, patcher_caches) -> list:
         for key in [k for k in list(cache_dict.keys()) if k != new_key]:
             patcher = cache_dict.get(key)
             logging.debug(
-                f"[ComfyUI-VibeVoice] Model changed for family '{family}' "
+                f"[VibeVoice TTS] Model changed for family '{family}' "
                 f"(active={active!r} -> {new_key!r}); evicting '{key}'..."
             )
             evict_patcher(patcher, cache_dict, key)

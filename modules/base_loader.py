@@ -67,14 +67,14 @@ def place_tensor_on_device(tensor, device):
             if not _DMA_ANNOUNCED and diagnostics_enabled():
                 _DMA_ANNOUNCED = True
                 logging.info(
-                    "[ComfyUI-VibeVoice] [vvload] weights are DMA'd file->VRAM (core aimdo); "
+                    "[VibeVoice TTS] [vvload] weights are DMA'd file->VRAM (core aimdo); "
                     "host RAM should stay flat during a load"
                 )
             return destination
     except Exception:
         # A missing/older aimdo native library raises here rather than
         # returning False; a plain copy is always correct, just slower.
-        logging.debug("[ComfyUI-VibeVoice] file->device DMA unavailable, falling back to .to()",
+        logging.debug("[VibeVoice TTS] file->device DMA unavailable, falling back to .to()",
                      exc_info=True)
     return tensor.to(device)
 
@@ -156,7 +156,7 @@ class BaseVibeVoiceLoader:
             return
         if os.path.exists(os.path.join(local_dir, "config.json")):
             return
-        logging.info(f"[ComfyUI-VibeVoice] Downloading official VibeVoice model: {model_name or local_dir}...")
+        logging.info(f"[VibeVoice TTS] Downloading official VibeVoice model: {model_name or local_dir}...")
         import inspect
         from huggingface_hub import snapshot_download
 
@@ -239,7 +239,7 @@ class BaseVibeVoiceLoader:
             raise ValueError(f"Sharded checkpoint index '{ckpt_path}' has empty weight_map")
 
         shard_filenames = sorted(set(weight_map.values()))
-        logging.debug(f"[ComfyUI-VibeVoice] Loading {len(shard_filenames)} shards from {local_dir}")
+        logging.debug(f"[VibeVoice TTS] Loading {len(shard_filenames)} shards from {local_dir}")
 
         merged_state_dict = {}
         for shard_filename in shard_filenames:
@@ -248,13 +248,13 @@ class BaseVibeVoiceLoader:
                 raise FileNotFoundError(
                     f"Shard file not found: {shard_path} (referenced in {ckpt_path})"
                 )
-            logging.debug(f"[ComfyUI-VibeVoice] Loading shard: {shard_filename}")
+            logging.debug(f"[VibeVoice TTS] Loading shard: {shard_filename}")
             shard_state_dict = comfy.utils.load_torch_file(shard_path, device=device)
             merged_state_dict.update(shard_state_dict)
             del shard_state_dict
 
         logging.debug(
-            f"[ComfyUI-VibeVoice] Merged {len(merged_state_dict)} parameters from {len(shard_filenames)} shards"
+            f"[VibeVoice TTS] Merged {len(merged_state_dict)} parameters from {len(shard_filenames)} shards"
         )
         return merged_state_dict
 
@@ -309,7 +309,7 @@ class BaseVibeVoiceLoader:
             raise ValueError(f"Sharded checkpoint index '{ckpt_path}' has empty weight_map")
 
         shard_filenames = sorted(set(weight_map.values()))
-        logging.debug(f"[ComfyUI-VibeVoice] Loading {len(shard_filenames)} shards from {local_dir}")
+        logging.debug(f"[VibeVoice TTS] Loading {len(shard_filenames)} shards from {local_dir}")
 
         for shard_filename in shard_filenames:
             shard_path = os.path.join(local_dir, shard_filename)
@@ -317,5 +317,5 @@ class BaseVibeVoiceLoader:
                 raise FileNotFoundError(
                     f"Shard file not found: {shard_path} (referenced in {ckpt_path})"
                 )
-            logging.debug(f"[ComfyUI-VibeVoice] Loading shard: {shard_filename}")
+            logging.debug(f"[VibeVoice TTS] Loading shard: {shard_filename}")
             yield from BaseVibeVoiceLoader.iter_checkpoint_tensors(shard_path)

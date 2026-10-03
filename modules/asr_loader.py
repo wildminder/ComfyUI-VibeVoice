@@ -183,7 +183,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
         """
         try:
             logging.debug(
-                f"[ComfyUI-VibeVoice] Loading native ASR model from '{model_path}' with dtype: {model_dtype} "
+                f"[VibeVoice TTS] Loading native ASR model from '{model_path}' with dtype: {model_dtype} "
                 f"and attention: '{attn_implementation}'"
             )
             from transformers import AutoProcessor, VibeVoiceAsrForConditionalGeneration
@@ -221,7 +221,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
                 convert_tree_for_streaming(model)
             except Exception as e:
                 logging.warning(
-                    f"[ComfyUI-VibeVoice] Streaming conversion failed (continuing without it): {e}"
+                    f"[VibeVoice TTS] Streaming conversion failed (continuing without it): {e}"
                 )
 
             model.eval()
@@ -229,7 +229,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
             _apply_sage_attention_if_requested(model, attention_mode)
             _neutralize_generation_config_presets(model)
 
-            logging.info(f"[ComfyUI-VibeVoice] Successfully loaded native ASR model from '{model_path}'")
+            logging.info(f"[VibeVoice TTS] Successfully loaded native ASR model from '{model_path}'")
             return model, processor
 
         except ImportError as e:
@@ -238,7 +238,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
                 f"(native VibeVoice-ASR support); installed: {e}"
             )
         except Exception as e:
-            logging.error(f"[ComfyUI-VibeVoice] Failed to load native ASR model from '{model_path}': {e}")
+            logging.error(f"[VibeVoice TTS] Failed to load native ASR model from '{model_path}': {e}")
             raise RuntimeError(f"Failed to load ASR model '{model_path}': {e}")
 
     @staticmethod
@@ -294,7 +294,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
 
         try:
             logging.debug(
-                f"[ComfyUI-VibeVoice] Loading ASR model '{model_name}' with dtype: {model_dtype} "
+                f"[VibeVoice TTS] Loading ASR model '{model_name}' with dtype: {model_dtype} "
                 f"and attention: '{attn_implementation}'"
             )
 
@@ -323,7 +323,7 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
                 convert_tree_for_streaming(model)
             except Exception as e:
                 logging.warning(
-                    f"[ComfyUI-VibeVoice] Streaming conversion failed (continuing without it): {e}"
+                    f"[VibeVoice TTS] Streaming conversion failed (continuing without it): {e}"
                 )
 
             model.eval()
@@ -331,11 +331,11 @@ class VibeVoiceASRLoader(BaseVibeVoiceLoader):
             _apply_sage_attention_if_requested(model, attention_mode)
             _neutralize_generation_config_presets(model)
 
-            logging.info(f"[ComfyUI-VibeVoice] Successfully loaded ASR model '{model_name}'")
+            logging.info(f"[VibeVoice TTS] Successfully loaded ASR model '{model_name}'")
             return model, processor
 
         except Exception as e:
-            logging.error(f"[ComfyUI-VibeVoice] Failed to load ASR model '{model_name}': {e}")
+            logging.error(f"[VibeVoice TTS] Failed to load ASR model '{model_name}': {e}")
             raise RuntimeError(f"Failed to load ASR model '{model_name}': {e}")
 
 
@@ -352,6 +352,6 @@ def cleanup_asr_models(keep_cache_key: str = None) -> None:
             del LOADED_ASR_MODELS_CACHE[key]
 
     if keys_to_remove:
-        logging.debug(f"[ComfyUI-VibeVoice] Cleaned up cached ASR models: {keys_to_remove}")
+        logging.debug(f"[VibeVoice TTS] Cleaned up cached ASR models: {keys_to_remove}")
         gc.collect()
         model_management.soft_empty_cache()

@@ -146,7 +146,7 @@ class VibeVoiceTokenizerProcessor(FeatureExtractionMixin):
         # Validate sampling rate
         if sampling_rate is not None and sampling_rate != self.sampling_rate:
             logging.warning(
-                f"[ComfyUI-VibeVoice] Input sampling rate ({sampling_rate}) differs from expected "
+                f"[VibeVoice TTS] Input sampling rate ({sampling_rate}) differs from expected "
                 f"sampling rate ({self.sampling_rate}). Please resample your audio."
             )
         

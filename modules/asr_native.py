@@ -171,7 +171,7 @@ def build_native_asr_processor(tokenizer_dir: str, preprocessor_path: str = ""):
     )
 
     logging.debug(
-        f"[ComfyUI-VibeVoice] Building native VibeVoice-ASR processor from tokenizer "
+        f"[VibeVoice TTS] Building native VibeVoice-ASR processor from tokenizer "
         f"'{tokenizer_file}' (preprocessor overlay: "
         f"'{preprocessor_path or 'packaged defaults'}')"
     )

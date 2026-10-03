@@ -27,7 +27,7 @@ from . import audio_backend
 
 if audio_backend._active_resample_backend() == "none":
     logging.warning(
-        "[ComfyUI-VibeVoice] VibeVoice Node: no audio resampling backend available "
+        "[VibeVoice TTS] VibeVoice Node: no audio resampling backend available "
         "(torchaudio/scipy/librosa all missing). Resampling of reference "
         "audio will fail. Install torchaudio (preferred) or scipy."
     )
@@ -117,7 +117,7 @@ def parse_script_1_based(script: str) -> tuple[list[tuple[int, str]], list[int]]
                 text_content = text_content[colon_index + 1:]
 
             if speaker_id < 1:
-                logging.warning(f"[ComfyUI-VibeVoice] Speaker ID must be 1 or greater. Skipping line: '{line}'")
+                logging.warning(f"[VibeVoice TTS] Speaker ID must be 1 or greater. Skipping line: '{line}'")
                 continue
 
             text = text_content.strip()
@@ -127,10 +127,10 @@ def parse_script_1_based(script: str) -> tuple[list[tuple[int, str]], list[int]]
             if speaker_id not in speaker_ids_in_script:
                 speaker_ids_in_script.append(speaker_id)
         else:
-            logging.warning(f"[ComfyUI-VibeVoice] Could not parse speaker marker, treating as part of previous line if any, or ignoring: '{line}'")
+            logging.warning(f"[VibeVoice TTS] Could not parse speaker marker, treating as part of previous line if any, or ignoring: '{line}'")
 
     if not parsed_lines and script.strip():
-        logging.debug("[ComfyUI-VibeVoice] No speaker markers found. Treating entire text as a single utterance for Speaker 1.")
+        logging.debug("[VibeVoice TTS] No speaker markers found. Treating entire text as a single utterance for Speaker 1.")
         parsed_lines.append((0, ' ' + script.strip()))
         speaker_ids_in_script.append(1)
 
@@ -169,7 +169,7 @@ def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> Optional
 
     # Scrub invalid values BEFORE resampling (NaN would poison the sinc filter).
     if not torch.isfinite(tensor).all():
-        logging.error("[ComfyUI-VibeVoice] Audio contains NaN or Inf values, replacing with zeros")
+        logging.error("[VibeVoice TTS] Audio contains NaN or Inf values, replacing with zeros")
         tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
     if original_sr != int(target_sr):
@@ -179,17 +179,17 @@ def preprocess_comfy_audio(audio_dict: dict, target_sr: int = 24000) -> Optional
 
     # Ensure audio is not completely silent or has extreme values
     if np.all(waveform == 0):
-        logging.warning("[ComfyUI-VibeVoice] Audio waveform is completely silent")
+        logging.warning("[VibeVoice TTS] Audio waveform is completely silent")
 
     # Normalize extreme values
     max_val = np.abs(waveform).max()
     if max_val > 10.0:
-        logging.warning(f"[ComfyUI-VibeVoice] Audio values are very large (max: {max_val}), normalizing")
+        logging.warning(f"[VibeVoice TTS] Audio values are very large (max: {max_val}), normalizing")
         waveform = waveform / max_val
 
     # Final check after resampling
     if np.any(np.isnan(waveform)) or np.any(np.isinf(waveform)):
-        logging.error("[ComfyUI-VibeVoice] Audio contains NaN or Inf after resampling, replacing with zeros")
+        logging.error("[VibeVoice TTS] Audio contains NaN or Inf after resampling, replacing with zeros")
         waveform = np.nan_to_num(waveform, nan=0.0, posinf=0.0, neginf=0.0)
 
     return waveform.astype(np.float32)

@@ -233,7 +233,7 @@ def resample_audio_tensor(
             )
         except Exception as e:  # pragma: no cover - defensive fallthrough
             logging.warning(
-                f"[ComfyUI-VibeVoice] VibeVoice: torchaudio resample failed ({e}); falling back."
+                f"[VibeVoice TTS] VibeVoice: torchaudio resample failed ({e}); falling back."
             )
 
     if _HAS_SCIPY:

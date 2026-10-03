@@ -390,7 +390,7 @@ def _ensure_cache_has_layers(cache):
     # bookkeeping that would make CPU offloading meaningful anyway.
     if getattr(cache, 'offloading', False) and not hasattr(cache, 'prefetch_stream'):
         logging.warning(
-            "[ComfyUI-VibeVoice] VibeVoice realtime: dropping `offloading=True` from a cached voice prompt - "
+            "[VibeVoice TTS] VibeVoice realtime: dropping `offloading=True` from a cached voice prompt - "
             "the pickled cache has no prefetch stream, and Cache.update would raise on it."
         )
         try:

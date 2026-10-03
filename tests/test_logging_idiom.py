@@ -5,10 +5,10 @@ logger (``app/logger.py``: ``setup_logger`` does ``logging.getLogger()`` then
 ``addHandler``). The formatter wraps every record in a coloured ``[LEVEL]`` tag
 and formats the body as bare ``%(message)s``. So a line reaches the console as::
 
-    [INFO] [ComfyUI-VibeVoice] Audio generation complete. Sample rate: 24000Hz
+    [INFO] [VibeVoice TTS] Audio generation complete. Sample rate: 24000Hz
 
 The whole idiom is therefore: a BARE ``logging.<level>(...)`` call on the root
-logger whose message begins with the literal ``"[ComfyUI-VibeVoice] "``. Core
+logger whose message begins with the literal ``"[VibeVoice TTS] "``. Core
 owns the level, the handler and the colour; this package owns nothing but the
 prefix. There is deliberately no ``vv_logging`` module, no ``Logger`` subclass,
 no ``LoggerAdapter``, no ``Formatter`` and no ``setLevel`` anywhere.
@@ -33,7 +33,7 @@ import os
 
 import pytest
 
-PREFIX = "[ComfyUI-VibeVoice] "
+PREFIX = "[VibeVoice TTS] "
 PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.join(PKG_DIR, "tests")
 
@@ -166,23 +166,22 @@ class TestRenderedBytes:
 
     def test_info_renders_green_tag_then_prefixed_message(self):
         out = self._render(logging.INFO, PREFIX + "Audio generation complete.")
-        assert out == "\x1b[32m[INFO]\x1b[0m [ComfyUI-VibeVoice] Audio generation complete."
+        assert out == "\x1b[32m[INFO]\x1b[0m " + PREFIX + "Audio generation complete."
 
     def test_warning_renders_bold_yellow_tag(self):
         out = self._render(logging.WARNING, PREFIX + "sage is not usable on this machine")
         assert out == (
-            "\x1b[1m\x1b[33m[WARNING]\x1b[0m "
-            "[ComfyUI-VibeVoice] sage is not usable on this machine"
+            "\x1b[1m\x1b[33m[WARNING]\x1b[0m " + PREFIX + "sage is not usable on this machine"
         )
 
     def test_error_renders_bold_red_tag(self):
         out = self._render(logging.ERROR, PREFIX + "boom")
-        assert out == "\x1b[1m\x1b[31m[ERROR]\x1b[0m [ComfyUI-VibeVoice] boom"
+        assert out == "\x1b[1m\x1b[31m[ERROR]\x1b[0m " + PREFIX + "boom"
 
     def test_prefix_is_part_of_the_message_not_a_format_string(self):
         """The prefix must survive ``%``-style lazy args intact."""
         out = self._render(logging.WARNING, PREFIX + "model '%s' -> '%s'", "a", "b")
-        assert out.endswith("[ComfyUI-VibeVoice] model 'a' -> 'b'")
+        assert out.endswith(PREFIX + "model 'a' -> 'b'")
 
 
 # ---------------------------------------------------------------------------

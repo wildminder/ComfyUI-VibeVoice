@@ -95,7 +95,7 @@ def replace_linears_for_quant(model: torch.nn.Module, layer_plan: dict) -> list:
         setattr(parent_cache[parent_name], child_name, new_mod)
         replaced.append(prefix)
 
-    logging.debug(f"[ComfyUI-VibeVoice] Replaced {len(replaced)} nn.Linear(s) with quant-resident modules")
+    logging.debug(f"[VibeVoice TTS] Replaced {len(replaced)} nn.Linear(s) with quant-resident modules")
     return replaced
 
 
@@ -128,7 +128,7 @@ def validate_weight_plan(
         )
     if attention_mode == "sage" and is_gguf_file and gguf_kquant_present:
         logging.warning(
-            "[ComfyUI-VibeVoice] SageAttention requested alongside GGUF K-quants: sage patches "
+            "[VibeVoice TTS] SageAttention requested alongside GGUF K-quants: sage patches "
             "attention computation only, quantized linear layers still run "
             "through per-matmul dequantization."
         )

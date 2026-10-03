@@ -232,7 +232,7 @@ def _log_conv_dtype_mismatch(module: nn.Module, x: torch.Tensor, w, b) -> None:
         for fr in reversed(traceback.extract_stack()[-15:-1])
     )
     logging.warning(
-        "[ComfyUI-VibeVoice] [vvdtype] conv dtype mismatch on %s(id=%x, layer_id=%s): x %s on %s "
+        "[VibeVoice TTS] [vvdtype] conv dtype mismatch on %s(id=%x, layer_id=%s): x %s on %s "
         "dtype=%s | w %s dtype=%s | b %s dtype=%s | call chain (innermost last): %s",
         type(module).__name__, id(module) & 0xFFFFFF,
         getattr(module, "_layer_id", None),
@@ -468,7 +468,7 @@ def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
     """Swap eligible leaf-module classes for streaming subclasses in place."""
     if not _STREAMING_CONVERSION_ENABLED:
         logging.debug(
-            "[ComfyUI-VibeVoice] Streaming conversion bypassed: model will execute with native "
+            "[VibeVoice TTS] Streaming conversion bypassed: model will execute with native "
             "resident PyTorch CUDA tensors."
         )
         return {}
@@ -480,7 +480,7 @@ def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
 
         register_vendored_types(register_streaming_type)
     except Exception as e:
-        logging.debug(f"[ComfyUI-VibeVoice] vendored streaming types unavailable: {e}")
+        logging.debug(f"[VibeVoice TTS] vendored streaming types unavailable: {e}")
 
     skip_set = [root]
     skip_set.extend(skip)
@@ -514,13 +514,13 @@ def convert_tree_for_streaming(root: nn.Module, skip=()) -> dict:
 
     if unknown_with_params:
         logging.warning(
-            "[ComfyUI-VibeVoice] Streaming conversion skipped %d parameter-bearing module "
+            "[VibeVoice TTS] Streaming conversion skipped %d parameter-bearing module "
             "kind(s) without a registered streaming forward: %s",
             len(unknown_with_params), unknown_with_params[:8],
         )
     if census:
         logging.debug(
-            "[ComfyUI-VibeVoice] Streaming-enabled %d module(s): %s",
+            "[VibeVoice TTS] Streaming-enabled %d module(s): %s",
             sum(census.values()),
             ", ".join(f"{k}={v}" for k, v in sorted(census.items())),
         )

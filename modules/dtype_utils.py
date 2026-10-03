@@ -180,7 +180,7 @@ def cast_model_to_dtype(model, dtype: torch.dtype) -> None:
     if dtype is None:
         return
     _cast_mismatched_params(model, dtype)
-    logging.debug(f"[ComfyUI-VibeVoice] Model cast to dtype (filtered): {dtype}")
+    logging.debug(f"[VibeVoice TTS] Model cast to dtype (filtered): {dtype}")
 
 
 def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
@@ -202,5 +202,5 @@ def cast_model_to_dtype_if_needed(model, dtype: torch.dtype) -> None:
     _cast_mismatched_params(model, dtype)
     sources = ", ".join(sorted({str(src) for _, src in mismatched}))
     logging.debug(
-        f"[ComfyUI-VibeVoice] Model cast {sources} -> {dtype} ({len(mismatched)} mismatched params)"
+        f"[VibeVoice TTS] Model cast {sources} -> {dtype} ({len(mismatched)} mismatched params)"
     )

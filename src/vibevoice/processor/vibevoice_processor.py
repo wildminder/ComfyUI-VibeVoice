@@ -82,8 +82,8 @@ class VibeVoiceProcessor:
                 with open(config_file, 'r') as f:
                     config = json.load(f)
             except Exception as e:
-                logging.warning(f"[ComfyUI-VibeVoice] Could not load preprocessor_config.json from {pretrained_model_name_or_path}: {e}")
-                logging.warning("[ComfyUI-VibeVoice] Using default configuration")
+                logging.warning(f"[VibeVoice TTS] Could not load preprocessor_config.json from {pretrained_model_name_or_path}: {e}")
+                logging.warning("[VibeVoice TTS] Using default configuration")
                 config = {
                     "speech_tok_compress_ratio": 3200,
                     "db_normalize": True,
@@ -95,7 +95,7 @@ class VibeVoiceProcessor:
         
         # Load tokenizer - try from model path first, then fall back to Qwen        
         language_model_pretrained_name = config.get("language_model_pretrained_name", None) or kwargs.pop("language_model_pretrained_name", "Qwen/Qwen2.5-1.5B")
-        logging.info(f"[ComfyUI-VibeVoice] Loading tokenizer from {language_model_pretrained_name}")
+        logging.info(f"[VibeVoice TTS] Loading tokenizer from {language_model_pretrained_name}")
         if 'qwen' in language_model_pretrained_name.lower():
             tokenizer = VibeVoiceTextTokenizerFast.from_pretrained(
                 language_model_pretrained_name,
@@ -158,7 +158,7 @@ class VibeVoiceProcessor:
         with open(config_path, 'w') as f:
             json.dump(processor_config, f, indent=2)
         
-        logging.debug(f"[ComfyUI-VibeVoice] Processor configuration saved in {config_path}")
+        logging.debug(f"[VibeVoice TTS] Processor configuration saved in {config_path}")
     
     def __call__(
         self,
@@ -528,21 +528,21 @@ class VibeVoiceProcessor:
         script_lines = []
         for item in data:
             if not isinstance(item, dict):
-                logging.warning(f"[ComfyUI-VibeVoice] Skipping non-dict entry: {item}")
+                logging.warning(f"[VibeVoice TTS] Skipping non-dict entry: {item}")
                 continue
                 
             speaker = item.get('speaker')
             text = item.get('text')
             
             if speaker is None or text is None:
-                logging.warning(f"[ComfyUI-VibeVoice] Skipping entry missing speaker or text: {item}")
+                logging.warning(f"[VibeVoice TTS] Skipping entry missing speaker or text: {item}")
                 continue
             
             # Ensure speaker ID is valid
             try:
                 speaker_id = int(speaker)
             except (ValueError, TypeError):
-                logging.warning(f"[ComfyUI-VibeVoice] Invalid speaker ID: {speaker}, skipping entry")
+                logging.warning(f"[VibeVoice TTS] Invalid speaker ID: {speaker}, skipping entry")
                 continue
             
             # Clean up text
@@ -613,7 +613,7 @@ class VibeVoiceProcessor:
                 parsed_lines.append((speaker_id, text))
                 speaker_ids.append(speaker_id)
             else:
-                logging.warning(f"[ComfyUI-VibeVoice] Could not parse line: '{line}'")
+                logging.warning(f"[VibeVoice TTS] Could not parse line: '{line}'")
         
         if not parsed_lines:
             raise ValueError("No valid speaker lines found in script")

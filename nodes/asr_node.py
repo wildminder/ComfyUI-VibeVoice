@@ -281,7 +281,7 @@ class VibeVoiceASRNode(io.ComfyNode):
             # Format segments as JSON string
             segments_json = json.dumps(segments, indent=2, ensure_ascii=False)
 
-            logging.info(f"[ComfyUI-VibeVoice] ASR transcription complete. {len(segments)} segments.")
+            logging.info(f"[VibeVoice TTS] ASR transcription complete. {len(segments)} segments.")
 
             if force_offload:
                 force_offload_asr_model(model_name, patcher)
@@ -289,9 +289,9 @@ class VibeVoiceASRNode(io.ComfyNode):
             return io.NodeOutput(raw_text, segments_json)
 
         except model_management.InterruptProcessingException:
-            logging.info("[ComfyUI-VibeVoice] VibeVoice ASR transcription was cancelled")
+            logging.info("[VibeVoice TTS] VibeVoice ASR transcription was cancelled")
             return io.NodeOutput("", "[]")
 
         except Exception as e:
-            logging.error(f"[ComfyUI-VibeVoice] Error during VibeVoice ASR transcription: {e}")
+            logging.error(f"[VibeVoice TTS] Error during VibeVoice ASR transcription: {e}")
             raise

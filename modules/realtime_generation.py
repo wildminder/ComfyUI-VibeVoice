@@ -246,7 +246,7 @@ def generate_realtime_audio(
     cfg_scale, cfg_adjusted = resolve_cfg_scale(cfg_scale)
     if cfg_adjusted:
         logging.warning(
-            "[ComfyUI-VibeVoice] cfg_scale was below the realtime model's usable guidance floor and "
+            "[VibeVoice TTS] cfg_scale was below the realtime model's usable guidance floor and "
             "has been raised to %.2f. Values below %.2f make this checkpoint "
             "repeat syllables instead of speaking the script. Raise the "
             "'cfg_scale' widget to silence this warning.",
@@ -279,7 +279,7 @@ def generate_realtime_audio(
         context_room = int(model.config.decoder_config.max_position_embeddings) - tts_lm_prompt_len
     except AttributeError:
         logging.warning(
-            "[ComfyUI-VibeVoice] Realtime model does not expose decoder_config.max_position_embeddings; "
+            "[VibeVoice TTS] Realtime model does not expose decoder_config.max_position_embeddings; "
             "falling back to the automatic length budget without a context cap."
         )
         context_room = REALTIME_MAX_AUTO_BUDGET_UNITS
@@ -287,7 +287,7 @@ def generate_realtime_audio(
         max_new_tokens, text_token_count=text_token_count, context_room=context_room
     )
     logging.info(
-        "[ComfyUI-VibeVoice] Realtime length budget: %d max_new_tokens units (~%.1f s of speech) "
+        "[VibeVoice TTS] Realtime length budget: %d max_new_tokens units (~%.1f s of speech) "
         "for %d text tokens.",
         length_budget,
         # The budget also pays for the text, so the speech it buys is only the
@@ -316,7 +316,7 @@ def generate_realtime_audio(
                 progress_callback=_progress,
             )
     except model_management.InterruptProcessingException:
-        logging.info("[ComfyUI-VibeVoice] VibeVoice realtime generation interrupted by user")
+        logging.info("[VibeVoice TTS] VibeVoice realtime generation interrupted by user")
         raise
     finally:
         pbar.update_absolute(pbar.total)
@@ -341,7 +341,7 @@ def generate_realtime_audio(
     reach_max = getattr(outputs, "reach_max_step_sample", None)
     if reach_max is not None and bool(reach_max.any()):
         logging.warning(
-            "[ComfyUI-VibeVoice] Realtime generation stopped on the length budget (%d units) "
+            "[VibeVoice TTS] Realtime generation stopped on the length budget (%d units) "
             "without the model signalling end of speech, so the clip is "
             "truncated. Lower 'max_new_tokens' will not help; raise it, or "
             "shorten the script.",

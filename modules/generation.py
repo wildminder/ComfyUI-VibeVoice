@@ -101,7 +101,7 @@ class ExternalVibeVoiceModelHandler(torch.nn.Module):
     def load_model(self, device, attention_mode: str = "sdpa"):
         """No-op: the model is already loaded."""
         logging.debug(
-            f"[ComfyUI-VibeVoice] ExternalVibeVoiceModelHandler.load_model called but model is "
+            f"[VibeVoice TTS] ExternalVibeVoiceModelHandler.load_model called but model is "
             f"already loaded for '{self.model_pack_name}'"
         )
 
@@ -187,7 +187,7 @@ def load_vibevoice_from_external(
         )
         VIBEVOICE_PATCHER_CACHE[cache_key] = patcher
         logging.debug(
-            f"[ComfyUI-VibeVoice] Created new external patcher for {model_name} with "
+            f"[VibeVoice TTS] Created new external patcher for {model_name} with "
             f"attn={actual_attention_mode}"
         )
 
@@ -255,7 +255,7 @@ def load_vibevoice_model(
             dtype=target_dtype,
         )
         VIBEVOICE_PATCHER_CACHE[cache_key] = patcher
-        logging.debug(f"[ComfyUI-VibeVoice] Created new patcher for {model_name} with attn={actual_attention_mode}, q4={quantize_4bit}")
+        logging.debug(f"[VibeVoice TTS] Created new patcher for {model_name} with attn={actual_attention_mode}, q4={quantize_4bit}")
 
     patcher = VIBEVOICE_PATCHER_CACHE[cache_key]
 
@@ -313,12 +313,12 @@ def generate_audio(
         if processed is not None:
             processed = np.asarray(processed, dtype=np.float32)
             if processed.ndim == 0:
-                logging.warning("[ComfyUI-VibeVoice] Voice sample is a scalar (0-d array), skipping")
+                logging.warning("[VibeVoice TTS] Voice sample is a scalar (0-d array), skipping")
                 continue
             if processed.ndim > 1:
                 processed = np.squeeze(processed)
             if processed.ndim != 1:
-                logging.warning(f"[ComfyUI-VibeVoice] Voice sample has unexpected shape {processed.shape}, skipping")
+                logging.warning(f"[VibeVoice TTS] Voice sample has unexpected shape {processed.shape}, skipping")
                 continue
             voice_samples_np.append(processed)
 
@@ -346,7 +346,7 @@ def generate_audio(
     for key, value in inputs.items():
         if isinstance(value, torch.Tensor):
             if torch.any(torch.isnan(value)) or torch.any(torch.isinf(value)):
-                logging.error(f"[ComfyUI-VibeVoice] Input tensor '{key}' contains NaN or Inf values")
+                logging.error(f"[VibeVoice TTS] Input tensor '{key}' contains NaN or Inf values")
                 raise ValueError(f"Invalid values in input tensor: {key}")
 
     compute_device = model_management.get_torch_device()
@@ -391,10 +391,10 @@ def generate_audio(
                 outputs = model.generate(**gen_inputs, progress_callback=_progress)
                 _rss.mark("gen-return")
             if diagnostics_enabled():
-                logging.info(f"[ComfyUI-VibeVoice] {pull_stats_line()}")
+                logging.info(f"[VibeVoice TTS] {pull_stats_line()}")
 
         except model_management.InterruptProcessingException:
-            logging.info("[ComfyUI-VibeVoice] VibeVoice generation interrupted by user")
+            logging.info("[VibeVoice TTS] VibeVoice generation interrupted by user")
             raise
         finally:
             pbar.update_absolute(pbar.total)
@@ -424,7 +424,7 @@ def generate_audio(
 
 def force_offload_model(patcher: VibeVoicePatcher, model_name: str, warm: bool = False) -> None:
     """Force offload a VibeVoice model from VRAM."""
-    logging.info(f"[ComfyUI-VibeVoice] Force offloading VibeVoice model '{model_name}' from VRAM...")
+    logging.info(f"[VibeVoice TTS] Force offloading VibeVoice model '{model_name}' from VRAM...")
     if patcher.is_loaded:
         if warm:
             patcher.unpatch_model(unpatch_weights=True, warm=True)
@@ -433,4 +433,4 @@ def force_offload_model(patcher: VibeVoicePatcher, model_name: str, warm: bool =
     model_management.unload_all_models()
     gc.collect()
     model_management.soft_empty_cache()
-    logging.info("[ComfyUI-VibeVoice] Model force offload completed")
+    logging.info("[VibeVoice TTS] Model force offload completed")

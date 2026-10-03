@@ -68,7 +68,7 @@ def register_vendored_types(register) -> None:
 
     for base_cls, compute_fn in entries:
         if not isinstance(base_cls, type):
-            logging.debug("[ComfyUI-VibeVoice] Skipping non-type streaming entry %r", base_cls)
+            logging.debug("[VibeVoice TTS] Skipping non-type streaming entry %r", base_cls)
             continue
         register(base_cls, compute_fn)
 
@@ -77,5 +77,5 @@ def _log_skip(what, e):
     import logging
 
     logging.debug(
-        "[ComfyUI-VibeVoice] Streaming registration skipped %s: %s", what, e
+        "[VibeVoice TTS] Streaming registration skipped %s: %s", what, e
     )

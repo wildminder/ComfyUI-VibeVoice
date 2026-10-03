@@ -301,7 +301,7 @@ class TestRendering:
             report_census(synthetic, phase="pre-h2d:synthetic")
         lines = [
             r for r in caplog.records
-            if r.getMessage().startswith("[ComfyUI-VibeVoice] [vvcensus]")
+            if r.getMessage().startswith("[VibeVoice TTS] [vvcensus]")
         ]
         assert len(lines) == 1
         message = lines[0].getMessage()

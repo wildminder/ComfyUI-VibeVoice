@@ -63,7 +63,7 @@ def _prefixed(caplog):
     """
     return "\n".join(
         r.getMessage() for r in caplog.records
-        if r.getMessage().startswith("[ComfyUI-VibeVoice]")
+        if r.getMessage().startswith("[VibeVoice TTS]")
     )
 
 

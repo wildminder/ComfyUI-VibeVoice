@@ -170,8 +170,8 @@ class VibeVoiceASRProcessor:
                 with open(config_file, 'r') as f:
                     config = json.load(f)
             except Exception as e:
-                logging.warning(f"[ComfyUI-VibeVoice] Could not load preprocessor_config.json: {e}")
-                logging.warning("[ComfyUI-VibeVoice] Using default configuration")
+                logging.warning(f"[VibeVoice TTS] Could not load preprocessor_config.json: {e}")
+                logging.warning("[VibeVoice TTS] Using default configuration")
         
         # Extract parameters
         speech_tok_compress_ratio = config.get("speech_tok_compress_ratio", 3200)
@@ -194,11 +194,11 @@ class VibeVoiceASRProcessor:
             # Dropping it silently surfaces much later as a vocabulary
             # mismatch, by which point the argument looks like it was honoured.
             logging.warning(
-                f"[ComfyUI-VibeVoice] ignoring language_model_pretrained_name={explicit_name!r}: "
+                f"[VibeVoice TTS] ignoring language_model_pretrained_name={explicit_name!r}: "
                 f"loading the tokenizer from {language_model_pretrained_name}, "
                 + ("which ships its own tokenizer files" if own_tokenizer
                    else "as named in preprocessor_config.json"))
-        logging.info(f"[ComfyUI-VibeVoice] Loading tokenizer from {language_model_pretrained_name}")
+        logging.info(f"[VibeVoice TTS] Loading tokenizer from {language_model_pretrained_name}")
 
         if own_tokenizer or 'qwen' in str(language_model_pretrained_name).lower():
             tokenizer = VibeVoiceASRTextTokenizerFast.from_pretrained(
@@ -256,7 +256,7 @@ class VibeVoiceASRProcessor:
         with open(config_path, 'w') as f:
             json.dump(processor_config, f, indent=2)
         
-        logging.debug(f"[ComfyUI-VibeVoice] Processor configuration saved in {config_path}")
+        logging.debug(f"[VibeVoice TTS] Processor configuration saved in {config_path}")
     
     def __call__(
         self,
@@ -626,11 +626,11 @@ class VibeVoiceASRProcessor:
             return cleaned_result
             
         except json.JSONDecodeError as e:
-            logging.warning(f"[ComfyUI-VibeVoice] Failed to parse JSON from transcription: {e}")
-            logging.debug(f"[ComfyUI-VibeVoice] Raw text: {text}")
+            logging.warning(f"[VibeVoice TTS] Failed to parse JSON from transcription: {e}")
+            logging.debug(f"[VibeVoice TTS] Raw text: {text}")
             return []
         except Exception as e:
-            logging.warning(f"[ComfyUI-VibeVoice] Error post-processing transcription: {e}")
+            logging.warning(f"[VibeVoice TTS] Error post-processing transcription: {e}")
             return []
     
     @property

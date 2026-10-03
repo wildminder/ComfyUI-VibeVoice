@@ -133,7 +133,7 @@ class ExternalVibeVoiceASRModelHandler(torch.nn.Module):
         interface compatibility with :class:`VibeVoiceASRModelHandler`.
         """
         logging.debug(
-            f"[ComfyUI-VibeVoice] ExternalVibeVoiceASRModelHandler.load_model called but model is "
+            f"[VibeVoice TTS] ExternalVibeVoiceASRModelHandler.load_model called but model is "
             f"already loaded for '{self.model_pack_name}'"
         )
 
@@ -172,7 +172,7 @@ def load_asr_model(
             dtype_str=dtype,
             attention_mode=attention_mode,
         )
-        logging.debug(f"[ComfyUI-VibeVoice] Loaded ASR model {model_name} with dtype={dtype}, attn={attention_mode}")
+        logging.debug(f"[VibeVoice TTS] Loaded ASR model {model_name} with dtype={dtype}, attn={attention_mode}")
     else:
         model, processor = LOADED_ASR_MODELS_CACHE[cache_key]
 
@@ -245,7 +245,7 @@ def load_asr_model_patched(
             dtype=target_dtype,
         )
         VIBEVOICE_ASR_PATCHER_CACHE[cache_key] = patcher
-        logging.debug(f"[ComfyUI-VibeVoice] Created ASR patcher for {model_name} with attn={actual_attn}")
+        logging.debug(f"[VibeVoice TTS] Created ASR patcher for {model_name} with attn={actual_attn}")
 
     patcher = VIBEVOICE_ASR_PATCHER_CACHE[cache_key]
 
@@ -351,7 +351,7 @@ def load_asr_from_external(
             dtype=target_dtype,
         )
         VIBEVOICE_ASR_PATCHER_CACHE[cache_key] = patcher
-        logging.debug(f"[ComfyUI-VibeVoice] Created ASR patcher for external model {model_name} with attn={actual_attn}")
+        logging.debug(f"[VibeVoice TTS] Created ASR patcher for external model {model_name} with attn={actual_attn}")
 
     patcher = VIBEVOICE_ASR_PATCHER_CACHE[cache_key]
 
@@ -453,7 +453,7 @@ def _transcribe_streaming(
     log_gguf_forward_counters("asr_streaming")
 
     raw_text = "\n".join(texts)
-    logging.info(f"[ComfyUI-VibeVoice] ASR streaming transcription complete. {len(segments)} segments, "
+    logging.info(f"[VibeVoice TTS] ASR streaming transcription complete. {len(segments)} segments, "
                 f"{total_chunks_seen} chunks.")
     return raw_text, segments
 
@@ -545,14 +545,14 @@ def _transcribe_native(
                 except (TypeError, ValueError):
                     continue
 
-        logging.info(f"[ComfyUI-VibeVoice] ASR transcription complete. {len(segments)} segments found.")
+        logging.info(f"[VibeVoice TTS] ASR transcription complete. {len(segments)} segments found.")
         return raw_text, segments
 
     except model_management.InterruptProcessingException:
-        logging.info("[ComfyUI-VibeVoice] ASR transcription interrupted by user")
+        logging.info("[VibeVoice TTS] ASR transcription interrupted by user")
         raise
     except Exception as e:
-        logging.error(f"[ComfyUI-VibeVoice] ASR transcription failed: {e}")
+        logging.error(f"[VibeVoice TTS] ASR transcription failed: {e}")
         raise RuntimeError(f"Transcription failed: {e}")
     finally:
         pbar.update_absolute(pbar.total)
@@ -671,17 +671,17 @@ def transcribe_audio(
         try:
             segments = processor.post_process_transcription(raw_text)
         except Exception as e:
-            logging.warning(f"[ComfyUI-VibeVoice] Failed to parse structured transcription: {e}")
+            logging.warning(f"[VibeVoice TTS] Failed to parse structured transcription: {e}")
             segments = []
 
-        logging.info(f"[ComfyUI-VibeVoice] ASR transcription complete. {len(segments)} segments found.")
+        logging.info(f"[VibeVoice TTS] ASR transcription complete. {len(segments)} segments found.")
         return raw_text, segments
 
     except model_management.InterruptProcessingException:
-        logging.info("[ComfyUI-VibeVoice] ASR transcription interrupted by user")
+        logging.info("[VibeVoice TTS] ASR transcription interrupted by user")
         raise
     except Exception as e:
-        logging.error(f"[ComfyUI-VibeVoice] ASR transcription failed: {e}")
+        logging.error(f"[VibeVoice TTS] ASR transcription failed: {e}")
         raise RuntimeError(f"Transcription failed: {e}")
     finally:
         pbar.update_absolute(pbar.total)
@@ -692,7 +692,7 @@ def transcribe_audio(
 
 def force_offload_asr_model(model_name: str, patcher=None) -> None:
     """Force offload ASR model from VRAM."""
-    logging.info(f"[ComfyUI-VibeVoice] Force offloading VibeVoice ASR model '{model_name}' from VRAM...")
+    logging.info(f"[VibeVoice TTS] Force offloading VibeVoice ASR model '{model_name}' from VRAM...")
     if patcher is not None:
         if patcher.is_loaded:
             patcher.unpatch_model(unpatch_weights=True, destroy=True)
@@ -701,4 +701,4 @@ def force_offload_asr_model(model_name: str, patcher=None) -> None:
         cleanup_asr_models()
     gc.collect()
     model_management.soft_empty_cache()
-    logging.info("[ComfyUI-VibeVoice] ASR model force offload completed")
+    logging.info("[VibeVoice TTS] ASR model force offload completed")

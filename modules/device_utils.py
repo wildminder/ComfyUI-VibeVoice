@@ -127,23 +127,23 @@ def get_torch_device(device_type: str = None) -> torch.device:
     if device_type == DEVICE_MPS:
         if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             return torch.device(DEVICE_MPS)
-        logging.warning("[ComfyUI-VibeVoice] Device 'mps' requested but not available; using default device.")
+        logging.warning("[VibeVoice TTS] Device 'mps' requested but not available; using default device.")
         return mm.get_torch_device()
 
     if device_type == DEVICE_XPU:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return torch.device(DEVICE_XPU)
-        logging.warning("[ComfyUI-VibeVoice] Device 'xpu' requested but not available; using default device.")
+        logging.warning("[VibeVoice TTS] Device 'xpu' requested but not available; using default device.")
         return mm.get_torch_device()
 
     if device_type == DEVICE_NPU:
         if hasattr(torch, "npu") and torch.npu.is_available():
             return torch.device(DEVICE_NPU)
-        logging.warning("[ComfyUI-VibeVoice] Device 'npu' requested but not available; using default device.")
+        logging.warning("[VibeVoice TTS] Device 'npu' requested but not available; using default device.")
         return mm.get_torch_device()
 
     # Unknown device type — fall back to ComfyUI's default.
-    logging.warning(f"[ComfyUI-VibeVoice] Device '{device_type}' not available; using default device.")
+    logging.warning(f"[VibeVoice TTS] Device '{device_type}' not available; using default device.")
     return mm.get_torch_device()
 
 

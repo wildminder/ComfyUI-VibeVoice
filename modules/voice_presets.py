@@ -75,12 +75,12 @@ def voice_preset_search_dirs() -> list[str]:
         for path in registry.get(VOICE_PRESET_FOLDER_KEY, ([], set()))[0]:
             paths.append(os.fspath(path))
     except Exception as exc:
-        logging.warning("[ComfyUI-VibeVoice] Cannot inspect registered VibeVoice voice folders: %s", exc)
+        logging.warning("[VibeVoice TTS] Cannot inspect registered VibeVoice voice folders: %s", exc)
 
     try:
         tts_roots = folder_paths.get_folder_paths("tts")
     except Exception as exc:
-        logging.warning("[ComfyUI-VibeVoice] Cannot inspect registered TTS folders: %s", exc)
+        logging.warning("[VibeVoice TTS] Cannot inspect registered TTS folders: %s", exc)
         tts_roots = []
 
     for tts_root in tts_roots:
@@ -119,7 +119,7 @@ def list_voice_presets(search_dirs: list[str] | None = None) -> dict[str, str]:
                 )
             )
         except OSError as exc:
-            logging.warning("[ComfyUI-VibeVoice] Cannot scan VibeVoice voice folder '%s': %s", root, exc)
+            logging.warning("[VibeVoice TTS] Cannot scan VibeVoice voice folder '%s': %s", root, exc)
             continue
 
         for path in candidates:
@@ -127,7 +127,7 @@ def list_voice_presets(search_dirs: list[str] | None = None) -> dict[str, str]:
             collision_key = stem.casefold()
             if collision_key in owners:
                 logging.warning(
-                    "[ComfyUI-VibeVoice] Ignoring duplicate VibeVoice voice preset '%s'; first "
+                    "[VibeVoice TTS] Ignoring duplicate VibeVoice voice preset '%s'; first "
                     "registration wins: '%s' then '%s'",
                     stem,
                     owners[collision_key],

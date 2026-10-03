@@ -106,7 +106,7 @@ else:
             vibevoice_search_paths.insert(0, primary_vibevoice_models_path)
 
         for search_path in vibevoice_search_paths:
-            logging.debug(f"[ComfyUI-VibeVoice] Scanning for VibeVoice models in: {search_path}")
+            logging.debug(f"[VibeVoice TTS] Scanning for VibeVoice models in: {search_path}")
             if not os.path.isdir(search_path):
                 continue
             for model_info in scan_vibevoice_models(search_path):
@@ -119,7 +119,7 @@ else:
                     }
 
         logging.debug(
-            f"[ComfyUI-VibeVoice] Discovered VibeVoice models: {sorted(list(AVAILABLE_VIBEVOICE_MODELS.keys()))}"
+            f"[VibeVoice TTS] Discovered VibeVoice models: {sorted(list(AVAILABLE_VIBEVOICE_MODELS.keys()))}"
         )
 
     # -- Exports ─

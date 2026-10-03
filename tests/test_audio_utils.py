@@ -224,7 +224,7 @@ class TestPreprocessComfyAudio:
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert len(errors) == 1, [r.getMessage() for r in caplog.records]
         assert "NaN or Inf" in errors[0].getMessage()
-        assert errors[0].getMessage().startswith("[ComfyUI-VibeVoice] ")
+        assert errors[0].getMessage().startswith("[VibeVoice TTS] ")
 
     def test_nan_input_logs_at_no_other_level(self):
         """Both directions: the NaN report is an ERROR and not also anything

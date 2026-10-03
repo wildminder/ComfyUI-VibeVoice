@@ -221,7 +221,7 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         cached_bundle = get_live_bundle(request_key)
         if cached_bundle is not None:
             logging.debug(
-                f"[ComfyUI-VibeVoice] Reusing the resident model for {request_key!r} "
+                f"[VibeVoice TTS] Reusing the resident model for {request_key!r} "
                 f"(identical re-execution; skipping the rebuild)"
             )
             return io.NodeOutput(cached_bundle)
@@ -239,6 +239,6 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
                 weight_path, requested_config_name, model_bundle["model_name"]
             )
         except Exception as e:
-            logging.debug(f"[ComfyUI-VibeVoice] Could not memoize reconciled config name: {e}")
+            logging.debug(f"[VibeVoice TTS] Could not memoize reconciled config name: {e}")
 
         return io.NodeOutput(model_bundle)
