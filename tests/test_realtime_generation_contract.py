@@ -215,3 +215,61 @@ def test_generation_config_compat_matches_installed_transformers():
     assert config.speech_end_id == tokenizer.speech_end_id
     assert config.speech_diffusion_id == tokenizer.speech_diffusion_id
     assert isinstance(model_kwargs, dict)
+
+
+def test_generation_config_is_not_passed_alongside_generation_kwargs(monkeypatch):
+    """The kwargs-only call must not trip transformers' pair deprecation.
+
+    transformers 5.x logs "Passing `generation_config` together with
+    generation-related arguments" when a config object reaches
+    ``_prepare_generation_config`` next to kwargs like ``max_new_tokens``, and
+    6.x refuses the combination. The vendored loop used to assemble its own
+    ``GenerationConfig`` for every call, so the node logged the warning on
+    every realtime generation.
+    """
+    from transformers.generation import utils as generation_utils
+    from transformers.generation.configuration_utils import GenerationConfig
+
+    # The `transformers` logger sets propagate=False, so caplog's root handler
+    # never sees it; record on the logger instance instead.
+    warnings_seen = []
+    monkeypatch.setattr(
+        generation_utils.logger,
+        "warning",
+        lambda message, *args, **kwargs: warnings_seen.append(
+            message % args if args else str(message)
+        ),
+    )
+
+    model = _make_streaming_model()
+    del model._build_generate_config_model_kwargs
+    model.config.is_encoder_decoder = False
+    model.generation_config = GenerationConfig()
+    model._prepare_model_inputs = MagicMock(
+        side_effect=lambda inputs, bos_token_id, model_kwargs: (
+            inputs,
+            "input_ids",
+            model_kwargs,
+        )
+    )
+    tokenizer = _stream_contract._FakeTokenizer()
+
+    config, _model_kwargs, _inputs = model._build_generate_config_model_kwargs(
+        None,
+        torch.zeros(1, 2, dtype=torch.long),
+        tokenizer,
+        return_processors=False,
+        max_new_tokens=8,
+    )
+
+    assert not [
+        message
+        for message in warnings_seen
+        if "generation_config" in message
+        and "together with generation-related" in message
+    ], warnings_seen
+    # The tokenizer's special ids must still win over the model defaults, which
+    # is why they are stamped on the returned config instead of in the object.
+    assert config.bos_token_id == tokenizer.bos_token_id
+    assert config.eos_token_id == tokenizer.eos_token_id
+    assert config.pad_token_id == tokenizer.pad_token_id

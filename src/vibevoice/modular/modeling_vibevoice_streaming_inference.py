@@ -838,24 +838,16 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
         )
 
     def _build_generate_config_model_kwargs(self, generation_config, inputs, tokenizer, return_processors=False, **kwargs):
-        if generation_config is None:
-            generation_config = GenerationConfig(
-                bos_token_id=tokenizer.bos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id = tokenizer.pad_token_id
-            )
-        else:
-            generation_config = GenerationConfig(
-                **generation_config,
-                bos_token_id=tokenizer.bos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id = tokenizer.pad_token_id
-            )
-
+        # No GenerationConfig is assembled here: transformers 5.x deprecates
+        # passing a config object together with generation kwargs (it logs
+        # "Passing `generation_config` together with generation-related
+        # arguments") and 6.x drops it. Every caller supplies its settings as
+        # kwargs (max_new_tokens, do_sample, ...), so the config object is left
+        # None and transformers merges the kwargs itself.
         # transformers 4.x accepted a positional "is_init" flag here; 5.x
         # narrowed the signature to (generation_config, **kwargs). Inspect the
-        # live signature so one vendored file supports both APIs. The custom
-        # speech token ids are assigned to the returned config below rather
+        # live signature so one vendored file supports both APIs. The token and
+        # custom speech ids are assigned to the returned config below rather
         # than passed through kwargs, because GenerationConfig no longer
         # tolerates unknown keyword attributes.
         _prepare_args = (
@@ -868,6 +860,9 @@ class VibeVoiceStreamingForConditionalGenerationInference(VibeVoiceStreamingPreT
             *_prepare_args,
             **kwargs
         )
+        generation_config.bos_token_id = tokenizer.bos_token_id
+        generation_config.eos_token_id = tokenizer.eos_token_id
+        generation_config.pad_token_id = tokenizer.pad_token_id
         generation_config.speech_start_id = tokenizer.speech_start_id
         generation_config.speech_end_id = tokenizer.speech_end_id
         generation_config.speech_diffusion_id = tokenizer.speech_diffusion_id

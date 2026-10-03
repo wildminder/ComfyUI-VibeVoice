@@ -191,8 +191,11 @@ def test_realtime_excludes_a_diverging_backend_loudly(caplog):
         resolved = resolve_realtime_attention_mode("sage")
     assert resolved == REALTIME_ATTENTION_FALLBACK
     assert "sage" in caplog.text
-    # The log must carry the measured reason, not just the mode name.
-    assert "diverg" in caplog.text or "cos=" in caplog.text
+    # The log must carry the registry's reason, not just the mode name. Matched
+    # against the registry rather than literal prose, so rewording the
+    # one-line user message does not break this test.
+    for reason in REALTIME_EXCLUDED_ATTENTION_MODES.values():
+        assert reason in caplog.text
 
     for mode in NEVER_EXCLUDE:
         assert mode not in REALTIME_EXCLUDED_ATTENTION_MODES

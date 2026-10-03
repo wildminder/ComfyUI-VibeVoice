@@ -317,8 +317,10 @@ class TestASRExcludesSage:
         assert resolve_asr_attention_mode("sage") == ASR_ATTENTION_FALLBACK
 
     def test_the_registry_carries_the_reason(self):
+        # The registry holds the one-line user-facing cause; the full kernel
+        # analysis stays in the module comment above it.
         assert "sage" in ASR_EXCLUDED_ATTENTION_MODES
-        assert "pad" in ASR_EXCLUDED_ATTENTION_MODES["sage"].lower()
+        assert "mask" in ASR_EXCLUDED_ATTENTION_MODES["sage"].lower()
 
     def test_downgrade_warns(self, caplog):
         with caplog.at_level("WARNING"):

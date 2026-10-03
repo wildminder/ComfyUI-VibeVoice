@@ -222,12 +222,7 @@ def get_attn_implementation_for_load(attention_mode: str) -> str:
 REALTIME_ATTENTION_FALLBACK = "sdpa"
 
 REALTIME_EXCLUDED_ATTENTION_MODES: dict[str, str] = {
-    "sage": (
-        "its conditioning diverges from every other backend (cos=0.9947 vs "
-        "eager, gate is 0.999): the sage kernel ignores the attention mask, so "
-        "a text window over the voice prefill attends ahead of its own "
-        "positions, and its int8/fp8 quantisation adds a further rel_l2=0.043"
-    ),
+    "sage": "the sage kernel ignores the attention mask",
 }
 
 
@@ -250,9 +245,7 @@ def resolve_realtime_attention_mode(attention_mode: str) -> str:
     if reason is None:
         return attention_mode
     logging.warning(
-        "[VibeVoice TTS] Attention mode '%s' is not used for realtime (VibeVoice-Realtime) "
-        "models: %s. Falling back to '%s' for this load. The standard TTS "
-        "family is unaffected.",
+        "[VibeVoice TTS] realtime models cannot use attention mode '%s' (%s); using '%s'.",
         attention_mode,
         reason,
         REALTIME_ATTENTION_FALLBACK,
@@ -283,13 +276,7 @@ def resolve_realtime_attention_mode(attention_mode: str) -> str:
 ASR_ATTENTION_FALLBACK = "sdpa"
 
 ASR_EXCLUDED_ATTENTION_MODES: dict[str, str] = {
-    "sage": (
-        "the ASR processor left-pads each batch to the longest utterance, so "
-        "prefill arrives with a real additive (B,1,S,S) attention mask, and "
-        "the sage kernel cannot take one -- it uses the mask only to decide "
-        "causality and then discards it, so every query attends to the pad "
-        "columns and the transcript is silently wrong"
-    ),
+    "sage": "the sage kernel cannot take an attention mask",
 }
 
 
@@ -314,8 +301,7 @@ def resolve_asr_attention_mode(attention_mode: str) -> str:
     if reason is None:
         return attention_mode
     logging.warning(
-        "[VibeVoice TTS] Attention mode '%s' is not used for ASR models: %s. Falling back to "
-        "'%s' for this load. The TTS family is unaffected.",
+        "[VibeVoice TTS] ASR models cannot use attention mode '%s' (%s); using '%s'.",
         attention_mode,
         reason,
         ASR_ATTENTION_FALLBACK,

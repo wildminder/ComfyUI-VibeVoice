@@ -243,15 +243,15 @@ def generate_realtime_audio(
     # default — correct for the standard models — sits below the realtime
     # family's usable band, where the output degenerates into syllable
     # repetition. Raise it before it reaches the sampler.
+    requested_cfg_scale = cfg_scale
     cfg_scale, cfg_adjusted = resolve_cfg_scale(cfg_scale)
     if cfg_adjusted:
         logging.warning(
-            "[VibeVoice TTS] cfg_scale was below the realtime model's usable guidance floor and "
-            "has been raised to %.2f. Values below %.2f make this checkpoint "
-            "repeat syllables instead of speaking the script. Raise the "
-            "'cfg_scale' widget to silence this warning.",
-            cfg_scale,
+            "[VibeVoice TTS] realtime cfg_scale floor is %.2f (lower values "
+            "repeat syllables); raised %s -> %.2f.",
             REALTIME_MIN_CFG_SCALE,
+            requested_cfg_scale,
+            cfg_scale,
         )
 
     inputs = processor.process_input_with_cached_prompt(
