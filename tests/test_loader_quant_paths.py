@@ -909,6 +909,160 @@ class TestOptionalAbsentPrefixes:
         assert original == {"lm_head.weight"}
 
 
+# ====================================================================
+# The realtime encoder namespace, measured rather than assumed
+# ====================================================================
+#
+# Instantiating the real trees on ``torch.device("meta")`` from the packaged
+# configs — a probe run OUTSIDE the suite, because conftest mocks the vendored
+# model code wholesale — shows the SAME shape for both released architectures
+# (streaming 881 state_dict keys, diffusion 1205):
+#
+#   * every key hangs off ``model.`` (plus ``tts_eos_classifier.`` on the
+#     streaming model and ``lm_head.`` on the diffusion one). ZERO keys in
+#     either tree begin with the unrooted ``acoustic_tokenizer.``;
+#   * 276 acoustic-tokenizer encoder keys, 276 decoder keys.
+#
+# So the encoder namespace is exactly ``model.acoustic_tokenizer.encoder.``,
+# and a prefix written without the ``model.`` root matches nothing at all.
+# The tables below rebuild those 276 keys from the measured block layout.
+
+_REALTIME_ENCODER_PREFIX = "model.acoustic_tokenizer.encoder."
+
+# (downsample index, sub-stage index), as measured on the released tree.
+_ENCODER_DOWNSAMPLE_BLOCKS = tuple((i, 0) for i in range(7))
+# (stage index, residual-layer index): six 3-layer stages, then an 8-layer one.
+_ENCODER_STAGE_BLOCKS = tuple(
+    [(i, j) for i in range(6) for j in range(3)]
+    + [(6, j) for j in range(8)]
+)
+_ENCODER_DOWNSAMPLE_SUFFIXES = ("conv.conv.weight", "conv.conv.bias")
+_ENCODER_BLOCK_SUFFIXES = (
+    "gamma", "ffn_gamma", "norm.weight", "ffn_norm.weight",
+    "mixer.conv.conv.conv.weight", "mixer.conv.conv.conv.bias",
+    "ffn.linear1.weight", "ffn.linear1.bias",
+    "ffn.linear2.weight", "ffn.linear2.bias",
+)
+_ENCODER_HEAD_SUFFIXES = ("conv.conv.weight", "conv.conv.bias")
+
+# Real key names from the same probe, one per remaining subtree. None of them
+# may ever be silenced by the optional-absent rule.
+_MEASURED_NON_ENCODER_KEYS = (
+    "model.acoustic_tokenizer.decoder.upsample_layers.0.0.conv.conv.weight",
+    "model.acoustic_tokenizer.decoder.head.conv.conv.weight",
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.layers.0.self_attn.q_proj.weight",
+    "tts_eos_classifier.fc1.weight",
+)
+
+
+def _measured_realtime_encoder_keys() -> set[str]:
+    """The 276 real encoder keys, rebuilt from the measured block layout."""
+    keys = {f"{_REALTIME_ENCODER_PREFIX}head.{s}" for s in _ENCODER_HEAD_SUFFIXES}
+    for block, stage in _ENCODER_DOWNSAMPLE_BLOCKS:
+        keys.update(
+            f"{_REALTIME_ENCODER_PREFIX}downsample_layers.{block}.{stage}.{s}"
+            for s in _ENCODER_DOWNSAMPLE_SUFFIXES
+        )
+    for stage, layer in _ENCODER_STAGE_BLOCKS:
+        keys.update(
+            f"{_REALTIME_ENCODER_PREFIX}stages.{stage}.{layer}.{s}"
+            for s in _ENCODER_BLOCK_SUFFIXES
+        )
+    return keys
+
+
+class TestRealtimeOptionalAbsentNamespace:
+    """The prefix must name the namespace the checkpoint actually uses.
+
+    ``OPTIONAL_ABSENT_PREFIXES`` used to carry only the unrooted spelling,
+    which matches zero keys in either released tree — so a realtime load still
+    warned about all 276 encoder keys while the rule looked armed.
+    """
+
+    def test_rebuilt_key_set_matches_the_published_count(self):
+        # 14 downsample + 260 stage + 2 head, as measured on the real tree.
+        assert len(_measured_realtime_encoder_keys()) == 276
+
+    def test_realtime_namespace_prefix_is_declared(self):
+        from ComfyUI_VibeVoice.modules.loader import OPTIONAL_ABSENT_PREFIXES
+
+        assert _REALTIME_ENCODER_PREFIX in OPTIONAL_ABSENT_PREFIXES
+
+    def test_every_measured_encoder_key_is_covered(self):
+        from ComfyUI_VibeVoice.modules.loader import OPTIONAL_ABSENT_PREFIXES
+
+        uncovered = [
+            k for k in _measured_realtime_encoder_keys()
+            if not any(k.startswith(p) for p in OPTIONAL_ABSENT_PREFIXES)
+        ]
+        assert uncovered == []
+
+    def test_only_the_rooted_prefix_matches_the_released_tree(self):
+        from ComfyUI_VibeVoice.modules.loader import OPTIONAL_ABSENT_PREFIXES
+
+        matching = [
+            p for p in OPTIONAL_ABSENT_PREFIXES
+            if any(k.startswith(p) for k in _measured_realtime_encoder_keys())
+        ]
+        # Drift guard: the unrooted spelling covers nothing here, so if it ever
+        # starts matching, the key layout changed and the comment above does.
+        assert matching == [_REALTIME_ENCODER_PREFIX]
+
+    def test_omitted_realtime_encoder_is_suppressed(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        missing = sorted(_measured_realtime_encoder_keys())
+        assigned = set(_MEASURED_NON_ENCODER_KEYS)
+
+        known = mark_optional_absent(missing, assigned)
+
+        assert known == set(missing)
+
+    def test_partially_supplied_realtime_encoder_is_still_reported(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        missing = sorted(_measured_realtime_encoder_keys())
+        # One real encoder key arrived — the rest are a genuine finding.
+        assigned = {
+            "model.acoustic_tokenizer.encoder.stages.0.0.gamma",
+            *_MEASURED_NON_ENCODER_KEYS,
+        }
+
+        assert mark_optional_absent(missing, assigned) == set()
+
+    def test_non_encoder_subtrees_are_never_optional(self):
+        from ComfyUI_VibeVoice.modules.loader import mark_optional_absent
+
+        # No encoder key was assigned at all, so the rule fires — yet none of
+        # these keys may be caught by it.
+        known = mark_optional_absent(list(_MEASURED_NON_ENCODER_KEYS), set())
+
+        assert known == set()
+
+    def test_1p5b_style_tree_marks_nothing_optional(self):
+        """The 1.5B tree carries a full encoder, and none of its keys match."""
+        from ComfyUI_VibeVoice.modules.loader import (
+            OPTIONAL_ABSENT_PREFIXES,
+            mark_optional_absent,
+        )
+
+        stub_keys = set(build_stub_vv().state_dict())
+        assert not [
+            k for k in stub_keys
+            if any(k.startswith(p) for p in OPTIONAL_ABSENT_PREFIXES)
+        ]
+
+        # A complete export: nothing missing, nothing marked.
+        assert mark_optional_absent([], stub_keys | _measured_realtime_encoder_keys()) == set()
+
+        # A truncated one still reports its own gap. This is the catcher for
+        # an over-broad prefix: no encoder key arrived, so the rule fires, and
+        # it must not swallow a missing key from the tree that never had one.
+        dropped = "model.language_model.layers.0.self_attn.q_proj.weight"
+        assert mark_optional_absent([dropped], stub_keys) == set()
+
+
 class _QuantGuardModel(torch.nn.Module):
     """Tiny real module for the streaming quant-storage guard tests."""
 

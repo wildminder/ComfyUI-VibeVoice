@@ -78,9 +78,19 @@ _SENTINEL_BUFFER_VALUES = {
 # alarming warning on every realtime load, where it could mask a genuinely
 # missing key.
 #
+# Prefixes are matched against the checkpoint's own key names, which are
+# rooted at the module the tensors hang off — for every released tree that is
+# ``model.`` (``VibeVoiceStreamingForConditionalGenerationInference.model
+# .acoustic_tokenizer.encoder.*``). The unrooted spelling is kept so a
+# tokenizer exported at the top level stays optional too, but on the released
+# checkpoints it matches nothing.
+#
 # A prefix is only treated as optional when the checkpoint supplied NO key
 # under it. If any encoder key is present, the rest are reported normally.
-OPTIONAL_ABSENT_PREFIXES = ("acoustic_tokenizer.encoder.",)
+OPTIONAL_ABSENT_PREFIXES = (
+    "model.acoustic_tokenizer.encoder.",
+    "acoustic_tokenizer.encoder.",
+)
 
 # Quant-storage dtypes that must NEVER reach a dense float loader.
 #
