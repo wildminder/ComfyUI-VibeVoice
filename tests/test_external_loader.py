@@ -1174,3 +1174,121 @@ class TestAutoDetectLoaderSemantics:
         assert AUTO_CONFIG_NAME not in ASR_CONFIG_NAMES
         assert is_asr_config_name(AUTO_CONFIG_NAME) is False
 
+
+# ====================================================================
+# Both resolution errors must name the remedy (plan §4.E)
+# ====================================================================
+#
+# The two errors behind the original report were each self-defeating: the
+# auto-detect error told the user to pick an explicit option, and the option
+# it pointed at then raised the packaged-default error listing a set that
+# provably did not contain it. The assertions below are on message CONTENT --
+# "raises FileNotFoundError" was already covered -- because following the
+# advice verbatim is the behaviour being pinned.
+
+
+class TestConfigNameErrorMessages:
+    """The remedy in each message is named, current, and short."""
+
+    @staticmethod
+    def _bare_weight(tmp_path):
+        weight = tmp_path / "VibeVoice-Realtime-0.5B-bf16.safetensors"
+        weight.write_bytes(b"")
+        return str(weight)
+
+    def test_missing_config_error_names_the_option(self, tmp_path):
+        """A listed option with no packaged default must be named as such.
+
+        Reproduces the shipped defect by removing one table entry, so the
+        branch is exercised without deleting a family from the table.
+        """
+        weight = self._bare_weight(tmp_path)
+
+        with patch.dict(external_loader._PACKAGED_CONFIG_FILES, {}, clear=True):
+            with pytest.raises(FileNotFoundError) as excinfo:
+                resolve_sidecar_config(weight, "VibeVoice-Realtime-0.5B")
+
+        message = str(excinfo.value)
+        assert "VibeVoice-Realtime-0.5B" in message
+        assert "no packaged default" in message
+
+    def test_missing_config_error_lists_real_packaged_defaults(self, tmp_path):
+        """The listed alternatives come from the table, so they cannot drift."""
+        weight = self._bare_weight(tmp_path)
+
+        with pytest.raises(FileNotFoundError) as excinfo:
+            resolve_sidecar_config(weight, "VibeVoice-99B")
+
+        message = str(excinfo.value)
+        for family in external_loader._PACKAGED_CONFIG_FILES:
+            assert family in message
+
+    def test_unknown_config_name_error_lists_options(self, tmp_path):
+        """An unrecognised name is answered with the option list itself."""
+        weight = self._bare_weight(tmp_path)
+
+        with pytest.raises(FileNotFoundError) as excinfo:
+            resolve_sidecar_config(weight, "VibeVoice-99B")
+
+        message = str(excinfo.value)
+        assert "is not a listed option" in message
+        for option in EXTERNAL_CONFIG_OPTIONS:
+            assert option in message
+
+    def test_auto_detect_error_advice_is_self_consistent(self, tmp_path):
+        """No recommended option may fail the way auto-detect just failed.
+
+        An option backed by a packaged default is listed bare; one without is
+        listed with its status, and the sidecar remedy stays in the message.
+        """
+        weight = self._bare_weight(tmp_path)
+
+        with patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=None,
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                external_loader.resolve_auto_config_name(weight)
+
+        message = str(excinfo.value)
+        for option in EXTERNAL_CONFIG_OPTIONS:
+            if option == external_loader.AUTO_CONFIG_NAME:
+                continue
+            if option in external_loader._PACKAGED_CONFIG_FILES:
+                assert option in message
+            else:
+                assert f"{option} (no packaged default)" in message
+        assert "sidecar config.json" in message
+
+    def test_auto_detect_error_marks_a_option_without_packaged_default(self, tmp_path):
+        """The same guard, with the missing entry the shipped bug actually was."""
+        weight = self._bare_weight(tmp_path)
+
+        with patch.dict(
+            external_loader._PACKAGED_CONFIG_FILES,
+            {"VibeVoice-7B": "default_VibeVoice-Large_config.json"},
+            clear=True,
+        ), patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=None,
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                external_loader.resolve_auto_config_name(weight)
+
+        assert "VibeVoice-Realtime-0.5B (no packaged default)" in str(excinfo.value)
+
+    def test_both_messages_stay_short(self, tmp_path):
+        """A wall of text in a node error is its own defect; cap both at 6 lines."""
+        weight = self._bare_weight(tmp_path)
+
+        with pytest.raises(FileNotFoundError) as sidecar:
+            resolve_sidecar_config(weight, "VibeVoice-99B")
+
+        with patch(
+            "ComfyUI_VibeVoice.modules.config_detect.fingerprint_weights",
+            return_value=None,
+        ), pytest.raises(ValueError) as auto:
+            external_loader.resolve_auto_config_name(weight)
+
+        assert len(str(sidecar.value).splitlines()) <= 6
+        assert len(str(auto.value).splitlines()) <= 6

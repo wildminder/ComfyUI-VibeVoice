@@ -135,8 +135,6 @@ def normalize_config_name(config_name: str) -> str:
     return config_name
 
 
-
-
 def resolve_auto_config_name(weight_path: str, gguf_reader=None, weights_fp=None) -> str:
     """Resolve ``AUTO_CONFIG_NAME`` to a concrete family from the weights."""
     if weights_fp is None:
@@ -146,7 +144,11 @@ def resolve_auto_config_name(weight_path: str, gguf_reader=None, weights_fp=None
 
     detected = weights_fp.config_name if weights_fp is not None else None
     if not detected:
-        explicit = [o for o in EXTERNAL_CONFIG_OPTIONS if o != AUTO_CONFIG_NAME]
+        explicit = [
+            o if _get_packaged_config_path(o) else f"{o} (no packaged default)"
+            for o in EXTERNAL_CONFIG_OPTIONS
+            if o != AUTO_CONFIG_NAME
+        ]
         if weights_fp is None:
             observed = "Observed dimensions: unavailable (no embedding fingerprint)."
         else:
@@ -271,10 +273,34 @@ def resolve_sidecar_config(weight_path: str, config_name: str) -> str:
     raise FileNotFoundError(
         f"No architecture config found for external model "
         f"'{os.path.basename(weight_path)}'.\n"
+        f"{_config_name_status(config_name)}\n"
         f"Place a sidecar config next to the weight file:\n"
         f"  - '{sidecar_path}'  (preferred), or\n"
         f"  - 'config.json' in '{os.path.dirname(weight_path)}'\n"
-        f"Alternatively select a config_name with a packaged default "
+        f"{_config_name_alternative(config_name)}"
+    )
+
+
+def _config_name_status(config_name: str) -> str:
+    """One line saying why ``config_name`` did not produce a config."""
+    if config_name in EXTERNAL_CONFIG_OPTIONS:
+        return (
+            f"config_name '{config_name}' is a listed option with no packaged "
+            f"default."
+        )
+    return f"config_name '{config_name}' is not a listed option."
+
+
+def _config_name_alternative(config_name: str) -> str:
+    """The last line: what to select instead, named from the real tables."""
+    if config_name in EXTERNAL_CONFIG_OPTIONS:
+        return (
+            f"Alternatively select a config_name with a packaged default "
+            f"({', '.join(_PACKAGED_CONFIG_FILES.keys())})."
+        )
+    return (
+        f"Alternatively select a listed option "
+        f"({', '.join(EXTERNAL_CONFIG_OPTIONS)}) with a packaged default "
         f"({', '.join(_PACKAGED_CONFIG_FILES.keys())})."
     )
 
