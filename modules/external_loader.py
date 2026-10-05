@@ -105,8 +105,14 @@ EXTERNAL_CONFIG_OPTIONS = [
     "VibeVoice-ASR",
 ]
 
+# Keys are matched against ``config_name.lower()``, so one lowercase entry
+# covers every casing of the same alias. The realtime family is spelled with a
+# hyphen or an underscore in saved workflows; both must reach the one packaged
+# realtime config instead of falling through to the no-packaged-default error.
 _LEGACY_CONFIG_ALIASES = {
     "vibevoice-large": "VibeVoice-7B",
+    "vibevoice-realtime": "VibeVoice-Realtime-0.5B",
+    "vibevoice_realtime": "VibeVoice-Realtime-0.5B",
 }
 
 
@@ -116,7 +122,19 @@ def normalize_config_name(config_name: str) -> str:
         return config_name
     if config_name in EXTERNAL_CONFIG_OPTIONS:
         return config_name
-    return _LEGACY_CONFIG_ALIASES.get(config_name.lower(), config_name)
+    alias = _LEGACY_CONFIG_ALIASES.get(config_name.lower())
+    if alias is not None:
+        return alias
+    # Not an error: a sidecar config.json can bind a name this node does not
+    # know. Debug-only so the API path stays usable for such workflows.
+    logging.debug(
+        f"[VibeVoice TTS] config_name '{config_name}' matches no known option "
+        f"(known: {', '.join(EXTERNAL_CONFIG_OPTIONS)}); passing it through "
+        f"unchanged for a sidecar config.json to bind."
+    )
+    return config_name
+
+
 
 
 def resolve_auto_config_name(weight_path: str, gguf_reader=None, weights_fp=None) -> str:

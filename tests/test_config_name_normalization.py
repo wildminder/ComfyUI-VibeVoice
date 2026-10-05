@@ -43,6 +43,97 @@ class TestNormalizeConfigName:
         assert normalize_config_name(None) is None
 
 
+class TestRealtimeAliases:
+    """The lowercase realtime spellings normalize to the one canonical option.
+
+    Saved workflows carry the realtime family in the spelling their author
+    typed — ``vibevoice-realtime`` with a hyphen, ``vibevoice_realtime`` with
+    an underscore, or either in a different case. Lookup is ``.lower()``-keyed,
+    so two alias entries cover all of them, and every one must reach the
+    canonical option instead of falling through to the no-packaged-default
+    error. The aliases never become visible options: the dropdown keeps one
+    canonical entry.
+    """
+
+    REALTIME = "VibeVoice-Realtime-0.5B"
+    ALIASES = ("vibevoice-realtime", "vibevoice_realtime")
+
+    def test_canonical_realtime_passes_through(self):
+        assert normalize_config_name(self.REALTIME) == self.REALTIME
+
+    @pytest.mark.parametrize(
+        "alias",
+        [
+            "vibevoice-realtime",
+            "VibeVoice-Realtime",
+            "VIBEVOICE-REALTIME",
+            "vibevoice_realtime",
+            "VibeVoice_Realtime",
+            "VIBEVOICE_REALTIME",
+        ],
+    )
+    def test_alias_maps_to_canonical_option(self, alias):
+        assert normalize_config_name(alias) == self.REALTIME
+
+    def test_alias_is_idempotent(self):
+        once = normalize_config_name("vibevoice_realtime")
+        assert normalize_config_name(once) == once
+
+    def test_aliases_resolve_to_the_packaged_realtime_config(self):
+        """The alias must land on the file the packaged-defaults task shipped."""
+        for alias in self.ALIASES:
+            path = _get_packaged_config_path(normalize_config_name(alias))
+            assert path, f"{alias!r} resolved to no packaged config"
+            assert path.replace("\\", "/").endswith(
+                "src/vibevoice/configs/default_VibeVoice-Realtime-0.5B_config.json"
+            )
+
+    def test_aliases_are_not_visible_options(self):
+        """Aliases normalize, but the dropdown keeps one canonical entry only."""
+        for alias in self.ALIASES:
+            assert alias not in EXTERNAL_CONFIG_OPTIONS
+        assert EXTERNAL_CONFIG_OPTIONS.count(self.REALTIME) == 1
+
+    @pytest.mark.parametrize("alias", list(ALIASES) + ["VibeVoice-Realtime"])
+    def test_validate_inputs_accepts_alias(self, alias):
+        assert VibeVoiceExternalLoaderNode.validate_inputs(config_name=alias) is True
+
+    def test_unknown_name_is_not_silently_rewritten(self):
+        """Aliases are a closed map, not a fuzzy matcher."""
+        assert normalize_config_name("VibeVoice-99B") == "VibeVoice-99B"
+        assert normalize_config_name("vibevoice-realtime-99b") == "vibevoice-realtime-99b"
+
+    def test_existing_large_alias_unchanged(self):
+        """Adding the realtime pair must not disturb the 7B alias."""
+        assert normalize_config_name("vibevoice-large") == "VibeVoice-7B"
+
+    def test_execute_normalizes_alias_before_identity(self):
+        """The node normalizes BEFORE the cache identity, so an aliased saved
+        workflow reuses the same bundle as the canonical spelling."""
+        fake_bundle = {"model": MagicMock()}
+
+        with patch(
+            "ComfyUI_VibeVoice.nodes.external_loader_node.load_external_vibevoice_model",
+            return_value=fake_bundle,
+        ) as mock_load, patch(
+            "ComfyUI_VibeVoice.nodes.external_loader_node.folder_paths.get_full_path_or_raise",
+            return_value="/fake/path/model.safetensors",
+        ), patch(
+            "ComfyUI_VibeVoice.nodes.external_loader_node.identity_for_external",
+            return_value="external:key",
+        ) as mock_identity:
+            VibeVoiceExternalLoaderNode.execute(
+                model_file="model.safetensors",
+                config_name="vibevoice_realtime",
+                attention_mode="sdpa",
+                quantize_llm_4bit=False,
+                dtype="auto",
+            )
+
+        assert mock_identity.call_args[0][1] == self.REALTIME
+        assert mock_load.call_args[1]["config_name"] == self.REALTIME
+
+
 class TestDropdownDeDuplication:
     """The visible option list no longer contains the ambiguous alias."""
 
