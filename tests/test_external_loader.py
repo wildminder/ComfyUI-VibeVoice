@@ -160,13 +160,53 @@ class TestPathResolution:
         assert result.endswith("default_VibeVoice-Large_config.json")
         assert os.path.exists(result)
 
-    def test_sidecar_config_no_packaged_default_raises(self, tmp_path):
-        """No sidecar + config_name without packaged default → FileNotFoundError."""
+    def test_sidecar_config_missing_falls_back_to_realtime(self, tmp_path):
+        """No sidecar + config_name='VibeVoice-Realtime-0.5B' → packaged default.
+
+        Realtime used to be the one selectable family with no packaged
+        default, so a bare weight file raised FileNotFoundError. It now
+        resolves through the same table as 1.5B/7B/ASR; the asset itself is
+        pinned byte-for-byte in tests/test_realtime_external_config.py.
+        """
         weight = tmp_path / "foo.safetensors"
         weight.write_bytes(b"")
 
+        result = resolve_sidecar_config(str(weight), "VibeVoice-Realtime-0.5B")
+        assert result.endswith("default_VibeVoice-Realtime-0.5B_config.json")
+        assert result == external_loader._get_packaged_config_path("VibeVoice-Realtime-0.5B")
+        assert os.path.exists(result)
+
+    def test_every_selectable_option_has_a_packaged_default(self):
+        """Registration is complete for every option in the dropdown.
+
+        Keeps _PACKAGED_CONFIG_FILES and EXTERNAL_CONFIG_OPTIONS from drifting
+        apart again: a selectable option with no entry here resolves nothing
+        and fails at generation time with an architecture error instead.
+        """
+        options = [
+            option
+            for option in external_loader.EXTERNAL_CONFIG_OPTIONS
+            if option != external_loader.AUTO_CONFIG_NAME
+        ]
+
+        for option in options:
+            path = external_loader._get_packaged_config_path(option)
+            assert path, f"no packaged default registered for {option}"
+            assert os.path.exists(path), f"packaged default missing on disk: {path}"
+
+    def test_sidecar_config_no_packaged_default_raises(self, tmp_path):
+        """No sidecar + config_name without packaged default → FileNotFoundError.
+
+        The name here must stay absent from _PACKAGED_CONFIG_FILES; it used to
+        be 'VibeVoice-Realtime-0.5B', which now ships a default of its own.
+        """
+        weight = tmp_path / "foo.safetensors"
+        weight.write_bytes(b"")
+        unregistered = "VibeVoice-4B"
+        assert unregistered not in external_loader._PACKAGED_CONFIG_FILES
+
         with pytest.raises(FileNotFoundError):
-            resolve_sidecar_config(str(weight), "VibeVoice-Realtime-0.5B")
+            resolve_sidecar_config(str(weight), unregistered)
 
     def test_sidecar_preprocessor_found(self, tmp_path):
         """<weight>.preprocessor.json sidecar is returned when present."""
@@ -1133,3 +1173,4 @@ class TestAutoDetectLoaderSemantics:
         """Auto is TTS-branch only; ASR remains an explicit selection."""
         assert AUTO_CONFIG_NAME not in ASR_CONFIG_NAMES
         assert is_asr_config_name(AUTO_CONFIG_NAME) is False
+

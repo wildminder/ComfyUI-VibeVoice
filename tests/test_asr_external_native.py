@@ -5,6 +5,7 @@ Covers:
   and carries the shape the published VibeVoice-ASR-HF checkpoint expects
 - ``resolve_sidecar_config`` prefers a ``<weight>.config.json`` sidecar and
   otherwise falls back to the packaged default for ``config_name="VibeVoice-ASR"``
+- the realtime family shares that table but resolves to its own asset
 - the packaged processor assets exist and parse
 
 The assets are addressed by PATH (via ``asr_native``), never through
@@ -55,7 +56,12 @@ class TestPackagedAsrConfig:
 
 
 class TestAsrSidecarPrecedence:
-    """Sidecar-first must still beat the packaged default for ASR."""
+    """Sidecar-first must still beat the packaged default for ASR.
+
+    The packaged-default table is shared by every family, so the sibling
+    realtime name is asserted here too: it resolves to its own asset, not
+    to the ASR one.
+    """
 
     def test_sidecar_overrides_packaged_default(self, tmp_path):
         """A <weight>.config.json sidecar wins over the packaged default."""
@@ -79,13 +85,22 @@ class TestAsrSidecarPrecedence:
         assert resolved.endswith("default_VibeVoice-ASR_config.json")
         assert os.path.exists(resolved)
 
-    def test_realtime_still_has_no_packaged_default(self, tmp_path):
-        """VibeVoice-Realtime-0.5B must keep raising (no packaged default)."""
+    def test_realtime_resolves_to_its_own_packaged_default(self, tmp_path):
+        """The realtime family has a packaged default of its own, not ASR's.
+
+        This test used to assert the opposite — that VibeVoice-Realtime-0.5B
+        was the one selectable option with no packaged default and kept
+        raising. Both families now ship one, so the shared table has to route
+        each name to its own asset rather than to the ASR file.
+        """
         weight = tmp_path / "foo.safetensors"
         weight.write_bytes(b"")
 
-        with pytest.raises(FileNotFoundError):
-            resolve_sidecar_config(str(weight), "VibeVoice-Realtime-0.5B")
+        resolved = resolve_sidecar_config(str(weight), "VibeVoice-Realtime-0.5B")
+
+        assert resolved.endswith("default_VibeVoice-Realtime-0.5B_config.json")
+        assert resolved != _get_packaged_config_path("VibeVoice-ASR")
+        assert os.path.exists(resolved)
 
 
 class TestPackagedProcessorAssets:

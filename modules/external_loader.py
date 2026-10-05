@@ -91,6 +91,7 @@ if SAGE_ATTENTION_AVAILABLE:
 _PACKAGED_CONFIG_FILES = {
     "VibeVoice-1.5B": "default_VibeVoice-1.5B_config.json",
     "VibeVoice-7B": "default_VibeVoice-Large_config.json",
+    "VibeVoice-Realtime-0.5B": "default_VibeVoice-Realtime-0.5B_config.json",
     "VibeVoice-ASR": "default_VibeVoice-ASR_config.json",
 }
 
