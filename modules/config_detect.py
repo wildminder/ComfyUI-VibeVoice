@@ -4,8 +4,9 @@ Plan 2026-08-27 (Phase 2, D3/D4): the LLM embedding tensor of a VibeVoice
 checkpoint is a perfect fingerprint of its architecture family —
 
     model.language_model.embed_tokens.weight  shape [vocab, hidden]
-        VibeVoice-7B    (152064, 3584)
-        VibeVoice-1.5B  (151936, 1536)
+        VibeVoice-7B               (152064, 3584)
+        VibeVoice-1.5B             (151936, 1536)
+        VibeVoice-Realtime-0.5B    (151936, 896)
 
     language_model.model.embed_tokens.weight  shape [vocab, hidden]
         VibeVoice-ASR   (152064, 3584)
@@ -15,6 +16,10 @@ module names only they have (``multi_modal_projector.*`` and the two
 ``*_tokenizer_encoder.*`` towers) and only then classified against their own
 signature table. A TTS file never carries those prefixes, so the two
 branches cannot be confused.
+
+The streaming checkpoints name their acoustic tower ``model.acoustic_tokenizer.*``
+(singular ``tokenizer``, always under the ``model.`` prefix), which matches none
+of those ASR-only prefixes, so they reach the TTS table like any other TTS file.
 
 This module reads that shape WITHOUT materializing any tensor data:
 
@@ -45,9 +50,16 @@ _EMBEDDING_KEY_CANDIDATES = (
 )
 
 # config_name -> (hidden_size, vocab_size) of the LLM embedding.
+#
+# VibeVoice-Realtime-0.5B shares the 1.5B VOCAB (151936) but not its hidden
+# size (896 vs 1536), so the two can only be told apart by the FULL tuple —
+# which is what classify_embedding_shape compares. Never collapse this to a
+# single-dimension lookup; that is what would let the realtime row steal a
+# 1.5B checkpoint.
 _FAMILY_SIGNATURES = {
     "VibeVoice-7B": (3584, 152064),
     "VibeVoice-1.5B": (1536, 151936),
+    "VibeVoice-Realtime-0.5B": (896, 151936),
 }
 
 _ASR_ONLY_KEY_PREFIXES = (
