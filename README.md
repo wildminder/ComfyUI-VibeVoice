@@ -274,13 +274,16 @@ node into the `external_model` input of the TTS or ASR node — connected, it
 
 | Sidecar | Binds | Fallback when absent |
 | :--- | :--- | :--- |
-| `<weights>.config.json` | Architecture config | `config.json` in the same directory, then the packaged default (`1.5B` / `7B` only) |
+| `<weights>.config.json` | Architecture config | `config.json` in the same directory, then the packaged default for the selected family (`VibeVoice-1.5B`, `VibeVoice-7B`, `VibeVoice-Realtime-0.5B`, `VibeVoice-ASR`) |
 | `<weights>.preprocessor.json` | Audio preprocessor config | `preprocessor_config.json` in the same directory |
 | `tokenizer.json` | Qwen2.5 text tokenizer | Packaged tokenizer, then a Hugging Face download |
 
 3.  Select the file in `model_file`; keep `config_name` on `Auto-detect` unless
-    needed — it reads the weight file's embedding fingerprint, and an explicit
-    choice contradicting the weights is auto-corrected with a warning.
+    needed — it reads the weight file's embedding fingerprint, recognizes all
+    four packaged families (`VibeVoice-1.5B`, `VibeVoice-7B`,
+    `VibeVoice-Realtime-0.5B`, `VibeVoice-ASR`), never guesses an unmatched
+    shape, and auto-corrects an explicit choice that contradicts the weights
+    with a warning.
 4.  Connect `VIBEVOICE_MODEL` → `external_model`.
 
 **Notes:**
@@ -292,6 +295,13 @@ node into the `external_model` input of the TTS or ASR node — connected, it
     accepted and routed through the realtime path.
 *   `quantize_llm_4bit` applies to TTS / realtime models only; ASR always loads
     at full precision.
+*   **Realtime key counts:** a `VibeVoice-Realtime-0.5B` export is decoder-only
+    — the released weights deliberately omit the 276
+    `model.acoustic_tokenizer.encoder.*` tensors (unlike `1.5B` / `7B`, which
+    carry them). The loader treats that block as intentionally absent only
+    while the checkpoint supplies *none* of it, so a truncated export still
+    reports its real missing keys. Diffing key counts against `1.5B` is
+    expected, not a bug.
 *   **GGUF:** `.gguf` files are listed in `model_file` and dequantized via the
     `gguf` package (`pip install gguf`) — ComfyUI's stock diffusion loader
     cannot parse GGUF. Both `models/diffusion_models/` and the ComfyUI-GGUF

@@ -88,3 +88,52 @@ STREAMING_INFERENCE_PATH = os.path.join(
 )
 
 
+
+
+class TestReadmePackagedDefaults:
+    """The README's packaged-default set is generated from the loader table.
+
+    The external-loader docs once advertised the fallback as "`1.5B` / `7B`
+    only" while the dropdown already offered four families -- the same
+    doc-vs-table drift that made a selectable option unusable. Asserted both
+    ways: every family the loader backs is named, and no option the loader
+    cannot back is claimed.
+    """
+
+    @staticmethod
+    def _arch_config_row() -> str:
+        for line in _read(README_PATH).splitlines():
+            if line.startswith("| `<weights>.config.json`"):
+                return line
+        raise AssertionError(
+            "README sidecar table no longer has an architecture-config row"
+        )
+
+    def test_row_names_every_packaged_default(self):
+        from ComfyUI_VibeVoice.modules.external_loader import _PACKAGED_CONFIG_FILES
+
+        row = self._arch_config_row()
+
+        for family in _PACKAGED_CONFIG_FILES:
+            assert family in row, (
+                f"README sidecar table does not mention packaged default "
+                f"'{family}'"
+            )
+
+    def test_row_claims_no_option_without_a_packaged_default(self):
+        from ComfyUI_VibeVoice.modules.external_loader import (
+            AUTO_CONFIG_NAME,
+            EXTERNAL_CONFIG_OPTIONS,
+        )
+
+        row = self._arch_config_row()
+
+        for option in EXTERNAL_CONFIG_OPTIONS:
+            if option == AUTO_CONFIG_NAME:
+                continue
+            assert option in row, (
+                f"README sidecar table omits selectable option '{option}'"
+            )
+
+    def test_row_no_longer_restricts_the_fallback_to_two_families(self):
+        assert "only)" not in self._arch_config_row()

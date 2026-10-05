@@ -89,6 +89,41 @@ Release history for ComfyUI-VibeVoice. Newest first.
 ---
 
 <details>
+<summary><strong>v2.12.1 - load the single-file realtime checkpoint externally</strong></summary>
+
+### Loading
+*   A single-file `VibeVoice-Realtime-0.5B` safetensors export now loads through
+    `Load VibeVoice Model` with no sidecar. The architecture config ships with the
+    node (a verbatim copy of the published `config.json`), so the realtime option
+    in `config_name` resolves instead of raising "no packaged default".
+*   `Auto-detect` recognizes the realtime family from its embedding fingerprint
+    (hidden 896, vocab 151936), which it shares with no other family. Detection
+    stays exact-match-only: an unmatched shape is still not guessed.
+*   `config_name` accepts the lowercase spellings `vibevoice-realtime` and
+    `vibevoice_realtime` in saved workflows.
+
+### Fixed
+*   The "intentionally absent" rule for the acoustic-tokenizer encoder matched a
+    key namespace no released checkpoint uses, so every realtime load warned
+    about 276 keys it should have known were absent. Both the rooted and the
+    bare spelling are matched now, and the rule still refuses to silence a
+    partially present encoder.
+*   Both "no architecture config" errors name the actual remedy: an option
+    without a packaged default is named as such, and the auto-detect error no
+    longer recommends an option that would fail the same way.
+
+### Diagnostics
+*   README: the sidecar table's fallback column is now the real packaged-default
+    set instead of "`1.5B` / `7B` only", auto-detect is documented as
+    recognizing all four families, and a note records that realtime exports are
+    decoder-only (276 encoder keys intentionally absent). A test now keeps that
+    table in step with the loader's.
+
+</details>
+
+---
+
+<details>
 <summary><strong>v2.12.0 - external VibeVoice-ASR (native) loading</strong></summary>
 
 ### Loading
