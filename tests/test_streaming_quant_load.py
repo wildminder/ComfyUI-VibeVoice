@@ -16,6 +16,8 @@ prove:
 
 import gc
 import json
+import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,7 +40,11 @@ from ComfyUI_VibeVoice.modules.convrot_quant import (
     scan_checkpoint_quantization,
 )
 from ComfyUI_VibeVoice.modules.fp8_quant import FP8Linear, probe_fp8_backend
-from ComfyUI_VibeVoice.modules.quant_common import replace_linears_for_quant
+from ComfyUI_VibeVoice.modules.quant_common import (
+    QuantTargetMismatch,
+    replace_linears_for_quant,
+    validate_weight_plan,
+)
 from ComfyUI_VibeVoice.modules.dtype_utils import cast_model_to_dtype_if_needed
 from ComfyUI_VibeVoice.modules.memory_census import census
 from ComfyUI_VibeVoice.modules.patcher import (
@@ -965,3 +971,148 @@ class TestASRStreaming:
         q = bundle["model"].model.language_model.layers[0].self_attn.q_proj
         assert isinstance(q, ConvRotInt8Linear)
         assert q.weight.dtype == torch.int8
+
+
+# ====================================================================
+# Realtime quant route: verified, not assumed
+# ====================================================================
+#
+# Three quantized exports of the realtime family (fp8_e4m3, int8_block,
+# int8_convrot) become loadable for the first time once the family resolves
+# to a packaged config, and none of them had been exercised before. The real
+# files are 1 GB each, so every case here is a synthetic checkpoint built
+# with the established `comfy_quant` idiom -- the shape and the guard
+# behaviour are what is under test, not the weights.
+
+
+def _realtime_prefix(layer, proj):
+    return f"model.tts_language_model.layers.{layer}.self_attn.{proj}"
+
+
+def _save_realtime_quant(path, layers):
+    """A tiny realtime-named quant checkpoint: {proj: kind} per layer."""
+    tensors = {}
+    for layer, specs in layers.items():
+        for proj, kind, shape in specs:
+            tensors.update(_quant_tensors(_realtime_prefix(layer, proj), kind, shape))
+    tensors["tts_eos_classifier.fc1.weight"] = torch.randn(64, 64)
+    save_file(tensors, str(path))
+    return path
+
+
+_REALTIME_QUANT_LAYERS = {
+    0: [
+        ("q_proj", "convrot", (64, 64)),
+        ("k_proj", "rowwise_fp8", (64, 64)),
+        ("v_proj", "block", (128, 64)),
+        ("o_proj", "rowwise", (16, 64)),
+    ],
+}
+
+
+class TestRealtimeQuantScan:
+    """scan_checkpoint_quantization and the quant guards on a realtime file."""
+
+    @pytest.mark.parametrize(
+        "family,kind,expect_convrot",
+        [
+            ("fp8_e4m3", "rowwise_fp8", False),
+            ("int8_block", "block", False),
+            ("int8_convrot", "convrot", True),
+        ],
+    )
+    def test_scan_sees_every_quant_layer(self, tmp_path, family, kind,
+                                         expect_convrot):
+        """One entry per quantized linear, named by its realtime prefix."""
+        shapes = {
+            "q_proj": (64, 64),
+            "k_proj": (64, 64),
+            "v_proj": (128, 64),
+            "o_proj": (16, 64),
+        }
+        layers = {0: [(proj, kind, shapes[proj]) for proj in shapes]}
+        path = _save_realtime_quant(tmp_path / f"{family}.safetensors", layers)
+
+        quant_map = scan_checkpoint_quantization(path)
+
+        assert set(quant_map) == {_realtime_prefix(0, proj) for proj in shapes}
+        assert len(quant_map) == len(shapes)
+        assert {info.convrot for info in quant_map.values()} == {expect_convrot}
+
+    def test_scan_reports_only_the_convrot_layer_as_convrot(self, tmp_path):
+        """The convrot flag decides the resident-vs-dequant branch downstream."""
+        path = _save_realtime_quant(
+            tmp_path / "mixed.safetensors", _REALTIME_QUANT_LAYERS)
+
+        quant_map = scan_checkpoint_quantization(path)
+
+        assert quant_map[_realtime_prefix(0, "q_proj")].convrot is True
+        assert quant_map[_realtime_prefix(0, "v_proj")].convrot is False
+
+    def test_dense_realtime_file_has_no_quant_layers(self, tmp_path):
+        """The BF16 realtime export carries no *.comfy_quant keys at all."""
+        path = tmp_path / "bf16.safetensors"
+        save_file(
+            {
+                "model.language_model.embed_tokens.weight": torch.randn(96, 64),
+                "lm_head.weight": torch.randn(96, 64),
+            },
+            str(path),
+        )
+
+        assert scan_checkpoint_quantization(path) == {}
+
+    def test_lm_head_guard_does_not_false_positive_on_realtime(self):
+        """The packaged realtime config sets tie_word_embeddings=false.
+
+        The guard fires on a quantized lm_head when the config ties it. With
+        untied embeddings the realtime exports must load, so the guard has to
+        stay silent -- asserted against the shipped asset, not a stub.
+        """
+        asset = os.path.join(
+            EL._packaged_configs_dir(),
+            "default_VibeVoice-Realtime-0.5B_config.json",
+        )
+        with open(asset, encoding="utf-8") as fh:
+            decoder = json.load(fh)["decoder_config"]
+
+        assert decoder["tie_word_embeddings"] is False
+        config = SimpleNamespace(
+            decoder_config=SimpleNamespace(
+                tie_word_embeddings=decoder["tie_word_embeddings"]
+            ),
+            tie_word_embeddings=False,
+        )
+
+        EL._assert_lm_head_not_tied(config, {"lm_head": object()})
+
+    def test_lm_head_guard_still_arms_on_a_tied_config(self):
+        """Untying the realtime config must not disarm the guard itself."""
+        config = SimpleNamespace(
+            decoder_config=SimpleNamespace(tie_word_embeddings=True),
+            tie_word_embeddings=True,
+        )
+
+        with pytest.raises(QuantTargetMismatch):
+            EL._assert_lm_head_not_tied(config, {"lm_head": object()})
+
+    @pytest.mark.parametrize(
+        "family,is_gguf,quantized",
+        [
+            ("bf16", False, False),
+            ("fp8_e4m3", False, False),
+            ("int8_block", False, False),
+            ("int8_convrot", False, True),
+            ("gguf_block", True, False),
+        ],
+    )
+    @pytest.mark.parametrize("attention_mode", ["sdpa", "eager", "flash", "sage"])
+    def test_validate_weight_plan_accepts_each_family(self, family, is_gguf,
+                                                      quantized, attention_mode):
+        """Quantize_llm_4bit is off for all of them; nothing else may conflict."""
+        validate_weight_plan(
+            is_gguf_file=is_gguf,
+            convrot_quant_map={"layer": object()} if quantized else {},
+            use_llm_4bit=False,
+            attention_mode=attention_mode,
+        )
