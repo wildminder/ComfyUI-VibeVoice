@@ -89,7 +89,7 @@ Release history for ComfyUI-VibeVoice. Newest first.
 ---
 
 <details>
-<summary><strong>v2.12.1 - load the single-file realtime checkpoint externally</strong></summary>
+<summary><strong>v2.12.2 - load the single-file realtime checkpoint externally</strong></summary>
 
 ### Loading
 *   A single-file `VibeVoice-Realtime-0.5B` safetensors export now loads through
