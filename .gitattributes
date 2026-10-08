@@ -1,0 +1,5 @@
+
+# Shipped upstream assets must stay byte-verbatim: no EOL conversion on
+# checkout. autocrlf turned the packaged realtime config into CRLF (2117 ->
+# 2203 bytes), which breaks the sha256 pin guarding it.
+src/vibevoice/configs/** -text
