@@ -89,6 +89,43 @@ Release history for ComfyUI-VibeVoice. Newest first.
 ---
 
 <details>
+<summary><strong>v2.12.3 - the gguf package is now optional</strong></summary>
+
+### Dependencies
+*   **`gguf` is no longer a forced dependency.** It is needed only to read
+    single-file quantized `.gguf` weights, so it moved out of the hard
+    `dependencies` list into the opt-in `gguf-extra` extras group
+    (`pip install gguf`, or `pip install "ComfyUI-VibeVoice[gguf-extra]"` for a
+    registry install). The ComfyUI registry and ComfyUI-Manager never install
+    extras, so a user who never loads a GGUF model no longer pulls the package
+    in — and the v2.12.2 hard dependency can no longer fail their install with
+    "Load Failed".
+*   `requirements.txt` no longer lists `gguf` as an active line either (the
+    same commented-out convention as the optional audio backends), because
+    Manager's prestartup installs every active line of that file.
+
+### Loading
+*   **The node loads with or without `gguf`.** The GGUF reader is imported
+    lazily now, so every other model family — safetensors, ConvRot INT8,
+    fp8-resident and 4-bit — is unaffected when the package is absent.
+*   **Selecting a `.gguf` file without the package shows an in-app notice
+    instead of a raw `ImportError`.** The load is refused up front with a
+    message naming the package and the install command, and the frontend opens
+    a modal with two actions: **Abort** and **Install missing package**. The
+    install action is one click through ComfyUI-Manager when it is available;
+    otherwise it shows the copyable `pip install gguf` command. A restart is
+    required either way to apply the install.
+
+### Diagnostics
+*   README: the external-models support wording now states that the package is
+    optional, installed only on request (`pip install gguf` or the `gguf-extra`
+    extra), and what the missing-package notice does.
+
+</details>
+
+---
+
+<details>
 <summary><strong>v2.12.2 - load the single-file realtime checkpoint externally</strong></summary>
 
 ### Loading
