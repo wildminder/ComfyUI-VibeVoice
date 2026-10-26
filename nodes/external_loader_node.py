@@ -32,6 +32,7 @@ from ..modules.attention_utils import (
     check_dtype_attention_compatible,
 )
 from ..modules.dtype_utils import get_dtype_options, DTYPE_AUTO
+from ..modules.gguf_quant import GGUF_MISSING_MESSAGE, gguf_available
 from ..modules.model_registry import (
     FAMILY_ASR,
     FAMILY_TTS,
@@ -39,6 +40,7 @@ from ..modules.model_registry import (
     get_live_bundle,
     identity_for_external,
 )
+from ..modules.notify import notify_gguf_missing
 from ..modules.utils import VIBEVOICE_ASR_PATCHER_CACHE, VIBEVOICE_PATCHER_CACHE
 
 
@@ -190,6 +192,18 @@ class VibeVoiceExternalLoaderNode(io.ComfyNode):
         config_name = normalize_config_name(config_name)
 
         weight_path = resolve_weight_path(model_file)
+
+        # One choke point for TTS and ASR single-file loads (same node): a
+        # .gguf selection without the optional ``gguf`` package is refused
+        # here, before any fingerprinting or parsing starts, with the exact
+        # message the loader paths raise. The modal notice is best effort —
+        # it must never mask or change the error below.
+        if weight_path.lower().endswith(".gguf") and not gguf_available():
+            try:
+                notify_gguf_missing(GGUF_MISSING_MESSAGE)
+            except Exception:
+                pass
+            raise RuntimeError(GGUF_MISSING_MESSAGE)
 
         if config_name == AUTO_CONFIG_NAME:
             config_name = resolve_auto_config_name(weight_path)

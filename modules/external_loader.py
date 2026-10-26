@@ -427,13 +427,9 @@ def _load_gguf_state_dict(weight_path: str, device=None) -> dict:
     if device is None:
         device = torch.device("cpu")
 
-    try:
-        import gguf
-    except ImportError as e:
-        raise RuntimeError(
-            "Loading .gguf weights requires the 'gguf' Python package. "
-            "Install it with: pip install gguf"
-        ) from e
+    from .gguf_quant import require_gguf
+
+    require_gguf()
 
     logging.debug(f"[VibeVoice TTS] Loading GGUF state dict from: {weight_path}")
     from .gguf_quant import dequantize_reader_tensor, open_gguf_reader
@@ -460,14 +456,11 @@ def _load_weight_state_dict(weight_path: str, device) -> dict:
 # ====================================================================
 
 def _open_gguf_reader(weight_path: str):
-    try:
-        import gguf  # noqa: F401
-    except ImportError as e:
-        raise RuntimeError(
-            "Loading .gguf weights requires the 'gguf' Python package. "
-            "Install it with: pip install gguf"
-        ) from e
-    from .gguf_quant import open_gguf_reader
+    # Same canonical message as the node gate and open_gguf_reader(): every
+    # path that needs ``gguf`` refuses identically via require_gguf().
+    from .gguf_quant import open_gguf_reader, require_gguf
+
+    require_gguf()
 
     return open_gguf_reader(weight_path)
 

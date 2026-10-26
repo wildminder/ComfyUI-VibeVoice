@@ -14,15 +14,22 @@ Dequantization kernels are ports of ``gguf-quants`` (gguf-py) semantics and
 are pinned BITWISE to that package by tests (tests/test_gguf_quant_blocks.py)
 — the installed gguf package acts as the parity oracle.
 
+The ``gguf`` package itself is an OPTIONAL dependency: it is only needed by the
+``.gguf`` single-file path. Nothing is imported from it at module scope (see
+``gguf_available`` / ``require_gguf`` / ``GGUF_MISSING_MESSAGE``), so a user who
+never loads a ``.gguf`` file does not need it installed.
+
 Supported quant matrix (v1): Q8_0, Q4_K, Q5_K, Q6_K.
 Float passthrough: F32, F16, BF16 (zero-copy torch views where possible).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import re
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -36,7 +43,62 @@ from .diagnostics import diagnostics_enabled
 _FLAT_POOL_WARNED = set()
 
 # ====================================================================
-# 0. Type matrix
+# 0. Optional dependency (gguf)
+# ====================================================================
+#
+# ``gguf`` is only needed by the .gguf single-file quantization path. A user
+# running default/safetensors checkpoints must never be forced to install it,
+# so nothing in this module imports gguf at module scope: a missing package
+# degrades to the friendly error below instead of an ImportError that takes
+# the whole node package down with it (the "Load Failed" symptom). Same
+# convention as ``sageattention`` in modules/attention_utils.py.
+
+_GGUF_INSTALL_COMMAND = f"{sys.executable} -m pip install gguf"
+
+#: Canonical user-facing message for a missing ``gguf`` package. A plain str so
+#: it can be dropped straight into an exception OR a UI notice.
+GGUF_MISSING_MESSAGE = (
+    "Loading .gguf weights requires the 'gguf' Python package, which is "
+    f"not installed. Install it with: {_GGUF_INSTALL_COMMAND}"
+)
+
+# find_spec() is a filesystem probe that must not rerun on every call, so the
+# answer is cached here. The cache-reset seam for tests: clear this dict to
+# re-probe after blocking the import (``sys.modules["gguf"] = None``).
+_GGUF_SPEC_CACHE: "dict[str, bool]" = {}
+
+
+def _probe_gguf() -> bool:
+    """Whether ``import gguf`` can succeed right now.
+
+    ``sys.modules["gguf"] = None`` is how a module is marked absent (tests block
+    it that way); importlib reports that as a ``ValueError`` from find_spec()
+    rather than as ``None``, so it counts as absent too.
+    """
+    try:
+        return importlib.util.find_spec("gguf") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def gguf_available() -> bool:
+    """Whether the optional ``gguf`` package is importable on this system."""
+    cached = _GGUF_SPEC_CACHE.get("available")
+    if cached is None:
+        cached = _probe_gguf()
+        _GGUF_SPEC_CACHE["available"] = cached
+    return cached
+
+
+def require_gguf() -> None:
+    """Raise :class:`RuntimeError` with the install hint if gguf is absent."""
+    if gguf_available():
+        return
+    raise RuntimeError(GGUF_MISSING_MESSAGE)
+
+
+# ====================================================================
+# 0b. Type matrix
 # ====================================================================
 
 
@@ -52,7 +114,12 @@ class UnsupportedGGMLType(TypeError):
     def __init__(self, ggml_type, tensor_name: str = ""):
         self.ggml_type = ggml_type
         self.tensor_name = tensor_name
-        self.supported = sorted(t.name for t in SUPPORTED_GGML_TYPES)
+        supported = SUPPORTED_GGML_TYPES
+        if supported is None:
+            # Imported without gguf: the matrices are only built on first real
+            # GGUF use, so fill them in here rather than dereferencing None.
+            supported = _require_matrices()[1]
+        self.supported = sorted(t.name for t in supported)
         super().__init__(
             f"GGUF tensor '{tensor_name}' uses GGML type "
             f"{getattr(ggml_type, 'name', ggml_type)}, which is not supported. "
@@ -69,7 +136,34 @@ def _build_matrices():
     return T, quant, floats
 
 
-_T, SUPPORTED_GGML_TYPES, FLOAT_GGML_TYPES = _build_matrices()
+def _require_matrices():
+    """Return ``(T, SUPPORTED_GGML_TYPES, FLOAT_GGML_TYPES)``, built on first use.
+
+    The module-level assignment below is deliberately import-safe: when gguf
+    is absent the three globals stay ``None`` and this module still imports.
+    Every runtime GGUF call site routes through here so a missing package
+    surfaces as :data:`GGUF_MISSING_MESSAGE` instead of an ``AttributeError``
+    on a ``None`` type matrix.
+    """
+    global _T, SUPPORTED_GGML_TYPES, FLOAT_GGML_TYPES
+    if _T is None:
+        require_gguf()
+        try:
+            _T, SUPPORTED_GGML_TYPES, FLOAT_GGML_TYPES = _build_matrices()
+        except ImportError as e:
+            # find_spec() reported the package present but the import still
+            # fails (broken install): report the same actionable remedy.
+            raise RuntimeError(GGUF_MISSING_MESSAGE) from e
+    return _T, SUPPORTED_GGML_TYPES, FLOAT_GGML_TYPES
+
+
+try:
+    _T, SUPPORTED_GGML_TYPES, FLOAT_GGML_TYPES = _build_matrices()
+except ImportError:
+    # gguf is optional (see GGUF_MISSING_MESSAGE). Keep the sentinels: this
+    # module must import cleanly without it. _require_matrices() above builds
+    # the real values on first GGUF use.
+    _T, SUPPORTED_GGML_TYPES, FLOAT_GGML_TYPES = None, None, None
 
 # GGML_QUANT_SIZES[qtype] = (block_size, type_size)
 _BLOCK_SIZES = {}
@@ -330,7 +424,7 @@ def _dequant_q8_0_fused(blocks: torch.Tensor, out_dtype: torch.dtype):
 
 
 def _kernel_for(ggml_type):
-    T = _T
+    T = _require_matrices()[0]
     if ggml_type == T.Q8_0:
         return _dequant_q8_0
     if ggml_type == T.Q4_K:
@@ -355,6 +449,7 @@ def _compute_dtype_for(ggml_type, out_dtype: torch.dtype) -> torch.dtype:
 
 def dequantize_blocks(raw: torch.Tensor, ggml_type, out_dtype: torch.dtype, shape) -> torch.Tensor:
     """Dequantize raw GGML blocks to ``out_dtype`` with logical ``shape``."""
+    T = _require_matrices()[0]
     kernel = _kernel_for(ggml_type)
     if kernel is None:
         raise UnsupportedGGMLType(ggml_type, tensor_name="<raw blocks>")
@@ -375,7 +470,7 @@ def dequantize_blocks(raw: torch.Tensor, ggml_type, out_dtype: torch.dtype, shap
     # scratch plus a second full cast pass. Only for Q8_0 on CUDA, only when
     # Triton is importable — everything else falls through to the torch chain
     # below, which stays the reference implementation.
-    if (_FUSED_Q8_0_ENABLED and ggml_type == _T.Q8_0 and blocks.is_cuda
+    if (_FUSED_Q8_0_ENABLED and ggml_type == T.Q8_0 and blocks.is_cuda
             and triton_q8_0_available()):
         return _dequant_q8_0_fused(blocks, out_dtype).reshape(shape)
 
@@ -509,7 +604,7 @@ def cached_dequantize_blocks(linear, out_dtype):
 
 def dequantize_dense(raw_or_view: torch.Tensor, ggml_type) -> torch.Tensor:
     """Materialize a FLOAT ggml tensor (F32/F16/BF16) as a native torch tensor."""
-    T = _T
+    T = _require_matrices()[0]
     if ggml_type == T.F32:
         t = raw_or_view
         if raw_or_view.dtype == torch.uint8:
@@ -545,9 +640,16 @@ def _flat_byte_shape(shape, quant_type) -> tuple:
 
 def open_gguf_reader(weight_path):
     """Open a GGUF file, recovering flat-block tensors if needed."""
+    require_gguf()
     import os
-    import gguf
-    import gguf.gguf_reader as _gr
+    try:
+        import gguf
+        import gguf.gguf_reader as _gr
+    except ImportError as e:
+        # find_spec() reported the package present but the import still fails
+        # (the package was removed/broken under us after the probe): report the
+        # same actionable remedy a missing package gets, not a bare ImportError.
+        raise RuntimeError(GGUF_MISSING_MESSAGE) from e
 
     try:
         return gguf.GGUFReader(weight_path)
@@ -578,19 +680,23 @@ def dequantize_reader_tensor(
     reader_tensor, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """Dequantize one reader tensor to a LOGICAL-shaped torch tensor."""
+    # First, so a missing gguf surfaces as the friendly message rather than as
+    # an ImportError from the gguf-only imports below.
+    T, supported, float_types = _require_matrices()
+
     import numpy as np
     from gguf.constants import GGML_QUANT_SIZES
 
     t = reader_tensor
-    if t.tensor_type in FLOAT_GGML_TYPES:
+    if t.tensor_type in float_types:
         data = np.ascontiguousarray(t.data)
         tensor = torch.from_numpy(data.copy())
-        if t.tensor_type == _T.BF16 and tensor.dtype == torch.uint8:
+        if t.tensor_type == T.BF16 and tensor.dtype == torch.uint8:
             tensor = tensor.view(torch.bfloat16)
         shape = tuple(int(s) for s in reversed(t.shape))
         return tensor.reshape(shape).clone().to(dtype)
 
-    if t.tensor_type not in SUPPORTED_GGML_TYPES:
+    if t.tensor_type not in supported:
         raise UnsupportedGGMLType(t.tensor_type, f"{t.name}")
 
     block_size, type_size = GGML_QUANT_SIZES[t.tensor_type]
