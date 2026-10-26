@@ -25,6 +25,13 @@ soundfile
 transformers
 diffusers
 bitsandbytes
+# gguf is OPTIONAL: it is only needed to read .gguf quantized model files,
+# and the package imports fine without it (a .gguf load is refused with an
+# in-app notice offering an install when the package is missing). Keeping it
+# commented out here means nobody who never loads a .gguf file pays for it:
+# ComfyUI-Manager's prestartup installs every ACTIVE line of this file.
+# Install it yourself (pip install gguf) when you want GGUF support.
+# gguf
 
 # Optional audio-resampling fallbacks (torchaudio is the primary resampler;
 # the node never requires librosa and degrades gracefully without it):

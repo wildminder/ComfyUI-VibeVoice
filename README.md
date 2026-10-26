@@ -303,9 +303,15 @@ node into the `external_model` input of the TTS or ASR node — connected, it
     reports its real missing keys. Diffing key counts against `1.5B` is
     expected, not a bug.
 *   **GGUF:** `.gguf` files are listed in `model_file` and dequantized via the
-    `gguf` package (`pip install gguf`) — ComfyUI's stock diffusion loader
-    cannot parse GGUF. Both `models/diffusion_models/` and the ComfyUI-GGUF
-    `unet_gguf` folder are discovered.
+    `gguf` package — ComfyUI's stock diffusion loader cannot parse GGUF. The
+    package is **optional**: safetensors and other formats never need it, and
+    it is installed only on request (`pip install gguf`, or the `gguf-extra`
+    extra for registry installs), never forced by the node. Without it, the
+    node loads fine, and selecting a `.gguf` model file shows an in-app notice
+    offering to install the missing package (one click through
+    ComfyUI-Manager, or a copyable command when Manager is unavailable).
+    Both `models/diffusion_models/` and the ComfyUI-GGUF `unet_gguf` folder
+    are discovered.
 *   **Mismatch guard:** a `config_name` contradicting the weights fails fast
     with the offending tensor names and the correct `config_name` suggested —
     no raw `size mismatch` stack trace.

@@ -170,6 +170,50 @@ class TestAudioDependencySurface:
         assert "torchaudio" in names
 
 
+class TestGgufHardDependency:
+    """gguf must stay OPTIONAL on every install path — the name is kept for
+    history (this class used to assert the opposite contract).
+
+    gguf is only needed to read `.gguf` single-file quantized models, and the
+    package imports cleanly without it (the GGML type matrix in
+    modules/gguf_quant.py is built lazily on first GGUF use). Users who never
+    touch a `.gguf` model must not be forced to install it: the Comfy registry
+    resolves `[project] dependencies` and Manager never installs extras, so a
+    hard `dependencies` entry forces it on everyone; and requirements.txt is
+    installed verbatim by Manager's prestartup, so an active `gguf` line there
+    would force it on every git-clone install too. A `.gguf` load selected
+    without the package is refused with an in-app notice instead.
+    """
+
+    def test_gguf_not_in_hard_dependencies(self):
+        data = _load_pyproject()
+        names = {_dep_name(d) for d in data["project"]["dependencies"]}
+        assert "gguf" not in names, (
+            "gguf must be optional, not a hard dependency: only .gguf "
+            "single-file quantized models need it, and the registry resolves "
+            "every hard dependency for all users."
+        )
+
+    def test_gguf_not_in_requirements_txt(self):
+        names = {_dep_name(e) for e in _requirements_entries()}
+        assert "gguf" not in names, (
+            "Manager/git-clone installs resolve every ACTIVE line of "
+            "requirements.txt, so an active gguf line there forces the "
+            "package on users who never load .gguf models — it must stay "
+            "commented out."
+        )
+
+    def test_gguf_in_optional_dependencies(self):
+        data = _load_pyproject()
+        extras = data["project"].get("optional-dependencies", {})
+        assert "gguf-extra" in extras, "optional-dependencies.gguf-extra must exist"
+        extra_names = {_dep_name(d) for d in extras["gguf-extra"]}
+        assert "gguf" in extra_names, (
+            "gguf-extra must offer the gguf package for users who want "
+            "single-file GGUF models."
+        )
+
+
 class TestRequirementsPyprojectParity:
     """requirements.txt must be a dependency-name subset of pyproject.toml.
 

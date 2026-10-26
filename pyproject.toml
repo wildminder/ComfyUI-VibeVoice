@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-VibeVoice"
 description = "VibeVoice TTS Updated! Expressive, long-form, multi-speaker conversational audio"
-version = "2.12.2"
+version = "2.12.3"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 
@@ -16,6 +16,11 @@ classifiers = [
 # primary resampler; scipy/librosa are only used if torchaudio is unavailable.
 # The node never requires librosa and degrades gracefully without it.
 audio-extra = ["scipy", "librosa"]
+# Optional GGUF (single-file quantized) model reader. Only needed to load
+# .gguf weights; the node refuses those loads with an in-app notice when the
+# package is absent, and everything else works without it. Extras are never
+# installed by the Comfy registry or ComfyUI-Manager, so this stays opt-in.
+gguf-extra = ["gguf"]
 
 [project.urls]
 Homepage = "https://github.com/wildminder/ComfyUI-VibeVoice"
