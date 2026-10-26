@@ -140,6 +140,9 @@ class TestCastModelToDtype:
         model.to.assert_not_called()
 
     def test_cast_protects_quant_resident_module(self):
+        # gguf is optional (plan 2026-10-26): the resident is built with a real
+        # GGML type, so skip rather than ImportError.
+        pytest.importorskip("gguf", reason="gguf package not installed")
         from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
 
         class _M(torch.nn.Module):

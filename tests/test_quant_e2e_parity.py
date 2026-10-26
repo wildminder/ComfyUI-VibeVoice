@@ -12,8 +12,13 @@ import pytest
 import torch
 from unittest.mock import MagicMock, patch
 
-import gguf
-from gguf.constants import GGMLQuantizationType as T
+# gguf is an optional dependency: the gguf-py oracle it dequantizes through is
+# the reference, so the suite must SKIP rather than error without it (same
+# pattern as tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+import gguf  # noqa: E402
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
 from gguf.quants import dequantize as oracle_dequantize
 
 from ComfyUI_VibeVoice.modules import external_loader as EL

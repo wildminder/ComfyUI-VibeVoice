@@ -2,8 +2,14 @@
 
 import pytest
 import torch
-import gguf
-from gguf.constants import GGMLQuantizationType as T
+
+# gguf is an optional dependency: these fixtures write and read real GGUF
+# files, so the suite must SKIP rather than error without it (same pattern as
+# tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+import gguf  # noqa: E402
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
 
 from ComfyUI_VibeVoice.modules import gguf_quant as G
 from ComfyUI_VibeVoice.modules.convrot_quant import (

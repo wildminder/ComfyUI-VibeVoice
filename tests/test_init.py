@@ -1,10 +1,15 @@
 """Tests for __init__.py - Entry point and folder registration."""
 
+import ast
 import sys
 import os
 import pytest
 
 import ComfyUI_VibeVoice
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PKG_DIR = os.path.dirname(TESTS_DIR)
+INIT_PATH = os.path.join(PKG_DIR, "__init__.py")
 
 
 class TestPytestGuard:
@@ -62,15 +67,54 @@ class TestEntrypointExport:
         assert callable(comfy_entrypoint)
 
 
-class TestNoWebDirectory:
-    """IMP-002: V3 nodes need no WEB_DIRECTORY; it must not point at a missing dir."""
+class TestWebDirectory:
+    """The V3 frontend listener lives in js/ and is served via WEB_DIRECTORY.
 
-    def test_no_web_directory_attribute(self):
-        """The package must not expose a WEB_DIRECTORY attribute."""
-        assert not hasattr(ComfyUI_VibeVoice, "WEB_DIRECTORY"), (
-            "WEB_DIRECTORY should be removed for V3 nodes."
+    ComfyUI scans the WEB_DIRECTORY module attribute for **/*.js and serves the
+    results under /extensions/<module>/ (ComfyUI nodes.py:2299-2302). Without it
+    the gguf-missing modal listener would never load and the browser would drop
+    the vibevoice.gguf_missing event with an "Unknown message type" error.
+    """
+
+    def _web_directory_assignments(self):
+        """(lineno, value) for every module-level WEB_DIRECTORY assignment.
+
+        Read by AST rather than via the imported attribute so the test still
+        pins the declaration itself, not just one observed value.
+        """
+        with open(INIT_PATH, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=INIT_PATH)
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "WEB_DIRECTORY" for t in node.targets
+            ):
+                found.append((node.lineno, ast.literal_eval(node.value)))
+        return found
+
+    def test_web_directory_declared_once(self):
+        """WEB_DIRECTORY is declared exactly once, and equals the js/ root."""
+        assignments = self._web_directory_assignments()
+        assert len(assignments) == 1, (
+            f"expected exactly one WEB_DIRECTORY assignment in {INIT_PATH}, "
+            f"found {len(assignments)}: {assignments}. It must not be split or "
+            "re-declared across branches."
+        )
+        assert getattr(ComfyUI_VibeVoice, "WEB_DIRECTORY", None) == "./js", (
+            "WEB_DIRECTORY must stay './js' (the directory ComfyUI globs for "
+            "**/*.js)."
+        )
+
+    def test_web_directory_resolves_to_existing_dir(self):
+        """WEB_DIRECTORY points at a directory that exists at import time."""
+        (lineno, value), = self._web_directory_assignments()
+        web_dir = os.path.abspath(os.path.join(PKG_DIR, value))
+        assert os.path.isdir(web_dir), (
+            f"WEB_DIRECTORY = {value!r} at {INIT_PATH}:{lineno} does not resolve "
+            f"to an existing directory ({web_dir}). ComfyUI only registers the "
+            "web root when os.path.isdir() is true, so the modal never ships."
         )
 
     def test_web_directory_not_in_all(self):
-        """WEB_DIRECTORY must not appear in __all__."""
+        """WEB_DIRECTORY is config, not part of the node's public exports."""
         assert "WEB_DIRECTORY" not in getattr(ComfyUI_VibeVoice, "__all__", [])

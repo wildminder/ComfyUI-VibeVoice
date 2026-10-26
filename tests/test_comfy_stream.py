@@ -544,6 +544,8 @@ class TestStreamingConversionGate:
     def test_quant_resident_still_excluded(self, enabled):
         """GGUF / convrot-int8 / fp8 residents stream natively and are never
         rewrapped, whichever way the gate is set."""
+        # gguf is optional (plan 2026-10-26): skip rather than ImportError.
+        pytest.importorskip("gguf", reason="gguf package not installed")
         from gguf.constants import GGMLQuantizationType as T
 
         from ComfyUI_VibeVoice.modules.convrot_quant import ConvRotInt8Linear

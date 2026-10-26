@@ -50,9 +50,15 @@ import time
 import numpy as np
 import pytest
 import torch
-from gguf.constants import GGMLQuantizationType as T
-from gguf.quants import dequantize as oracle_dequantize
-from gguf.quants import quantize as oracle_quantize
+
+# gguf is an optional dependency: every reference value here is produced by the
+# gguf-py oracle, so the suite must SKIP rather than error without it (same
+# pattern as tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
+from gguf.quants import dequantize as oracle_dequantize  # noqa: E402
+from gguf.quants import quantize as oracle_quantize  # noqa: E402
 
 from ComfyUI_VibeVoice.modules import gguf_quant as G
 
@@ -69,6 +75,10 @@ def _seeded_raw(shape=(512, 256), seed=0):
 
 def _handcrafted_blocks(qtype, n_blocks):
     """Deterministic raw bytes for a k-quant, valid enough to unpack."""
+    # Defensive: the module-level guard already makes this file SKIP without
+    # gguf, but this helper is the only thing standing between a caller and the
+    # package if it is ever reused elsewhere.
+    pytest.importorskip("gguf", reason="gguf package not installed")
     from gguf.constants import GGML_QUANT_SIZES
 
     rng = np.random.default_rng(7)
@@ -331,6 +341,9 @@ def test_gguf_perf_benchmark_q8_0_dequant_cost():
     shapes. That ~1 ms difference is paid ONCE at load, in exchange for
     bit-exact weights.
     """
+    # Defensive: the module-level guard already makes this file SKIP without
+    # gguf; kept so the benchmark body cannot outlive it.
+    pytest.importorskip("gguf", reason="gguf package not installed")
     from gguf.constants import GGML_QUANT_SIZES
 
     block_size, type_size = GGML_QUANT_SIZES[T.Q8_0]

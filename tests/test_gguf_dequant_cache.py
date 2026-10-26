@@ -13,7 +13,13 @@ the hit-rate ones.
 import pytest
 import torch
 
-from ComfyUI_VibeVoice.modules import gguf_quant as G
+# gguf is an optional dependency (plan 2026-10-26 section 4.5). Every test
+# below builds a Q8_0 GGUFLinear, which needs a real GGML type from the package
+# (``G._T`` is the None sentinel without it), so a missing gguf must SKIP the
+# file rather than error on the sentinel.
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+from ComfyUI_VibeVoice.modules import gguf_quant as G  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

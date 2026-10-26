@@ -18,7 +18,12 @@ import pytest
 import torch
 from unittest.mock import MagicMock, patch
 
-import gguf
+# gguf is an optional dependency: this harness loads a real .gguf file, so the
+# suite must SKIP rather than error without it (same pattern as
+# tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+import gguf  # noqa: E402
 
 from ComfyUI_VibeVoice.modules import external_loader as EL
 from ComfyUI_VibeVoice.modules.external_loader import load_external_vibevoice_model

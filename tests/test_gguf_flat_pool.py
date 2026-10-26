@@ -15,9 +15,15 @@ in the same shape family, plus a Q8_0 ``embed_tokens`` targeting an
 
 import pytest
 import torch
-from gguf.constants import GGMLQuantizationType as T
 
-import gguf
+# gguf is an optional dependency: without it there is no GGUFReader to recover
+# these files from, so the suite must SKIP rather than error (same pattern as
+# tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
+
+import gguf  # noqa: E402
 
 from conftest import build_stub_vv, write_synthetic_gguf
 

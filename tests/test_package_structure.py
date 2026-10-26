@@ -45,8 +45,19 @@ class TestPackageStructure:
         import tests
         assert tests is not None
 
-    def test_js_dir_absent(self):
-        """IMP-002: the formerly-empty js/ directory should not exist."""
-        assert not os.path.isdir(os.path.join(ROOT, "js")), (
-            "js/ directory should be removed; V3 nodes require no web root."
+    def test_js_dir_present(self):
+        """js/ exists and ships the modal entry point ComfyUI globs for **/*.js.
+
+        WEB_DIRECTORY = "./js" (see tests/test_init.py::TestWebDirectory) is only
+        honoured by ComfyUI when the target directory exists at startup, so an
+        empty or missing js/ silently drops the gguf-missing modal.
+        """
+        js_dir = os.path.join(ROOT, "js")
+        assert os.path.isdir(js_dir), (
+            "js/ directory should exist: WEB_DIRECTORY points at it and ComfyUI "
+            "only serves frontend extensions when the directory is present."
+        )
+        assert os.path.isfile(os.path.join(js_dir, "gguf_missing_modal.js")), (
+            "js/ should contain gguf_missing_modal.js, the registered listener "
+            "for the vibevoice.gguf_missing event."
         )

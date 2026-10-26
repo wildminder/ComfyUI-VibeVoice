@@ -60,6 +60,11 @@ def _save_safetensors(tmp_path, tensors: dict, name="model.safetensors") -> str:
 
 def _write_gguf(tmp_path, tensors: dict, name="model.gguf") -> str:
     """Write a minimal real GGUF file with the given named float tensors."""
+    # gguf is an optional dependency (plan 2026-10-26). This helper is the
+    # single entry point every GGUF fingerprint/dispatch test below goes
+    # through, so a missing package degrades each of them to a SKIP here
+    # instead of an ImportError at the reader call.
+    pytest.importorskip("gguf", reason="gguf package not installed")
     import gguf
 
     path = str(tmp_path / name)

@@ -25,8 +25,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from gguf.constants import GGMLQuantizationType as T
-from gguf.quants import quantize as oracle_quantize
+
+# gguf is an optional dependency: the counters are read off real residents built
+# from gguf-quantized bytes, so the suite must SKIP rather than error without it
+# (same pattern as tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
+from gguf.quants import quantize as oracle_quantize  # noqa: E402
 
 from ComfyUI_VibeVoice.modules import gguf_quant as G
 from ComfyUI_VibeVoice.modules.external_loader import _log_load_diagnostics

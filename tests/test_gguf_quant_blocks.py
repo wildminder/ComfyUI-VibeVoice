@@ -11,8 +11,15 @@ import os
 import numpy as np
 import pytest
 import torch
-import gguf
-from gguf.constants import GGMLQuantizationType as T
+
+# gguf is an optional dependency: without it the gguf-py parity oracle below
+# does not exist, so the suite must SKIP rather than error (same pattern as
+# tests/test_gguf_loading.py). The gguf-free import contract is pinned by
+# tests/test_gguf_optional.py.
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+import gguf  # noqa: E402
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
 from gguf.quants import dequantize as oracle_dequantize, quantize as oracle_quantize
 
 from ComfyUI_VibeVoice.modules import gguf_quant as G

@@ -8,8 +8,14 @@ import pytest
 import torch
 
 import numpy as np
-from gguf.constants import GGMLQuantizationType as T
-from gguf.quants import dequantize as oracle_dequantize, quantize as oracle_quantize
+
+# gguf is an optional dependency: the residents are built from gguf-quantized
+# bytes, so the suite must SKIP rather than error without it (same pattern as
+# tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
+from gguf.quants import dequantize as oracle_dequantize, quantize as oracle_quantize  # noqa: E402
 
 from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear
 from ComfyUI_VibeVoice.modules.convrot_quant import ConvRotInt8Linear

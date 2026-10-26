@@ -770,6 +770,8 @@ class TestWarnIfLowbitQuantization:
 
     def test_gguf_lowbit_warns(self, tmp_path, caplog):
         """GGUF with many sub-4-bit I-quant tensors must warn."""
+        # gguf is optional (plan 2026-10-26): skip rather than ImportError.
+        pytest.importorskip("gguf", reason="gguf package not installed")
         # Build a fake GGUFReader with a tensor table of IQ3_XXS tensors.
         from gguf.constants import GGMLQuantizationType
 
@@ -788,6 +790,8 @@ class TestWarnIfLowbitQuantization:
 
     def test_gguf_highbit_no_warning(self, tmp_path, caplog):
         """GGUF with Q8_0 tensors must NOT warn."""
+        # gguf is optional (plan 2026-10-26): skip rather than ImportError.
+        pytest.importorskip("gguf", reason="gguf package not installed")
         from gguf.constants import GGMLQuantizationType
 
         fake_tensors = [MagicMock() for _ in range(10)]

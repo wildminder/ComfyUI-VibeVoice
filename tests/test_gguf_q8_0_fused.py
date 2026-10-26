@@ -16,7 +16,13 @@ but NOT under the dev venv. They skip cleanly when unavailable.
 import pytest
 import torch
 
-from ComfyUI_VibeVoice.modules import gguf_quant as G
+# gguf is an optional dependency (plan 2026-10-26 section 4.5). The reference
+# chain is driven with a real GGML type (``G._T.Q8_0`` is the None sentinel
+# without the package), so a missing gguf must SKIP the file rather than error
+# on the sentinel.
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+from ComfyUI_VibeVoice.modules import gguf_quant as G  # noqa: E402
 
 # Scales covering the interesting fp16 shapes: sign, subnormal-adjacent,
 # ordinary, top of range. NaN/Inf bit patterns are deliberately NOT fixtures —

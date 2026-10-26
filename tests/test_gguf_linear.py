@@ -5,8 +5,14 @@ import torch
 from torch import nn
 
 import numpy as np
-from gguf.constants import GGMLQuantizationType as T
-from gguf.quants import dequantize as oracle_dequantize, quantize as oracle_quantize
+
+# gguf is an optional dependency: the parity oracle and the raw-block builders
+# both come from it, so the suite must SKIP rather than error without it (same
+# pattern as tests/test_gguf_loading.py).
+pytest.importorskip("gguf", reason="gguf package not installed")
+
+from gguf.constants import GGMLQuantizationType as T  # noqa: E402
+from gguf.quants import dequantize as oracle_dequantize, quantize as oracle_quantize  # noqa: E402
 
 from ComfyUI_VibeVoice.modules.gguf_quant import GGUFLinear, gguf_linear_factory
 from ComfyUI_VibeVoice.modules.quant_common import (
@@ -197,6 +203,9 @@ def _load_sage_module():
 
 class TestSageTargetDtypeResolution:
     def test_quant_resident_passes_hidden_dtype_through(self):
+        # Defensive: the module-level guard already makes this file SKIP without
+        # gguf; kept so this body cannot outlive it.
+        pytest.importorskip("gguf", reason="gguf package not installed")
         sage = _load_sage_module()
         from gguf.constants import GGMLQuantizationType as T
 
@@ -228,6 +237,9 @@ class TestSageTargetDtypeResolution:
 
 class TestResidentRejectsNonFloatInput:
     def test_gguf_linear_loudly_rejects_byte_input(self):
+        # Defensive: the module-level guard already makes this file SKIP without
+        # gguf; kept so this body cannot outlive it.
+        pytest.importorskip("gguf", reason="gguf package not installed")
         from gguf.constants import GGMLQuantizationType as T
 
         res = GGUFLinear(32, 16, bias=False, ggml_type=T.Q8_0)

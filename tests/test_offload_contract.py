@@ -489,6 +489,14 @@ class TestQuantResidentLifecycle:
 
     @pytest.fixture
     def resident_patcher(self):
+        # gguf is an optional dependency (plan 2026-10-26 section 4.5): the
+        # resident handler is built from gguf-quantized types, so a missing
+        # gguf must degrade THIS class to a SKIP at fixture setup rather than
+        # an ImportError raised mid-setup. Scoped to the fixture, not the
+        # module: the offload-contract tests above never touch gguf and must
+        # keep running without the package (module-level importorskip would
+        # silently drop their coverage).
+        pytest.importorskip("gguf", reason="gguf package not installed")
         handler = _ResidentHandler()
         with patch("comfy.model_patcher.ModelPatcher.__init__"):
             p = VibeVoicePatcher(

@@ -376,6 +376,13 @@ def write_synthetic_gguf(path, spec, seed: int = 0, flat_pool: set = None):
     Returns:
         The written path (as given).
     """
+    # gguf is an optional dependency (plan 2026-10-26 section 4.5): a synthetic
+    # .gguf needs the writer from the package itself, so a missing gguf must
+    # degrade every caller of this fixture to a SKIP, not an ImportError raised
+    # mid-fixture. The gguf-free import contract lives in
+    # tests/test_gguf_optional.py.
+    pytest.importorskip("gguf", reason="gguf package not installed")
+
     import numpy as np
     import gguf as _gguf
     from gguf.constants import GGMLQuantizationType as T
