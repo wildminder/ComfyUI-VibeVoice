@@ -16,6 +16,11 @@ import os
 import sys
 import logging
 
+# -- Frontend Assets
+# Served by ComfyUI under /extensions/<module>/ (nodes.py scans WEB_DIRECTORY for
+# **/*.js). The js/ directory must exist at import time for the glob to register it.
+WEB_DIRECTORY = "./js"
+
 # -- Diffusers Compatibility Patch
 # Apply before any imports that might trigger the vendored code.
 # The vendored dpm_solver.py imports from diffusers, which may fail if
